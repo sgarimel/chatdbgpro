@@ -136,13 +136,12 @@ class Assistant:
 
         try:
             if not litellm.supports_function_calling(self._model):
-                raise AssistantError(textwrap.dedent(f"""\
-                    The {self._model} model does not support function calls.
-                    You must use a model that does, eg. gpt-4."""))
-        except:
-            raise AssistantError(textwrap.dedent(f"""\
-                {self._model} does not appear to be a supported model.
-                See https://docs.litellm.ai/docs/providers."""))
+                import warnings
+                warnings.warn(f"LiteLLM reports {self._model} may not support function calls. Proceeding anyway.")
+        except AssistantError:
+            raise
+        except Exception:
+            pass
 
     def _add_function(self, function):
         """
@@ -201,7 +200,10 @@ class Assistant:
             completion = litellm.stream_chunk_builder(
                 chunks, messages=self._conversation
             )
-            cost += litellm.completion_cost(completion)
+            try:
+                cost += litellm.completion_cost(completion)
+            except Exception:
+                pass
 
             # add content to conversation, but if there is no content, then the message
             # has only tool calls, and skip this step
@@ -222,7 +224,10 @@ class Assistant:
                 )
 
                 # this part wasn't counted above...
-                cost += litellm.completion_cost(tool_completion)
+                try:
+                    cost += litellm.completion_cost(tool_completion)
+                except Exception:
+                    pass
 
                 tool_message = tool_completion.choices[0].message
 
@@ -264,11 +269,21 @@ class Assistant:
         )
 
     def _trim_conversation(self):
-        old_len = litellm.token_counter(self._model, messages=self._conversation)
+        try:
+            old_len = litellm.token_counter(self._model, messages=self._conversation)
+        except Exception:
+            return  # Unknown model — skip trimming
 
-        self._conversation = trim_messages(self._conversation, self._model)
+        try:
+            self._conversation = trim_messages(self._conversation, self._model)
+        except Exception:
+            return
 
-        new_len = litellm.token_counter(self._model, messages=self._conversation)
+        try:
+            new_len = litellm.token_counter(self._model, messages=self._conversation)
+        except Exception:
+            return
+
         if old_len != new_len:
             self._broadcast(
                 "on_warn", f"Trimming conversation from {old_len} to {new_len} tokens."
