@@ -617,29 +617,47 @@ class ChatDBG(ChatDBGSuper):
 
     def _supported_functions(self):
         if chatdbg_config.take_the_wheel:
-            functions = [self.debug, self.info]
-            if self._supports_flow:
-                functions += [self.slice]
+            functions = []
+            if chatdbg_config.enable_debug:
+                functions.append(self.debug)
+            if chatdbg_config.enable_info:
+                functions.append(self.info)
+            if chatdbg_config.enable_slice and self._supports_flow:
+                functions.append(self.slice)
         else:
             functions = []
 
         return functions
 
     def _make_assistant(self):
+        chatdbg_config.apply_tool_config()
         instruction_prompt = self._initial_prompt_instructions()
         functions = self._supported_functions()
+
+        listeners = [
+            chatdbg_config.make_printer(
+                self.stdout, self.prompt, self._chat_prefix, self._text_width
+            ),
+            self._log,
+        ]
+
+        if chatdbg_config.collect_data:
+            from chatdbg.util.collector import AblationDataCollector
+            listeners.append(AblationDataCollector(
+                output_path=chatdbg_config.collect_data,
+                extra_metadata={
+                    "model": chatdbg_config.model,
+                    "tool_config": chatdbg_config.tool_config,
+                    "enabled_tools": [f.__name__ for f in functions],
+                },
+            ))
 
         self._assistant = Assistant(
             instruction_prompt,
             model=chatdbg_config.model,
             functions=functions,
             max_call_response_tokens=8192,
-            listeners=[
-                chatdbg_config.make_printer(
-                    self.stdout, self.prompt, self._chat_prefix, self._text_width
-                ),
-                self._log,
-            ],
+            listeners=listeners,
         )
 
     ### Callbacks for LLM

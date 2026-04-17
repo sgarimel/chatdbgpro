@@ -192,13 +192,17 @@ class DBGDialog:
         )
 
     def _supported_functions(self):
-        functions = [self.llm_debug, self.llm_get_code_surrounding]
-        if clangd_lsp_integration.is_available():
-            functions += [self.llm_find_definition]
+        functions = []
+        if chatdbg_config.enable_native_debug:
+            functions.append(self.llm_debug)
+        if chatdbg_config.enable_get_code_surrounding:
+            functions.append(self.llm_get_code_surrounding)
+        if chatdbg_config.enable_find_definition and clangd_lsp_integration.is_available():
+            functions.append(self.llm_find_definition)
         return functions
 
     def _make_assistant(self) -> Assistant:
-
+        chatdbg_config.apply_tool_config()
         functions = self._supported_functions()
         instruction_prompt = self.initial_prompt_instructions()
 
@@ -207,14 +211,27 @@ class DBGDialog:
         # here for all subclasses.
         printer = chatdbg_config.make_printer(sys.__stdout__, self._prompt, "   ", 80)
 
+        listeners = [
+            printer,
+            self._log,
+        ]
+
+        if chatdbg_config.collect_data:
+            from ..util.collector import AblationDataCollector
+            listeners.append(AblationDataCollector(
+                output_path=chatdbg_config.collect_data,
+                extra_metadata={
+                    "model": chatdbg_config.model,
+                    "tool_config": chatdbg_config.tool_config,
+                    "enabled_tools": [f.__name__ for f in functions],
+                },
+            ))
+
         assistant = Assistant(
             instruction_prompt,
             model=chatdbg_config.model,
             functions=functions,
-            listeners=[
-                printer,
-                self._log,
-            ],
+            listeners=listeners,
         )
 
         return assistant

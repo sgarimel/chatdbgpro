@@ -1,5 +1,7 @@
 import argparse
+import json
 import os
+import sys
 
 from traitlets import Bool, Int, Unicode
 from traitlets.config import Configurable
@@ -93,6 +95,19 @@ class ChatDBGConfig(Configurable):
         help="Disable any protections against GPT running harmful code or commands",
     ).tag(config=True)
 
+    # Tool config: 'interactive' to prompt at startup, or path to a JSON file.
+    # If empty (default), all tools are enabled.
+    tool_config = Unicode(
+        _chatdbg_get_env("tool_config", ""),
+        help="Tool config: '' (all enabled), 'interactive' (prompt at startup), or path to a JSON config file",
+    ).tag(config=True)
+
+    # Ablation data collection: path for output JSON, or '' to disable.
+    collect_data = Unicode(
+        _chatdbg_get_env("collect_data", ""),
+        help="Path for ablation data output JSON, or '' to disable collection",
+    ).tag(config=True)
+
     _user_configurable = [
         log,
         model,
@@ -100,7 +115,86 @@ class ChatDBGConfig(Configurable):
         format,
         module_whitelist,
         unsafe,
+        tool_config,
+        collect_data,
     ]
+
+    # Per-tool ablation state (not exposed as env vars / traitlets).
+    # Only modified by interactive mode or JSON config file.
+    _tool_flags = {
+        "enable_debug": "Enable the `debug` tool (run pdb commands)",
+        "enable_info": "Enable the `info` tool (get docs/source for symbols)",
+        "enable_slice": "Enable the `slice` tool (data-flow slicing)",
+        "enable_native_debug": "Enable the native `debug` tool (run debugger commands)",
+        "enable_get_code_surrounding": "Enable the `get_code_surrounding` tool",
+        "enable_find_definition": "Enable the `find_definition` tool (LSP lookup)",
+    }
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        # Initialize all tool flags to True (all enabled by default)
+        for flag_name in self._tool_flags:
+            setattr(self, flag_name, True)
+
+    def apply_tool_config(self):
+        """Apply tool configuration based on tool_config mode."""
+        mode = self.tool_config
+        if mode == "":
+            return
+        elif mode == "interactive":
+            self._interactive_tool_config()
+        else:
+            self._load_tool_config_file(mode)
+
+    def _interactive_tool_config(self):
+        """Prompt the user Y/N for each tool flag."""
+        print("Configure tools for this session:")
+        for flag_name, description in self._tool_flags.items():
+            current = getattr(self, flag_name)
+            try:
+                answer = input(f"  {description}? [{'Y/n' if current else 'y/N'}] ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                break
+            if answer == "":
+                pass  # keep current value
+            elif answer in ("y", "yes"):
+                setattr(self, flag_name, True)
+            elif answer in ("n", "no"):
+                setattr(self, flag_name, False)
+            else:
+                print(f"    Unrecognized input '{answer}', keeping {'Y' if current else 'N'}")
+        print()
+
+    def _load_tool_config_file(self, path):
+        """Load tool flags from a JSON file.
+
+        Expected format:
+        {
+            "enable_debug": true,
+            "enable_info": false,
+            "enable_slice": true,
+            ...
+        }
+        Any flag not present in the file keeps its current value (True).
+        """
+        try:
+            with open(path, "r") as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            print(f"*** Tool config file not found: {path}", file=sys.stderr)
+            return
+        except json.JSONDecodeError as e:
+            print(f"*** Invalid JSON in tool config file {path}: {e}", file=sys.stderr)
+            return
+
+        for flag_name in self._tool_flags:
+            if flag_name in data:
+                value = data[flag_name]
+                if isinstance(value, bool):
+                    setattr(self, flag_name, value)
+                else:
+                    print(f"*** Ignoring non-boolean value for {flag_name}: {value}", file=sys.stderr)
 
     def _parser(self):
         parser = DBGParser(add_help=False)
@@ -131,6 +225,8 @@ class ChatDBGConfig(Configurable):
             "format": self.format,
             "instructions": self.instructions,
             "module_whitelist": self.module_whitelist,
+            "tool_config": self.tool_config,
+            "collect_data": self.collect_data,
         }
 
     def parse_user_flags(self, argv: list[str]) -> None:
