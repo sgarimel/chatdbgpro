@@ -38,13 +38,18 @@ def get_all_bugs():
         # Normalize: CLI may return different key names
         normalized = []
         for b in bugs:
+            idx_raw = b.get("index") if b.get("index") is not None else b.get("id")
+            if idx_raw is None or b.get("project") is None:
+                print(f"[seed_db] Skipping malformed CLI entry: {b}", file=sys.stderr)
+                continue
+            idx = int(idx_raw)
             normalized.append({
-                "project":         b.get("project"),
-                "index":           int(b.get("index") or b.get("id")),
+                "project":         b["project"],
+                "index":           idx,
                 "bug_type":        b.get("type") or b.get("bug_type"),
                 "cve_id":          b.get("cve") or b.get("cve_id"),
                 "trigger_command": b.get("trigger") or b.get("trigger_command"),
-                "docker_image":    f"bugscpp/{b['project']}:{b.get('index') or b.get('id')}",
+                "docker_image":    f"bugscpp/{b['project']}:{idx}",
             })
         print(f"[seed_db] CLI returned {len(normalized)} bugs")
         return normalized
@@ -68,7 +73,9 @@ def seed(db_path=DB_PATH):
         print("[seed_db] ERROR: no bug metadata found. Aborting.", file=sys.stderr)
         sys.exit(1)
 
-    inserted = skipped = 0
+    print(f"[seed_db] Inserting {len(bugs)} bug(s) into {db_path}")
+    inserted = skipped = errored = 0
+    missing_trigger = 0
     for bug in bugs:
         try:
             cur.execute(
@@ -92,12 +99,24 @@ def seed(db_path=DB_PATH):
             else:
                 skipped += 1  # already in DB from a previous run
 
+            if not bug.get("trigger_command"):
+                missing_trigger += 1
+
         except Exception as e:
+            errored += 1
             print(f"  ERROR inserting {bug}: {e}", file=sys.stderr)
 
     con.commit()
     con.close()
-    print(f"[seed_db] Done: {inserted} inserted, {skipped} already present -> {db_path}")
+    print(f"[seed_db] Done: {inserted} inserted, {skipped} already present, "
+          f"{errored} errored -> {db_path}")
+    if missing_trigger:
+        # Trigger command is the crash-inducing argv; without it crash_filter
+        # launches GDB with no args and most bugs will not actually crash.
+        print(f"[seed_db] WARNING: {missing_trigger}/{len(bugs)} bugs have no "
+              f"trigger_command. crash_filter will be unable to reproduce crashes "
+              f"for these. Inspect utils._extract_trigger and the BugsC++ "
+              f"meta.json format for missing projects.")
 
 
 if __name__ == "__main__":

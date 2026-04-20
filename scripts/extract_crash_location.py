@@ -23,7 +23,7 @@ from pathlib import Path
 
 from tqdm import tqdm
 
-from utils import BACKTRACES_DIR, DB_PATH, get_db_connection
+from utils import BACKTRACES_DIR, DATA_DIR, DB_PATH, IssueTracker, get_db_connection
 
 # Path prefixes that indicate a system / library frame (not user project code).
 # We walk up the stack skipping these until we find project source.
@@ -86,19 +86,26 @@ def find_user_frame(frames: list[dict]) -> dict | None:
     return None
 
 
-def get_backtrace(project: str, bug_index: int) -> str:
-    """Run GDB `bt full` inside the bugscpp container and return output."""
+def get_backtrace(project: str, bug_index: int, trigger_command: str | None) -> str:
+    """Run GDB `bt full` inside the bugscpp container and return output.
+
+    Passes trigger_command so GDB's `run` actually executes the program with
+    crash-inducing argv (see crash_filter.run_gdb_in_container for rationale).
+    """
+    gdb_args = [
+        "-batch",
+        "-ex", "set pagination off",
+        "-ex", "set confirm off",
+        "-ex", "run",
+        "-ex", "bt full",
+        "-ex", "quit",
+    ]
+    if trigger_command:
+        import shlex
+        gdb_args += ["--args"] + shlex.split(trigger_command)
+
     result = subprocess.run(
-        [
-            "bugscpp", "exec", project, str(bug_index), "--buggy",
-            "--", "gdb",
-            "-batch",
-            "-ex", "set pagination off",
-            "-ex", "set confirm off",
-            "-ex", "run",
-            "-ex", "bt full",
-            "-ex", "quit",
-        ],
+        ["bugscpp", "exec", project, str(bug_index), "--buggy", "--", "gdb"] + gdb_args,
         capture_output=True,
         text=True,
         timeout=120,
@@ -113,12 +120,12 @@ def run(db_path=DB_PATH, resume=False):
 
     if resume:
         eligible = cur.execute("""
-            SELECT bug_id, project, bug_index FROM test_cases
+            SELECT bug_id, project, bug_index, trigger_command FROM test_cases
             WHERE crash_reproducible = 1 AND backtrace_path IS NULL
         """).fetchall()
     else:
         eligible = cur.execute("""
-            SELECT bug_id, project, bug_index FROM test_cases
+            SELECT bug_id, project, bug_index, trigger_command FROM test_cases
             WHERE crash_reproducible = 1
         """).fetchall()
 
@@ -126,36 +133,60 @@ def run(db_path=DB_PATH, resume=False):
         print("[extract_crash_location] No crash-reproducible bugs to process.")
         return
 
+    print(f"[extract_crash_location] Extracting frames for {len(eligible)} bug(s)")
+
+    issues = IssueTracker("extract_crash_location")
     parsed = failed = 0
 
     for row in tqdm(eligible, desc="Extracting frames", unit="bug"):
-        bug_id, project, bug_index = row["bug_id"], row["project"], row["bug_index"]
+        bug_id    = row["bug_id"]
+        project   = row["project"]
+        bug_index = row["bug_index"]
+        trigger   = row["trigger_command"]
         bt_path = BACKTRACES_DIR / f"{bug_id}.txt"
 
         try:
-            output = get_backtrace(project, bug_index)
+            output = get_backtrace(project, bug_index, trigger)
         except subprocess.TimeoutExpired:
-            tqdm.write(f"  TIMEOUT: {bug_id}")
+            tqdm.write(f"  [TIMEOUT] {bug_id}")
+            issues.record("timeout", bug_id, "gdb bt full > 120s")
             failed += 1
             continue
         except Exception as e:
-            tqdm.write(f"  ERROR {bug_id}: {e}")
+            tqdm.write(f"  [ERROR] {bug_id}: {e}")
+            issues.record("bugscpp_error", bug_id, str(e)[:120])
             failed += 1
             continue
 
         bt_path.write_text(output)
+
+        if not output.strip():
+            tqdm.write(f"  [EMPTY] {bug_id}: gdb produced no output")
+            issues.record("empty_output", bug_id)
+            failed += 1
+            continue
+
         frames = parse_backtrace(output)
 
         if not frames:
-            tqdm.write(f"  WARNING: no parseable frames for {bug_id}")
+            tqdm.write(f"  [PARSE FAIL] {bug_id}: {len(output)} bytes, no frames matched")
+            issues.record("parse_failed", bug_id, f"{len(output)}B output")
             failed += 1
             continue
 
         frame0     = frames[0]
-        user_frame = find_user_frame(frames) or frame0
+        user_frame_raw = find_user_frame(frames)
+        if user_frame_raw is None:
+            # All frames look like system paths — corpus ground truth would
+            # point into libc. Flag so finalize can exclude if we choose.
+            issues.record("only_system_frames", bug_id,
+                          f"frame0={frame0.get('file')}")
+            tqdm.write(f"  [SYSTEM ONLY] {bug_id}: all frames in system paths")
+        user_frame = user_frame_raw or frame0
 
-        # Store relative path from data/ for portability
-        rel_bt = bt_path.relative_to(db_path.parent)
+        # Store relative path from data/ for portability (DATA_DIR, not db_path
+        # parent — db_path may be a string in some call sites).
+        rel_bt = bt_path.relative_to(DATA_DIR)
 
         cur.execute(
             """
@@ -178,9 +209,12 @@ def run(db_path=DB_PATH, resume=False):
         )
         con.commit()
         parsed += 1
+        tqdm.write(f"  [OK] {bug_id}: user_frame={user_frame['function']} "
+                   f"@ {user_frame.get('file')}:{user_frame.get('line')}")
 
     con.close()
     print(f"[extract_crash_location] Done: {parsed} frames extracted, {failed} failed")
+    issues.print_summary()
 
 
 if __name__ == "__main__":

@@ -21,7 +21,7 @@ import subprocess
 
 from tqdm import tqdm
 
-from utils import DB_PATH, PATCHES_DIR, get_db_connection, run_bugscpp
+from utils import DATA_DIR, DB_PATH, IssueTracker, PATCHES_DIR, get_db_connection, run_bugscpp
 
 
 def extract_patch(project: str, bug_index: int, patch_path) -> bool:
@@ -76,6 +76,10 @@ def run(db_path=DB_PATH, resume=False, skip_validation=False):
         print("[extract_patches] No crash-eligible bugs to process.")
         return
 
+    print(f"[extract_patches] Processing {len(eligible)} bug(s) "
+          f"(skip_validation={skip_validation})")
+
+    issues = IssueTracker("extract_patches")
     extracted = validated = skipped = 0
 
     for row in tqdm(eligible, desc="Patches", unit="bug"):
@@ -85,33 +89,45 @@ def run(db_path=DB_PATH, resume=False, skip_validation=False):
         # --- Extract ---
         try:
             ok = extract_patch(project, bug_index, patch_path)
+        except subprocess.TimeoutExpired:
+            tqdm.write(f"  [EXTRACT TIMEOUT] {bug_id}")
+            issues.record("extract_timeout", bug_id)
+            skipped += 1
+            continue
         except Exception as e:
-            tqdm.write(f"  ERROR extracting {bug_id}: {e}")
+            tqdm.write(f"  [EXTRACT FAIL] {bug_id}: {e}")
+            issues.record("extract_failed", bug_id, str(e)[:120])
             skipped += 1
             continue
 
         if not ok:
-            tqdm.write(f"  WARNING: empty patch for {bug_id}")
+            tqdm.write(f"  [EMPTY PATCH] {bug_id}")
+            issues.record("empty_patch", bug_id)
             skipped += 1
             continue
 
         extracted += 1
-        rel_patch = patch_path.relative_to(db_path.parent)
+        rel_patch = patch_path.relative_to(DATA_DIR)
 
         # --- Validate (unless skipped) ---
         valid = False
         if not skip_validation:
             try:
                 valid = validate_patch(project, bug_index)
+                if not valid:
+                    issues.record("validation_failed", bug_id, "test suite nonzero exit")
             except subprocess.TimeoutExpired:
-                tqdm.write(f"  TIMEOUT validating {bug_id}")
+                tqdm.write(f"  [VALIDATION TIMEOUT] {bug_id}")
+                issues.record("validation_timeout", bug_id)
             except Exception as e:
-                tqdm.write(f"  ERROR validating {bug_id}: {e}")
+                tqdm.write(f"  [VALIDATION ERROR] {bug_id}: {e}")
+                issues.record("bugscpp_error", bug_id, str(e)[:120])
         else:
             valid = True  # trust extraction if validation is skipped
 
         if valid:
             validated += 1
+            tqdm.write(f"  [OK] {bug_id}")
 
         cur.execute(
             """
@@ -128,6 +144,7 @@ def run(db_path=DB_PATH, resume=False, skip_validation=False):
         f"[extract_patches] Done: {extracted} extracted, "
         f"{validated} validated, {skipped} skipped"
     )
+    issues.print_summary()
 
 
 if __name__ == "__main__":

@@ -8,6 +8,7 @@ import os
 import sqlite3
 import subprocess
 import json
+from collections import Counter
 from pathlib import Path
 
 # ── Paths ────────────────────────────────────────────────────────────────────
@@ -33,6 +34,43 @@ BUGSCPP_TAXONOMY_DIR = BUGSCPP_REPO / "bugscpp" / "taxonomy"
 
 # Projects to skip (demo/sanitizer variants that aren't real bugs)
 SKIP_PROJECTS = {"example"}
+
+
+class IssueTracker:
+    """
+    Categorical counter for pipeline failure modes. Scripts bump a named
+    bucket for each non-success outcome and print a breakdown at the end,
+    so operators can see *which* failure modes dominated the run instead
+    of scrolling through tqdm output.
+
+    Known buckets used by the pipeline (extend freely):
+      build_filter:  checkout_failed, build_timeout, build_failed, exception
+      crash_filter:  timeout, no_signal, non_catchable, inconsistent_signal,
+                     bugscpp_error
+      extract_frames: timeout, empty_output, parse_failed, only_system_frames,
+                      bugscpp_error
+      extract_patches: extract_failed, empty_patch, validation_timeout,
+                       validation_failed, bugscpp_error
+    """
+
+    def __init__(self, script_name: str):
+        self.script_name = script_name
+        self.counts: Counter = Counter()
+        self.examples: dict[str, str] = {}
+
+    def record(self, kind: str, bug_id: str | None = None, detail: str = ""):
+        self.counts[kind] += 1
+        if bug_id and kind not in self.examples:
+            self.examples[kind] = f"{bug_id}: {detail}"[:160]
+
+    def print_summary(self):
+        if not self.counts:
+            print(f"[{self.script_name}] No issues recorded.")
+            return
+        print(f"\n[{self.script_name}] Issue breakdown:")
+        for kind, n in self.counts.most_common():
+            ex = self.examples.get(kind, "")
+            print(f"  {kind:22s} {n:4d}   e.g. {ex}")
 
 
 def get_db_connection(db_path=DB_PATH):

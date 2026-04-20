@@ -14,10 +14,14 @@ Estimated time: 30–60 min for all 209 bugs. Run in tmux.
 """
 
 import argparse
+import subprocess
 import sys
 from tqdm import tqdm
 
-from utils import DB_PATH, BUGSCPP_REPO, DATA_DIR, get_db_connection, run_bugscpp
+from utils import (
+    DB_PATH, BUGSCPP_REPO, DATA_DIR, IssueTracker,
+    get_db_connection, run_bugscpp,
+)
 
 WORKSPACES_DIR = DATA_DIR / "workspaces"
 
@@ -31,30 +35,37 @@ def build_bug(project: str, bug_index: int):
     """
     1. Checkout the buggy version into a local workspace.
     2. Build it inside the Docker container.
-    Returns (success: bool, error_msg: str | None).
+    Returns (success, error_msg, failure_kind). failure_kind is one of
+    None / "checkout_failed" / "build_timeout" / "build_failed".
     """
     target = str(WORKSPACES_DIR / f"{project}-{bug_index}")
 
     # Step 1: checkout (idempotent — skips if already checked out)
-    co = run_bugscpp(
-        ["checkout", project, str(bug_index), "--buggy", "--target", target],
-        timeout=120,
-    )
+    try:
+        co = run_bugscpp(
+            ["checkout", project, str(bug_index), "--buggy", "--target", target],
+            timeout=120,
+        )
+    except subprocess.TimeoutExpired:
+        return False, "checkout timed out after 120s", "checkout_failed"
+
     if co.returncode != 0:
         err = (co.stderr or co.stdout or "checkout failed")[:2000]
-        return False, f"checkout: {err}"
+        return False, f"checkout: {err}", "checkout_failed"
 
     # Step 2: build from the checked-out workspace
-    result = run_bugscpp(
-        ["build", workspace_path(project, bug_index)],
-        timeout=600,
-    )
+    try:
+        result = run_bugscpp(
+            ["build", workspace_path(project, bug_index)],
+            timeout=600,
+        )
+    except subprocess.TimeoutExpired:
+        return False, "build timed out after 600s", "build_timeout"
 
     if result.returncode == 0:
-        return True, None
-    else:
-        err = (result.stderr or result.stdout or "unknown error")[:2000]
-        return False, err
+        return True, None, None
+    err = (result.stderr or result.stdout or "unknown error")[:2000]
+    return False, err, "build_failed"
 
 
 def run(db_path=DB_PATH, resume=False, project_filter=None):
@@ -79,15 +90,19 @@ def run(db_path=DB_PATH, resume=False, project_filter=None):
         print("[build_filter] Nothing to build.")
         return
 
+    print(f"[build_filter] Building {len(candidates)} bug(s) "
+          f"(resume={resume}, project_filter={project_filter})")
+
+    issues = IssueTracker("build_filter")
     success_count = fail_count = 0
 
     for row in tqdm(candidates, desc="Building", unit="bug"):
         bug_id, project, bug_index = row["bug_id"], row["project"], row["bug_index"]
 
         try:
-            success, error_msg = build_bug(project, bug_index)
+            success, error_msg, kind = build_bug(project, bug_index)
         except Exception as e:
-            success, error_msg = False, f"exception: {e}"
+            success, error_msg, kind = False, f"exception: {e}", "exception"
 
         cur.execute(
             "INSERT INTO build_log (bug_id, success, error_msg) VALUES (?, ?, ?)",
@@ -95,14 +110,23 @@ def run(db_path=DB_PATH, resume=False, project_filter=None):
         )
         con.commit()  # commit per-row so progress survives interruptions
 
+        # In non-resume mode, prune any prior build_log rows for this bug
+        # so queries joining on build_log.success don't see stale duplicates.
+        if not resume:
+            cur.execute("DELETE FROM build_log WHERE bug_id = ? AND id NOT IN (SELECT MAX(id) FROM build_log WHERE bug_id = ?)", (bug_id, bug_id))
+
         if success:
             success_count += 1
+            tqdm.write(f"  [OK]   {bug_id}")
         else:
             fail_count += 1
-            tqdm.write(f"  BUILD FAILED: {bug_id}: {error_msg[:120]}")
+            issues.record(kind or "build_failed", bug_id, (error_msg or "")[:120])
+            tqdm.write(f"  [FAIL:{kind}] {bug_id}: {(error_msg or '')[:120]}")
 
     con.close()
-    print(f"[build_filter] Done: {success_count} built, {fail_count} failed")
+    print(f"[build_filter] Done: {success_count} built, {fail_count} failed "
+          f"({100*success_count/max(1,len(candidates)):.1f}% success)")
+    issues.print_summary()
 
 
 if __name__ == "__main__":

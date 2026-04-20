@@ -14,7 +14,6 @@ Usage:
 Prints a summary breakdown after marking the corpus.
 """
 
-import sqlite3
 from utils import DB_PATH, get_db_connection
 
 
