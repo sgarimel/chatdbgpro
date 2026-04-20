@@ -108,6 +108,14 @@ class ChatDBGConfig(Configurable):
         help="Path for ablation data output JSON, or '' to disable collection",
     ).tag(config=True)
 
+    # Frontier-model oracle tool: the "ask the oracle" tool routes the
+    # caller's question to this model via LiteLLM. Used for the
+    # "small-model-with-oracle-escalation" ablation.
+    oracle_model = Unicode(
+        _chatdbg_get_env("oracle_model", "openrouter/openai/gpt-5"),
+        help="Model path used by the 'ask_oracle' tool (LiteLLM format)",
+    ).tag(config=True)
+
     _user_configurable = [
         log,
         model,
@@ -117,6 +125,7 @@ class ChatDBGConfig(Configurable):
         unsafe,
         tool_config,
         collect_data,
+        oracle_model,
     ]
 
     # Per-tool ablation state (not exposed as env vars / traitlets).
@@ -128,6 +137,8 @@ class ChatDBGConfig(Configurable):
         "enable_native_debug": "Enable the native `debug` tool (run debugger commands)",
         "enable_get_code_surrounding": "Enable the `get_code_surrounding` tool",
         "enable_find_definition": "Enable the `find_definition` tool (LSP lookup)",
+        "enable_oracle": "Enable the `ask_oracle` tool (escalate to a frontier model)",
+        "enable_bash": "Enable the `bash` tool (run shell commands in the working directory)",
     }
 
     def __init__(self, **kwargs):

@@ -1,3 +1,4 @@
+import subprocess
 import sys
 
 from . import clangd_lsp_integration
@@ -191,6 +192,98 @@ class DBGDialog:
             f"definition {filename}:{line_number} {symbol}"
         )
 
+    def llm_ask_oracle(self, question: str) -> str:
+        """
+        {
+            "name": "ask_oracle",
+            "description": "Escalate a hard reasoning question to a frontier 'oracle' model. Use this ONLY when you are stuck and cannot resolve a specific question using the debugger. The oracle has NO access to the program, the debugger, or the stack — you must include any code snippets, values, or state it needs in the `question` field verbatim. Keep the question tight: the oracle is expensive.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "question": {
+                        "type": "string",
+                        "description": "A self-contained question including all code / state the oracle needs to answer it."
+                    }
+                },
+                "required": ["question"]
+            }
+        }
+        """
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            import litellm
+
+        try:
+            resp = litellm.completion(
+                model=chatdbg_config.oracle_model,
+                messages=[
+                    {"role": "system",
+                     "content": "You are a senior C/C++ debugging oracle. Answer precisely and briefly. Point to the single most likely root cause if asked."},
+                    {"role": "user", "content": question},
+                ],
+                temperature=0.0,
+                timeout=60,
+            )
+            content = (resp.choices[0].message.content or "").strip()
+            usage = getattr(resp, "usage", None) or {}
+            ptok = getattr(usage, "prompt_tokens", None) or (
+                usage.get("prompt_tokens", 0) if isinstance(usage, dict) else 0)
+            ctok = getattr(usage, "completion_tokens", None) or (
+                usage.get("completion_tokens", 0) if isinstance(usage, dict) else 0)
+            header = f"[oracle:{chatdbg_config.oracle_model} in={ptok} out={ctok}]\n"
+            return f"ask_oracle", header + content
+        except Exception as e:
+            return f"ask_oracle", f"[oracle call failed: {e}]"
+
+    def llm_bash(self, command: str) -> str:
+        """
+        {
+            "name": "bash",
+            "description": "Execute a POSIX shell command in the debugger's working directory and return combined stdout/stderr plus the exit code. Use this for file inspection (ls, cat, grep, find, head, tail, wc), running or re-running the program with different inputs, comparing files (diff), or any workflow that is cheaper to do in a shell than in the debugger. Pipelines, redirections, and `&&` are supported. A 30-second timeout applies per call and output longer than 8 KB is truncated. Do not use interactive programs (editors, pagers).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "A single shell command line."
+                    }
+                },
+                "required": ["command"]
+            }
+        }
+        """
+        _OUTPUT_LIMIT = 8192
+        _TIMEOUT_S = 30
+
+        try:
+            proc = subprocess.run(
+                command,
+                shell=True,
+                text=True,
+                capture_output=True,
+                timeout=_TIMEOUT_S,
+            )
+        except subprocess.TimeoutExpired:
+            return f"bash: {command}", f"[bash timed out after {_TIMEOUT_S}s]"
+        except Exception as e:
+            return f"bash: {command}", f"[bash call failed: {e}]"
+
+        out = proc.stdout or ""
+        err = proc.stderr or ""
+        parts = []
+        if out:
+            parts.append(out.rstrip("\n"))
+        if err:
+            parts.append(f"[stderr]\n{err.rstrip(chr(10))}")
+        body = "\n".join(parts) if parts else "[no output]"
+        if len(body) > _OUTPUT_LIMIT:
+            body = (
+                body[:_OUTPUT_LIMIT]
+                + f"\n... [truncated, {len(body) - _OUTPUT_LIMIT} bytes elided]"
+            )
+        return f"bash: {command}", f"{body}\n[exit={proc.returncode}]"
+
     def _supported_functions(self):
         functions = []
         if chatdbg_config.enable_native_debug:
@@ -199,6 +292,10 @@ class DBGDialog:
             functions.append(self.llm_get_code_surrounding)
         if chatdbg_config.enable_find_definition and clangd_lsp_integration.is_available():
             functions.append(self.llm_find_definition)
+        if chatdbg_config.enable_oracle:
+            functions.append(self.llm_ask_oracle)
+        if chatdbg_config.enable_bash:
+            functions.append(self.llm_bash)
         return functions
 
     def _make_assistant(self) -> Assistant:

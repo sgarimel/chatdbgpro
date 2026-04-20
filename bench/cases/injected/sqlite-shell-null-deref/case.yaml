@@ -1,0 +1,69 @@
+id: sqlite-shell-null-deref
+language: c
+kind: injected_repo
+description: >
+  The SQLite shell's `.read` dot-command opens the requested file with
+  fopen() and should bail out if fopen returns NULL. The injected patch
+  deletes the null-check, so `.read /nonexistent/path` immediately calls
+  fgets() on a NULL FILE* pointer. AddressSanitizer reports a SEGV at
+  address 0x0 inside fgets, with the SQLite shell `process_input`
+  function visible in the frame above.
+
+repo:
+  url: https://github.com/sqlite/sqlite
+  sha: version-3.45.2
+  subdir: .
+
+build:
+  prepare:
+    - "./configure"
+  commands:
+    - "make CFLAGS='-g -O0 -fsanitize=address -fno-omit-frame-pointer' LDFLAGS='-fsanitize=address' sqlite3"
+  binary: sqlite3
+
+run:
+  repro: "./bench-repro.sh"
+  expected_crash: true
+  env: {}
+  clean_env: false
+
+bug:
+  patch_file: bug.patch
+  root_cause_file: shell.c
+  root_cause_lines_approx: [dot_read_fopen_call_site]
+  related_lines_approx: [dot_read_error_branch]
+  category: missing_null_check
+  error_type: null_deref
+  expected_sanitizer: asan
+  expected_sanitizer_report_contains: "SEGV"
+
+criteria:
+  root_cause: >
+    The response must identify that the shell's `.read` handler calls
+    fopen() without checking for NULL, so opening a missing file and
+    then passing the NULL FILE* to fgets() is what crashes. Merely
+    saying "NULL pointer dereference" is not enough — the agent has to
+    locate the removed `if (in == 0)` guard (or equivalent) in shell.c.
+
+  local_fix: >
+    Restore the null-check on the fopen result in the `.read`
+    dot-command handler: after `FILE *in = fopen(path, "rb");`, re-add
+    an `if (in == 0) { utf8_printf(stderr, "cannot open \"%s\"\n", path);
+    return 1; }` (or equivalent error-reporting branch).
+
+  global_fix: >
+    A root-cause fix removes the class of "forgot to check fopen"
+    bugs from shell.c. Acceptable options:
+      (a) introduce an `open_or_complain(const char *path, ...)`
+          helper that wraps fopen, prints the standard error message
+          on NULL, and returns NULL, then route all dot-commands that
+          open a file (.read, .import, .log, .output, etc.) through it;
+      (b) wrap fopen in a small RAII-ish struct with a checked accessor
+          that aborts the dot-command cleanly if the file never opened;
+      (c) enable a compile-time warning / static analysis check
+          (e.g. -Wunused-result on a wrapped fopen) so future callers
+          cannot silently drop the check.
+    Just re-adding the single `if (in == 0)` branch does NOT qualify
+    as a global fix.
+
+verified: false

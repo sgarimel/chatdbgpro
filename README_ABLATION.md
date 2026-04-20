@@ -2,6 +2,8 @@
 
 This fork of [ChatDBG](https://github.com/plasma-umass/ChatDBG) adds infrastructure for ablation studies — systematically enabling/disabling tools and swapping LLM backends to measure their contribution to debugging performance.
 
+> **End-to-end bench pipeline:** see [`bench/README.md`](./bench/README.md) for the sweep/judge/analyze harness built on top of this framework (test-case database with proximate/root-cause criteria, LLM-as-judge evaluator, and CSV/markdown rollups). The rest of this document describes the per-session ablation knobs those tools use.
+
 ## Overview
 
 Two axes of ablation:
@@ -21,9 +23,13 @@ Built-in tools:
 
 | Flag | Tool | Description |
 |---|---|---|
-| `enable_debug` | `debug` | Run arbitrary pdb commands |
-| `enable_info` | `info` | Get docs/source for symbols |
-| `enable_slice` | `slice` | Data-flow slicing |
+| `enable_debug` | `debug` (pdb) | Run arbitrary pdb commands |
+| `enable_info` | `info` (pdb) | Get docs/source for symbols |
+| `enable_slice` | `slice` (pdb) | Data-flow slicing |
+| `enable_native_debug` | `debug` (gdb/lldb) | Run arbitrary debugger commands |
+| `enable_get_code_surrounding` | `get_code_surrounding` | Print source around a location |
+| `enable_find_definition` | `find_definition` | clangd LSP symbol lookup |
+| `enable_oracle` | `ask_oracle` | Escalate a single hard question to a frontier model (set via `CHATDBG_ORACLE_MODEL`, default `openrouter/openai/gpt-5`) |
 
 ### Configuring tool ablation
 
