@@ -1,0 +1,76 @@
+id: lua-string-use-after-free
+language: c
+kind: injected_repo
+description: >
+  Lua 5.4's OP_CONCAT implementation in lvm.c (`luaV_concat` +
+  surrounding `vmcase(OP_CONCAT)` block) must invoke a GC write-barrier
+  whenever it stores a freshly allocated TString back into a register
+  belonging to the running function's stack. The injected patch deletes
+  that barrier call. On a script that triggers an incremental GC step
+  between the concat and the next use of the result, the collector
+  misses the reference and reclaims the string. The next opcode that
+  reads that register hits freed heap memory. AddressSanitizer reports
+  `heap-use-after-free READ` inside luaV_execute (or a TString
+  accessor) with the preceding OP_CONCAT visible in the trace.
+
+repo:
+  url: https://github.com/lua/lua
+  sha: v5.4.7
+  subdir: .
+
+build:
+  prepare: []
+  commands:
+    - "make MYCFLAGS='-g -O0 -fsanitize=address -fno-omit-frame-pointer' MYLDFLAGS='-fsanitize=address' linux"
+  binary: src/lua
+
+run:
+  repro: "./bench-repro.sh"
+  expected_crash: true
+  env: {ASAN_OPTIONS: "abort_on_error=1:halt_on_error=1:detect_leaks=0"}
+  clean_env: false
+
+bug:
+  patch_file: bug.patch
+  root_cause_file: lvm.c
+  root_cause_lines_approx: [op_concat_write_barrier_call]
+  related_lines_approx: [luaV_concat_result_store]
+  category: missing_gc_barrier
+  error_type: use_after_free
+  expected_sanitizer: asan
+  expected_sanitizer_report_contains: "heap-use-after-free"
+
+criteria:
+  root_cause: >
+    The response must identify that the OP_CONCAT / luaV_concat path
+    stores a newly allocated TString into a stack register without
+    issuing the required GC write-barrier (luaC_barrier /
+    luaC_objbarrier), so the incremental collector later misses the
+    reference and reclaims the result string. A correct answer names
+    both the missing barrier call AND the store it was guarding.
+    "String got freed" or "dangling pointer" without explaining the
+    GC invariant violation does not count.
+
+  local_fix: >
+    Restore the write-barrier call (e.g. `luaC_barrier(L, parent,
+    newstr);` or the appropriate `luaC_objbarrier` variant) immediately
+    after the new TString is stored into the register slot, matching
+    the surrounding opcodes in lvm.c.
+
+  global_fix: >
+    A root-cause fix removes the "remember to call the barrier by
+    hand" footgun from the VM. Acceptable options:
+      (a) wrap register stores in a single helper
+          `setreg_barriered(L, ra, v)` that performs both the store
+          and the write-barrier, and route every opcode that stores
+          a GC object into a register through it;
+      (b) express the write-barrier as a property of the TValue
+          setter macros (`setsvalue2s`, `setobj2s`, ...) so no opcode
+          can skip it;
+      (c) add a debug-mode GC invariant check that traps if any
+          black-to-white reference is ever found during a step, so
+          future regressions are caught at test time.
+    Just re-adding the single barrier call does NOT qualify as a
+    global fix.
+
+verified: false

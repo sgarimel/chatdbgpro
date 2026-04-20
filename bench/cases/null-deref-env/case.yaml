@@ -1,0 +1,53 @@
+id: null-deref-env
+language: c
+source_file: program.c
+description: >
+  is_admin calls getenv("USER") and getenv("ADMIN_USER") and dereferences
+  the results without null-checking. When the env vars are unset, getenv
+  returns NULL and the program segfaults. The harness runs the program
+  with a cleared environment to trigger the crash.
+
+build:
+  compiler: clang
+  flags: ["-g", "-O0", "-fno-omit-frame-pointer", "-fsanitize=address"]
+
+run:
+  args: []
+  stdin: ""
+  # `env: clean` causes the orchestrator to strip USER / ADMIN_USER.
+  env: {}
+  clean_env: true
+  expected_crash: true
+
+bug:
+  category: null_deref
+  error_type: missing_null_check
+  root_cause_lines: [13]
+  related_lines: [9, 10]
+
+criteria:
+  root_cause: >
+    The response must identify that getenv may return NULL when the
+    requested variable is unset, and that is_admin dereferences both
+    pointers on line 13 without checking. It should point out that in
+    the failing run at least one of USER / ADMIN_USER is NULL.
+    "Segfault in is_admin" by itself is not enough unless it is tied to
+    the missing null-check on getenv.
+
+  local_fix: >
+    Add explicit null checks and short-circuit before the dereference:
+      if (!u || !a) return 0;
+    Equivalent defaults (e.g. `u = u ? u : ""`) are also acceptable, as
+    long as `*u` / `*a` are not reached when either pointer is NULL.
+
+  global_fix: >
+    A root-cause fix treats missing config as a first-class error,
+    rather than silently coercing it to "not admin". Acceptable:
+      (a) return a tri-state result (admin / not-admin / misconfigured)
+          and have the caller surface the misconfigured case,
+      (b) load and validate all required env vars up front in a single
+          `load_config()` routine that fails loudly if anything is
+          missing, then pass the config struct into is_admin,
+      (c) document and assert the precondition at program startup.
+    A bare null-check + "return 0" that silently turns a misconfigured
+    environment into "not admin" is a local fix, not a global one.

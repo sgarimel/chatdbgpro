@@ -1,0 +1,89 @@
+id: cjson-parse-string-oob
+language: c
+kind: injected_repo
+description: >
+  cJSON.c's parse_string() scans input looking for the closing quote.
+  The pre-patch guard `(input_end - content) < length` is dropped, so
+  an unterminated JSON string causes the loop to read past the input
+  buffer. AddressSanitizer flags a heap-buffer-overflow in parse_string
+  on any input of the form `"abc` with no closing quote.
+
+repo:
+  url: https://github.com/DaveGamble/cJSON
+  sha: v1.7.18
+  subdir: .
+
+build:
+  prepare: []
+  # driver.c lives next to case.yaml; the `assets` mechanism copies it
+  # into the cloned workspace before `commands` runs. We need a custom
+  # driver because v1.7.18's tests/parse_with_opts.c is a Unity fixture,
+  # not a standalone stdin-reader.
+  assets:
+    - {src: driver.c, dst: bench_driver.c}
+  commands:
+    - "cc -g -O0 -fsanitize=address -fno-omit-frame-pointer -c cJSON.c -o cJSON.o"
+    - "cc -g -O0 -fsanitize=address -fno-omit-frame-pointer bench_driver.c cJSON.o -o bench_driver"
+  binary: bench_driver
+
+run:
+  repro: "./bench-repro.sh"
+  expected_crash: true
+  env: {}
+  clean_env: false
+
+# Structured launch for the tier-3 driver. `run.repro` remains as the
+# human-facing "how do I reproduce this outside the bench" artifact.
+debug:
+  args: []
+  stdin_data: '"abc'
+
+bug:
+  patch_file: bug.patch
+  # Machine-applied variant of bug.patch — a list of single-match text
+  # substitutions. Each op requires its `before` string to appear exactly
+  # once in the target file, so this format is robust to upstream
+  # line-number shifts without needing to rebase a unified diff.
+  patch_ops:
+    - file: cJSON.c
+      before: "while (((size_t)(input_end - input_buffer->content) < input_buffer->length) && (*input_end != '\\\"'))"
+      after: "while (*input_end != '\\\"')"
+  root_cause_file: cJSON.c
+  # Post-patch line numbers; calibrate in step 4 against the exact v1.7.18 tree.
+  root_cause_lines_approx: [parse_string_loop_header]
+  related_lines_approx: [parse_string_bounds_check]
+  category: off_by_one
+  error_type: buffer_overread
+  expected_sanitizer: asan
+  expected_sanitizer_report_contains: "heap-buffer-overflow"
+
+criteria:
+  root_cause: >
+    The response must identify that parse_string's scan loop over
+    input_end lost the `(input_end - content) < length` bound when the
+    patch was applied, so an unterminated string literal walks off the
+    end of the input buffer. Pointing at the while-loop header in
+    parse_string and explaining that the missing length check is the
+    defect counts; merely saying "buffer overflow in cJSON" does not.
+
+  local_fix: >
+    Restore the length bound to the loop, e.g.
+        while ((size_t)(input_end - input_buffer->content) < input_buffer->length
+               && *input_end != '\"') { ... }
+    or an equivalent guard that ensures `input_end` stays within the
+    content region.
+
+  global_fix: >
+    A root-cause fix treats unterminated strings as a parser error at
+    the input-buffer layer rather than hoping every consumer remembers
+    the bound. Acceptable options:
+      (a) introduce a `cjson_buffer_at(buf, offset)` helper that
+          returns NULL past-the-end, and route every read through it,
+      (b) switch the parser to a bounded-view type (ptr+len pair
+          passed by value) and remove raw pointer arithmetic, or
+      (c) add an explicit `ensure_bounds(buf, n)` pre-check at every
+          state transition in parse_string.
+    Simply re-adding the single length check without any structural
+    change does NOT qualify as a global fix.
+
+verified: true

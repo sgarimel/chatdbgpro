@@ -1,0 +1,52 @@
+id: off-by-one-crc
+language: c
+source_file: program.c
+description: >
+  A CRC-8 helper reads one byte past the end of the input buffer because
+  the inner loop uses an inclusive upper bound. With AddressSanitizer the
+  program crashes with a heap-buffer-overflow report pointing into crc8().
+
+build:
+  compiler: clang
+  # -O0 keeps line numbers stable; ASan surfaces the OOB read deterministically.
+  flags: ["-g", "-O0", "-fno-omit-frame-pointer", "-fsanitize=address"]
+
+run:
+  args: []
+  stdin: ""
+  env: {}
+  expected_crash: true
+
+bug:
+  category: off_by_one
+  error_type: buffer_overread
+  root_cause_lines: [11]
+  related_lines: [12, 23]
+
+criteria:
+  root_cause: >
+    The response must identify that crc8's outer loop uses the inclusive
+    bound `i <= len`, causing it to read buf[len] which is one past the
+    last valid element. Pointing at line 11 (the `for` statement), line
+    12 (the `crc ^= buf[i]` read), or clearly naming the `<=` as the
+    defect counts; merely saying "buffer overflow" without localising
+    it does not.
+
+  local_fix: >
+    Change the loop bound so it stops at len-1. Any of:
+      - `for (size_t i = 0; i < len; i++)`
+      - `for (size_t i = 0; i != len; i++)`
+    is acceptable as a local (proximate-cause) fix. The fix must be in
+    crc8's loop header, not in the caller.
+
+  global_fix: >
+    A root-cause fix removes the opportunity for this class of off-by-one.
+    Acceptable options:
+      (a) rewrite crc8 to take an end pointer (`const uint8_t *end`) or a
+          half-open [begin,end) range, or
+      (b) adopt a bounded view type (e.g. std::span<const uint8_t>) and
+          iterate over it, or
+      (c) add a static_assert / length invariant at the call site AND
+          switch to `i < len`.
+    Simply flipping `<=` to `<` without any structural change does NOT
+    qualify as a global fix.
