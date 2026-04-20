@@ -22,6 +22,23 @@ Three key limitations of the original ChatDBG:
 
 ## Study Plan
 
+## Test Case Database
+
+The file `chatdbg_test_case_pipeline.md` documents the complete pipeline for 
+building the evaluation test case corpus from BugsC++. It covers:
+
+- Environment setup (Docker, GDB, Python dependencies, BugsC++ CLI)
+- The SQLite database schema (`data/corpus.db`) and companion flat file structure
+- Six sequential scripts (`scripts/seed_db.py` through `scripts/finalize_corpus.py`)
+  that filter BugsC++'s 209 C/C++ bugs down to ~120-160 reproducible crash cases
+- Verification and commit instructions
+
+The database stores ground-truth crash locations (function, file, line) and 
+developer patches for each included test case. These are the two reference 
+answers used for automated scoring in the evaluation harness.
+
+Run all scripts in order before attempting any evaluation runs.
+
 ### Baselines (drop-in model replacements for ChatDBG procedure)
 
 Run smallest → largest, repeating the original ChatDBG tests:
