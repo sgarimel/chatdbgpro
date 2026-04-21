@@ -1,7 +1,7 @@
 """
 scripts/crash_filter.py  —  Pipeline Step 3
 For each successfully-built bug, runs the crash-trigger command under GDB
-three times inside the BugsC++ container. A bug passes the crash filter if
+three times from the local BugsC++ checkout workspace. A bug passes the crash filter if
 it crashes with the SAME catchable signal (SIGSEGV / SIGABRT / SIGFPE / SIGBUS)
 on all three runs.
 
@@ -15,11 +15,8 @@ Usage:
 
 Estimated time: 2–4 hours. Run in tmux.
 
-NOTE on bugscpp exec:
-    bugscpp exec <project> <index> -- <cmd>  runs <cmd> inside the bug's
-    container with the correct working directory already set.
-    If your bugscpp version does not have `exec`, see the TODO below and
-    replace with `docker exec` against the running container.
+This script intentionally does NOT use `bugscpp exec` because it is not part
+of the documented CLI surface.
 """
 
 import argparse
@@ -35,9 +32,51 @@ from utils import (
     DB_PATH,
     FILTER_RUNS_DIR,
     IssueTracker,
+    checkout_bug,
     get_db_connection,
-    run_bugscpp,
+    get_workspace_dir,
+    tokenize_trigger,
 )
+
+# Bash snippet run inside the docker container. Populates LD_LIBRARY_PATH from
+# every .libs directory under the workspace (handles autotools/libtool builds
+# where the real ELF lives under tools/.libs/ and depends on ../.libs/libX.so).
+# Then invokes gdb in batch mode against the (possibly rewritten) argv.
+DOCKER_GDB_SCRIPT = r"""
+export LD_LIBRARY_PATH="$(find /work -type d -name .libs -printf '%p:')${LD_LIBRARY_PATH:-}"
+exec gdb -batch \
+    -ex 'set pagination off' \
+    -ex 'set confirm off' \
+    -ex 'run' \
+    -ex 'bt' \
+    -ex 'quit' \
+    --args "$@"
+"""
+
+
+def resolve_libtool_argv(workspace_dir: Path, argv: list[str]) -> list[str]:
+    """
+    If argv[0] inside the workspace is a libtool shell-wrapper script, rewrite
+    it to the real ELF under sibling .libs/. Leaves argv unchanged otherwise.
+    Safe because we only rewrite when the .libs/ variant actually exists.
+    """
+    if not argv:
+        return argv
+    exe = argv[0]
+    exe_abs = workspace_dir / exe
+    if not exe_abs.is_file():
+        return argv
+    try:
+        head = exe_abs.read_bytes()[:4096]
+    except Exception:
+        return argv
+    if b"libtool" not in head:
+        return argv
+    dirname, _, base = exe.rpartition("/")
+    alt = f"{dirname}/.libs/{base}" if dirname else f".libs/{base}"
+    if (workspace_dir / alt).is_file():
+        return [alt] + argv[1:]
+    return argv
 
 # GDB commands executed in batch mode for each run.
 # `run` starts the program (bugscpp sets up argv via container env).
@@ -69,40 +108,50 @@ def parse_signal(gdb_output: str) -> str | None:
     return None
 
 
-def run_gdb_in_container(
+def run_gdb_in_workspace(
     bug_id: str, project: str, bug_index: int, run_number: int,
     trigger_command: str | None,
+    docker_image: str | None = None,
 ):
     """
-    Run GDB inside the bugscpp container for this bug.
+    Run GDB in the local checked-out buggy workspace for this bug.
+    When docker_image is set, dispatch gdb inside that container with the
+    workspace bind-mounted at /work. Otherwise invoke host gdb directly.
     Returns (crashed, signal, exit_code, raw_path, error_kind).
-    error_kind is None on non-error paths, else: "timeout" | "bugscpp_error".
-
-    The trigger_command comes from BugsC++ metadata (seed_db.py populates it).
-    GDB's `run` reads args from `--args` on the gdb invocation; we append the
-    tokenised trigger so the program actually executes with the crash-inducing
-    input. Without this, `run` launches the program with no args and most bugs
-    will silently exit 0 instead of crashing.
     """
     raw_path = FILTER_RUNS_DIR / f"{bug_id}_run{run_number}.txt"
     raw_path.parent.mkdir(parents=True, exist_ok=True)
 
-    gdb_cmd = list(GDB_BATCH_ARGS)
-    if trigger_command:
-        # Pass trigger tokens after `--args PROGRAM [ARGV...]`. bugscpp `exec`
-        # runs the command inside the container's working directory, so the
-        # trigger string (e.g. "./tiff2pdf input.tif /dev/null") is split on
-        # whitespace and handed to GDB as the inferior's argv.
-        import shlex
-        gdb_cmd += ["--args"] + shlex.split(trigger_command)
+    workspace_dir = get_workspace_dir(project, bug_index, buggy=True)
+    if not workspace_dir.exists():
+        raw_path.write_text(f"WORKSPACE_NOT_FOUND: {workspace_dir}")
+        return False, None, -1, str(raw_path), "bugscpp_error"
+
+    trigger_argv = tokenize_trigger(trigger_command)
+    trigger_argv = resolve_libtool_argv(workspace_dir, trigger_argv)
+
+    if docker_image:
+        cmd = [
+            "docker", "run", "--rm",
+            "-v", f"{workspace_dir.resolve()}:/work",
+            "-w", "/work",
+            docker_image,
+            "bash", "-c", DOCKER_GDB_SCRIPT, "bash",
+        ] + trigger_argv
+        run_cwd = None
+    else:
+        cmd = ["gdb"] + list(GDB_BATCH_ARGS)
+        if trigger_argv:
+            cmd += ["--args"] + trigger_argv
+        run_cwd = str(workspace_dir)
 
     try:
         result = subprocess.run(
-            ["bugscpp", "exec", project, str(bug_index), "--buggy",
-             "--", "gdb"] + gdb_cmd,
+            cmd,
             capture_output=True,
             text=True,
-            timeout=120,
+            timeout=180 if docker_image else 120,
+            cwd=run_cwd,
         )
     except subprocess.TimeoutExpired:
         raw_path.write_text("TIMEOUT")
@@ -122,26 +171,25 @@ def run_gdb_in_container(
     return crashed, signal, result.returncode, str(raw_path), None
 
 
-def run(db_path=DB_PATH, resume=False):
+def run(db_path=DB_PATH, resume=False, bug_id=None, docker_image=None):
     con = get_db_connection(db_path)
     cur = con.cursor()
 
+    base_sql = """
+        SELECT t.bug_id, t.project, t.bug_index, t.trigger_command
+        FROM test_cases t
+        JOIN build_log b ON t.bug_id = b.bug_id
+        WHERE b.success = 1
+    """
+    params: tuple = ()
+    if bug_id:
+        base_sql += " AND t.bug_id = ?"
+        params = (bug_id,)
     if resume:
-        # Skip bugs that already have filter_log entries (all 3 runs)
-        built = cur.execute("""
-            SELECT t.bug_id, t.project, t.bug_index, t.trigger_command
-            FROM test_cases t
-            JOIN build_log b ON t.bug_id = b.bug_id
-            WHERE b.success = 1
-              AND (SELECT COUNT(*) FROM filter_log f WHERE f.bug_id = t.bug_id) < 3
-        """).fetchall()
-    else:
-        built = cur.execute("""
-            SELECT t.bug_id, t.project, t.bug_index, t.trigger_command
-            FROM test_cases t
-            JOIN build_log b ON t.bug_id = b.bug_id
-            WHERE b.success = 1
-        """).fetchall()
+        base_sql += (
+            " AND (SELECT COUNT(*) FROM filter_log f WHERE f.bug_id = t.bug_id) < 3"
+        )
+    built = cur.execute(base_sql, params).fetchall()
 
     if not built:
         print("[crash_filter] No bugs to process.")
@@ -165,9 +213,41 @@ def run(db_path=DB_PATH, resume=False):
             missing_trigger += 1
             issues.record("missing_trigger", bug_id, "no trigger_command in DB")
 
+        # When running against an already-checked-out workspace (e.g. the
+        # smoke sandbox) re-running checkout is wasted work. Skip if present.
+        workspace_dir = get_workspace_dir(project, bug_index, buggy=True)
+        if workspace_dir.exists():
+            class _OK: returncode = 0; stderr = ""; stdout = ""
+            co = _OK()
+        else:
+            co = checkout_bug(project, bug_index, buggy=True, timeout=180)
+        if co.returncode != 0:
+            err = (co.stderr or co.stdout or "checkout failed")[:2000]
+            for run_num in range(1, 4):
+                raw_path = FILTER_RUNS_DIR / f"{bug_id}_run{run_num}.txt"
+                raw_path.parent.mkdir(parents=True, exist_ok=True)
+                raw_path.write_text(f"CHECKOUT_FAILED: {err}")
+                cur.execute(
+                    """
+                    INSERT INTO filter_log
+                        (bug_id, run_number, crashed, signal, gdb_exit_code, raw_output_path)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (bug_id, run_num, 0, None, -1, str(raw_path)),
+                )
+            issues.record("bugscpp_error", bug_id, "checkout_failed")
+            cur.execute(
+                "UPDATE test_cases SET crash_reproducible = 0 WHERE bug_id = ?",
+                (bug_id,),
+            )
+            con.commit()
+            continue
+
         for run_num in range(1, 4):
-            crashed, signal, exit_code, raw_path, err_kind = run_gdb_in_container(
-                bug_id, project, bug_index, run_num, trigger
+
+            crashed, signal, exit_code, raw_path, err_kind = run_gdb_in_workspace(
+                bug_id, project, bug_index, run_num, trigger,
+                docker_image=docker_image,
             )
 
             cur.execute(
@@ -239,5 +319,13 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--resume", action="store_true",
                         help="Skip bugs already partially processed in filter_log")
+    parser.add_argument("--bug-id", default=None,
+                        help="Run only this bug_id (e.g. libtiff-2)")
+    parser.add_argument("--db", default=str(DB_PATH),
+                        help="Path to sqlite DB (default: data/corpus.db)")
+    parser.add_argument("--docker-image", default=None,
+                        help="Run gdb inside this docker image with workspace "
+                             "mounted at /work (e.g. chatdbgpro/gdb-libtiff:latest)")
     args = parser.parse_args()
-    run(resume=args.resume)
+    run(db_path=args.db, resume=args.resume,
+        bug_id=args.bug_id, docker_image=args.docker_image)

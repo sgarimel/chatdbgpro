@@ -1,7 +1,7 @@
 """
 scripts/extract_patches.py  —  Pipeline Step 5
 For each crash-eligible bug:
-  1. Pulls the developer's ground-truth patch via `bugscpp show --patch`
+  1. Reads the ground-truth patch directly from BugsC++ taxonomy patch files
   2. Saves it to data/patches/<bug_id>.diff
   3. Runs the fixed version's test suite to confirm the patch is valid
   4. Sets patch_validated = 1 in test_cases if validation passes
@@ -21,56 +21,87 @@ import subprocess
 
 from tqdm import tqdm
 
-from utils import DATA_DIR, DB_PATH, IssueTracker, PATCHES_DIR, get_db_connection, run_bugscpp
+from utils import (
+    DATA_DIR,
+    DB_PATH,
+    IssueTracker,
+    PATCHES_DIR,
+    checkout_bug,
+    get_db_connection,
+    get_workspace_dir,
+    read_taxonomy_patch,
+    run_bugscpp,
+)
 
 
 def extract_patch(project: str, bug_index: int, patch_path) -> bool:
     """
-    Pull the ground-truth unified diff from bugscpp and write to patch_path.
+    Read the ground-truth unified diff from the taxonomy patch directory and
+    write it to patch_path.
     Returns True if the file is non-empty.
     """
-    result = run_bugscpp(
-        ["show", project, str(bug_index), "--patch"],
-        timeout=60,
-        check=True,
-    )
-    content = result.stdout.strip()
+    content = read_taxonomy_patch(project, bug_index).strip()
     if not content:
         return False
-    patch_path.write_text(content)
+    patch_path.write_text(content + "\n")
     return True
 
 
-def validate_patch(project: str, bug_index: int) -> bool:
+def validate_patch(
+    project: str, bug_index: int, case_expr: str | None = None,
+    build_timeout: int = 900, test_timeout: int = 600,
+) -> tuple[bool, str]:
     """
-    Build and test the FIXED version of the bug inside the container.
-    Returns True if the test suite exits 0 (all tests pass with the patch).
+    Build and test the FIXED version of the bug via the bugscpp CLI.
+    Workflow (per bugscpp docs):
+      1. `bugscpp checkout <project> <index> -t <target>` (no --buggy) ->
+         creates <target>/<project>/fixed-<index>
+      2. `bugscpp build <fixed_checkout_path>`
+      3. `bugscpp test  <fixed_checkout_path> [--case <expr>]`
 
-    `--buggy false` (or similar flag) tells bugscpp to use the fixed source tree.
-    The exact flag name varies by bugscpp version — adjust if needed.
+    Returns (ok, reason). `ok=True` iff the test suite exits 0.
+    `reason` is one of: "ok", "checkout_failed: ...", "build_failed: ...",
+    "tests_failed: ...".
     """
-    result = run_bugscpp(
-        ["test", project, str(bug_index)],  # tests fixed version by default
-        timeout=300,
-    )
-    return result.returncode == 0
+    fixed_dir = get_workspace_dir(project, bug_index, buggy=False)
+    if not fixed_dir.exists():
+        co = checkout_bug(project, bug_index, buggy=False, timeout=300)
+        if co.returncode != 0:
+            err = (co.stderr or co.stdout or "checkout failed").strip()[:200]
+            return False, f"checkout_failed: {err}"
+
+    build = run_bugscpp(["build", str(fixed_dir)], timeout=build_timeout)
+    if build.returncode != 0:
+        err = (build.stderr or build.stdout or "build failed").strip()[-200:]
+        return False, f"build_failed: {err}"
+
+    test_cmd = ["test", str(fixed_dir)]
+    if case_expr:
+        test_cmd += ["--case", case_expr]
+    result = run_bugscpp(test_cmd, timeout=test_timeout)
+    if result.returncode != 0:
+        err = (result.stderr or result.stdout or "tests failed").strip()[-200:]
+        return False, f"tests_failed: {err}"
+    return True, "ok"
 
 
-def run(db_path=DB_PATH, resume=False, skip_validation=False):
+def run(db_path=DB_PATH, resume=False, skip_validation=False, case_expr=None,
+        bug_id=None):
     PATCHES_DIR.mkdir(parents=True, exist_ok=True)
     con = get_db_connection(db_path)
     cur = con.cursor()
 
+    base_sql = (
+        "SELECT bug_id, project, bug_index FROM test_cases "
+        "WHERE crash_reproducible = 1"
+    )
+    params: tuple = ()
+    if bug_id:
+        base_sql += " AND bug_id = ?"
+        params = (bug_id,)
     if resume:
-        eligible = cur.execute("""
-            SELECT bug_id, project, bug_index FROM test_cases
-            WHERE crash_reproducible = 1 AND patch_path IS NULL
-        """).fetchall()
-    else:
-        eligible = cur.execute("""
-            SELECT bug_id, project, bug_index FROM test_cases
-            WHERE crash_reproducible = 1
-        """).fetchall()
+        base_sql += " AND patch_path IS NULL"
+    eligible = cur.execute(base_sql, params).fetchall()
 
     if not eligible:
         print("[extract_patches] No crash-eligible bugs to process.")
@@ -113,9 +144,13 @@ def run(db_path=DB_PATH, resume=False, skip_validation=False):
         valid = False
         if not skip_validation:
             try:
-                valid = validate_patch(project, bug_index)
+                valid, reason = validate_patch(
+                    project, bug_index, case_expr=case_expr,
+                )
                 if not valid:
-                    issues.record("validation_failed", bug_id, "test suite nonzero exit")
+                    kind = reason.split(":", 1)[0] or "validation_failed"
+                    tqdm.write(f"  [VALIDATION FAIL] {bug_id}: {reason}")
+                    issues.record(kind, bug_id, reason[:160])
             except subprocess.TimeoutExpired:
                 tqdm.write(f"  [VALIDATION TIMEOUT] {bug_id}")
                 issues.record("validation_timeout", bug_id)
@@ -123,7 +158,9 @@ def run(db_path=DB_PATH, resume=False, skip_validation=False):
                 tqdm.write(f"  [VALIDATION ERROR] {bug_id}: {e}")
                 issues.record("bugscpp_error", bug_id, str(e)[:120])
         else:
-            valid = True  # trust extraction if validation is skipped
+            # Extraction-only mode: mark patch_validated=0 so finalize can
+            # distinguish "extracted but not yet validated" from real pass.
+            valid = False
 
         if valid:
             validated += 1
@@ -153,5 +190,16 @@ if __name__ == "__main__":
                         help="Skip bugs that already have patch_path set")
     parser.add_argument("--skip-validation", action="store_true",
                         help="Extract patches without running the test suite")
+    parser.add_argument(
+        "--case",
+        default=None,
+        help="Optional bugscpp --case expression for targeted validation tests",
+    )
+    parser.add_argument("--bug-id", default=None,
+                        help="Process only this bug_id")
+    parser.add_argument("--db", default=str(DB_PATH),
+                        help="Path to sqlite DB (default: data/corpus.db)")
     args = parser.parse_args()
-    run(resume=args.resume, skip_validation=args.skip_validation)
+    run(db_path=args.db, resume=args.resume,
+        skip_validation=args.skip_validation, case_expr=args.case,
+        bug_id=args.bug_id)

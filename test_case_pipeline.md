@@ -72,7 +72,7 @@ git clone https://github.com/Suresoft-GLaDOS/bugscpp.git
 cd bugscpp
 ```
 
-The BugsC++ repo contains the metadata for all 209 bugs (project names, bug indices, trigger commands, expected signals) in a structured format that the CLI reads. You do not need to build anything from source — the CLI just references this metadata and pulls Docker images.
+The BugsC++ repo contains metadata for all defects (currently 215 across 24 projects, excluding the example project in most runs): project names, bug indices, trigger commands, and tags. You do not need to build BugsC++ from source for this pipeline.
 
 ### 1.4 Cloning Your Project Repo
 
@@ -103,7 +103,7 @@ data/
 
 ### 1.5 Pulling BugsC++ Docker Images
 
-This step downloads all 209 Docker images (~50–100 GB total). Run it once on a machine with good bandwidth. On Tinker, do this in a `tmux` session in case your connection drops.
+This step downloads Docker images for the full dataset (~50-100 GB total). Run it once on a machine with good bandwidth. On Tinker, do this in a `tmux` session in case your connection drops.
 
 ```bash
 # Pull all images — takes 30–60 minutes depending on connection
@@ -249,7 +249,7 @@ BugsC++ has a structured metadata file for each project that lists all bugs, the
 ```python
 # scripts/seed_db.py
 """
-Reads BugsC++ metadata and inserts all 209 bugs into test_cases
+Reads BugsC++ metadata and inserts all bug candidates into test_cases
 as candidate rows. Does not build or run anything.
 """
 
@@ -307,20 +307,20 @@ if __name__ == "__main__":
 Run it:
 ```bash
 python scripts/seed_db.py
-# Expected: "Seeded 209 bugs into data/corpus.db"
+# Expected: "Seeded <N> bugs into data/corpus.db" (typically ~214 when skipping example)
 ```
 
 **Note:** The exact `bugscpp list --json` interface depends on the BugsC++ version. If it does not support `--json`, inspect the metadata directory in the cloned BugsC++ repo (`bugscpp/metadata/`) — each project has a JSON file listing its bugs. The seed script may need to read those files directly instead.
 
 ### 3.2 Build Filter: Compile Each Bug with Debug Symbols
 
-Before running GDB, each bug must be built inside its Docker container with `-g -O0`. This script attempts the build for every candidate and logs the result.
+Before running GDB, each bug must be checked out and built with debug symbols (`-g -O0`). This script attempts the build for every candidate and logs the result.
 
 ```python
 # scripts/build_filter.py
 """
-For each candidate bug in test_cases, attempt to build the buggy version
-with -g -O0 inside the BugsC++ Docker container. Logs results to build_log.
+For each candidate bug in test_cases, checkout the buggy workspace and
+build with debug symbols. Logs results to build_log.
 """
 
 import sqlite3
@@ -390,6 +390,8 @@ Bugs that fail to build are excluded from all subsequent steps. Do not delete th
 
 This is the core filtering step. For each bug that built successfully, run the crash-triggering test input under GDB in batch mode and check whether the program crashes with a catchable signal. Repeat three times to confirm reproducibility.
 
+Important CLI compatibility note: the documented BugsC++ CLI does **not** include `bugscpp exec`. The pipeline runs GDB directly from the checked-out local workspace directory instead.
+
 ```python
 # scripts/crash_filter.py
 """
@@ -436,23 +438,22 @@ def get_trigger_command(project, bug_index):
 
 def run_gdb(bug_id, project, bug_index, run_number):
     """
-    Run the buggy program under GDB inside the BugsC++ container.
+    Run the buggy program under GDB from the checked-out buggy workspace.
     Returns (crashed: bool, signal: str or None, output: str)
     """
     raw_path = os.path.join(FILTER_RUN_DIR, f"{bug_id}_run{run_number}.txt")
 
     try:
-        # bugscpp exec runs a command inside the bug's container
+        # Run gdb directly in the local buggy workspace directory
         result = subprocess.run(
-            ["bugscpp", "exec", project, str(bug_index),
-             "--", "gdb", "-batch",
+            ["gdb", "-batch",
              "-ex", "set pagination off",
              "-ex", "set confirm off",
              "-ex", "run",
              "-ex", "bt",
              "-ex", "quit",
-             "--args", "TRIGGER_PLACEHOLDER"],   # bugscpp substitutes trigger command
-            capture_output=True, text=True, timeout=120
+             "--args", "TRIGGER_PLACEHOLDER"],   # populate from trigger_command metadata
+            capture_output=True, text=True, timeout=120, cwd="WORKSPACE_BUGGY_DIR"
         )
         output = result.stdout + result.stderr
 
@@ -544,7 +545,7 @@ Run it:
 python scripts/crash_filter.py
 ```
 
-This is the slowest step — 3 GDB runs × ~200 bugs × container startup time. On a fast machine, budget 2–4 hours. Run it in `tmux`.
+This is the slowest step — 3 GDB runs x ~200 bugs. On a fast machine, budget 2-4 hours. Run it in `tmux`.
 
 After completion:
 ```bash
@@ -555,7 +556,7 @@ sqlite3 data/corpus.db \
 
 ### 3.4 Extract Crash Location from Backtrace
 
-For each reproducibly crashing bug, run GDB one more time with a richer command set to capture the full backtrace and extract the crash frames.
+For each reproducibly crashing bug, run GDB one more time with a richer command set from the checked-out workspace to capture the full backtrace and extract the crash frames.
 
 ```python
 # scripts/extract_crash_location.py
@@ -704,9 +705,11 @@ Manually inspect 2–3 of the raw backtrace files in `data/backtraces/` to confi
 # scripts/extract_patches.py
 """
 For each crash-eligible bug:
-1. Extracts the developer's ground-truth patch via bugscpp CLI
+1. Reads the developer's ground-truth patch from taxonomy patch files:
+   `../bugscpp/bugscpp/taxonomy/<project>/patch/<idx:04d>-buggy.patch`
+   and `../bugscpp/bugscpp/taxonomy/<project>/patch/<idx:04d>-common.patch`
 2. Stores it to data/patches/<bug_id>.diff
-3. Applies the patch to the fixed version and confirms the test suite passes
+3. Validates against the fixed version by running `bugscpp test`
 4. Sets patch_validated = 1 if validation succeeds
 5. Updates patch_path in test_cases
 """
@@ -722,22 +725,17 @@ PATCHES_DIR = "data/patches"
 os.makedirs(PATCHES_DIR, exist_ok=True)
 
 def extract_patch(project, bug_index, patch_path):
-    """Pull the ground-truth patch from bugscpp and write to file."""
-    result = subprocess.run(
-        ["bugscpp", "show", project, str(bug_index), "--patch"],
-        capture_output=True, text=True, check=True
-    )
-    with open(patch_path, "w") as f:
-        f.write(result.stdout)
-    return len(result.stdout) > 0
+    """Read patch text from taxonomy files and write to file."""
+    # Read 0001-buggy.patch and 0001-common.patch if present, concatenate.
+    ...
 
-def validate_patch(project, bug_index):
+def validate_patch(project, bug_index, case_expr=None):
     """
-    Apply the patch to the fixed version of the bug inside the container
-    and run the test suite. Returns True if all tests pass.
+    Run tests on the fixed version. Returns True if tests pass.
+    Optional: pass --case <EXPR> to target a subset of test IDs.
     """
     result = subprocess.run(
-        ["bugscpp", "test", project, str(bug_index), "--buggy", "false"],
+        ["bugscpp", "test", project, str(bug_index)],
         capture_output=True, text=True, timeout=300
     )
     return result.returncode == 0
@@ -927,7 +925,7 @@ data/
     └── ...
 
 scripts/
-├── seed_db.py              # Step 1: insert all 209 candidates
+├── seed_db.py              # Step 1: insert all discovered candidates
 ├── build_filter.py         # Step 2: attempt builds, log results
 ├── crash_filter.py         # Step 3: run GDB 3x, check signals
 ├── extract_crash_location.py  # Step 4: parse frames, store backtrace files
