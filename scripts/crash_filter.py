@@ -10,38 +10,32 @@ Raw output per run is saved to data/filter_runs/<bug_id>_run<N>.txt
 (these are NOT committed — add filter_runs/ to .gitignore).
 
 Usage:
-    python scripts/crash_filter.py            # process all build-successful bugs
-    python scripts/crash_filter.py --resume   # skip bugs already in filter_log
+    python scripts/crash_filter.py                         # serial, all built bugs
+    python scripts/crash_filter.py --resume                # skip bugs already in filter_log
+    python scripts/crash_filter.py --workers 4             # 4 parallel workers
+    python scripts/crash_filter.py --bug-id libtiff-2      # one bug only
 
-Estimated time: 2–4 hours. Run in tmux.
-
-This script intentionally does NOT use `bugscpp exec` because it is not part
-of the documented CLI surface.
+Estimated time: 2–4 hours serial, ~30–45 min with 4 workers. Run in tmux.
 """
 
 import argparse
-import os
 import re
 import subprocess
 from pathlib import Path
 
-from tqdm import tqdm
-
+from _parallel import BugResult, run_pipeline_step
 from utils import (
     CATCHABLE_SIGNALS,
     DB_PATH,
     FILTER_RUNS_DIR,
     IssueTracker,
     checkout_bug,
+    gdb_image_for,
     get_db_connection,
     get_workspace_dir,
     tokenize_trigger,
 )
 
-# Bash snippet run inside the docker container. Populates LD_LIBRARY_PATH from
-# every .libs directory under the workspace (handles autotools/libtool builds
-# where the real ELF lives under tools/.libs/ and depends on ../.libs/libX.so).
-# Then invokes gdb in batch mode against the (possibly rewritten) argv.
 DOCKER_GDB_SCRIPT = r"""
 export LD_LIBRARY_PATH="$(find /work -type d -name .libs -printf '%p:')${LD_LIBRARY_PATH:-}"
 exec gdb -batch \
@@ -55,11 +49,6 @@ exec gdb -batch \
 
 
 def resolve_libtool_argv(workspace_dir: Path, argv: list[str]) -> list[str]:
-    """
-    If argv[0] inside the workspace is a libtool shell-wrapper script, rewrite
-    it to the real ELF under sibling .libs/. Leaves argv unchanged otherwise.
-    Safe because we only rewrite when the .libs/ variant actually exists.
-    """
     if not argv:
         return argv
     exe = argv[0]
@@ -78,9 +67,7 @@ def resolve_libtool_argv(workspace_dir: Path, argv: list[str]) -> list[str]:
         return [alt] + argv[1:]
     return argv
 
-# GDB commands executed in batch mode for each run.
-# `run` starts the program (bugscpp sets up argv via container env).
-# `bt` prints backtrace after the crash.
+
 GDB_BATCH_ARGS = [
     "-batch",
     "-ex", "set pagination off",
@@ -92,12 +79,6 @@ GDB_BATCH_ARGS = [
 
 
 def parse_signal(gdb_output: str) -> str | None:
-    """
-    Extract the signal name from GDB batch output.
-    GDB prints:
-        Program received signal SIGSEGV, Segmentation fault.
-        Program terminated with signal SIGABRT, Aborted.
-    """
     for pattern in [
         r"Program received signal (\w+)",
         r"Program terminated with signal (\w+)",
@@ -113,12 +94,7 @@ def run_gdb_in_workspace(
     trigger_command: str | None,
     docker_image: str | None = None,
 ):
-    """
-    Run GDB in the local checked-out buggy workspace for this bug.
-    When docker_image is set, dispatch gdb inside that container with the
-    workspace bind-mounted at /work. Otherwise invoke host gdb directly.
-    Returns (crashed, signal, exit_code, raw_path, error_kind).
-    """
+    """Returns (crashed, signal, exit_code, raw_path, error_kind)."""
     raw_path = FILTER_RUNS_DIR / f"{bug_id}_run{run_number}.txt"
     raw_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -171,7 +147,100 @@ def run_gdb_in_workspace(
     return crashed, signal, result.returncode, str(raw_path), None
 
 
-def run(db_path=DB_PATH, resume=False, bug_id=None, docker_image=None):
+def process_one(row: dict, ctx: dict) -> BugResult:
+    bug_id = row["bug_id"]
+    project = row["project"]
+    bug_index = row["bug_index"]
+    trigger = row["trigger_command"]
+    if ctx.get("no_docker"):
+        docker_image = None
+    else:
+        docker_image = ctx.get("docker_image_override") or gdb_image_for(project)
+
+    res = BugResult(bug_id=bug_id)
+
+    if not trigger:
+        res.counters["missing_trigger"] = 1
+        res.issue_records.append(("missing_trigger", bug_id, "no trigger_command in DB"))
+
+    workspace_dir = get_workspace_dir(project, bug_index, buggy=True)
+    if not workspace_dir.exists():
+        co = checkout_bug(project, bug_index, buggy=True, timeout=180)
+        if co.returncode != 0:
+            err = (co.stderr or co.stdout or "checkout failed")[:2000]
+            for run_num in range(1, 4):
+                raw_path = FILTER_RUNS_DIR / f"{bug_id}_run{run_num}.txt"
+                raw_path.parent.mkdir(parents=True, exist_ok=True)
+                raw_path.write_text(f"CHECKOUT_FAILED: {err}")
+                res.db_updates.append((
+                    "INSERT INTO filter_log "
+                    "(bug_id, run_number, crashed, signal, gdb_exit_code, raw_output_path) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (bug_id, run_num, 0, None, -1, str(raw_path)),
+                ))
+            res.issue_records.append(("bugscpp_error", bug_id, "checkout_failed"))
+            res.db_updates.append((
+                "UPDATE test_cases SET crash_reproducible = 0 WHERE bug_id = ?",
+                (bug_id,),
+            ))
+            return res
+
+    signals_seen: list[str] = []
+    for run_num in range(1, 4):
+        crashed, signal, exit_code, raw_path, err_kind = run_gdb_in_workspace(
+            bug_id, project, bug_index, run_num, trigger,
+            docker_image=docker_image,
+        )
+        res.db_updates.append((
+            "INSERT INTO filter_log "
+            "(bug_id, run_number, crashed, signal, gdb_exit_code, raw_output_path) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (bug_id, run_num, 1 if crashed else 0, signal, exit_code, raw_path),
+        ))
+        if err_kind:
+            res.issue_records.append((err_kind, bug_id, f"run{run_num}"))
+        if crashed:
+            signals_seen.append(signal)
+
+    reproducible = (
+        len(signals_seen) == 3
+        and len(set(signals_seen)) == 1
+        and signals_seen[0] in CATCHABLE_SIGNALS
+    )
+
+    if reproducible:
+        res.db_updates.append((
+            "UPDATE test_cases SET crash_signal = ?, crash_reproducible = 1 "
+            "WHERE bug_id = ?",
+            (signals_seen[0], bug_id),
+        ))
+        res.counters["eligible"] = 1
+        res.log_lines.append(f"  [REPRO:{signals_seen[0]}] {bug_id}")
+    else:
+        res.db_updates.append((
+            "UPDATE test_cases SET crash_reproducible = 0 WHERE bug_id = ?",
+            (bug_id,),
+        ))
+        if not signals_seen:
+            res.issue_records.append(("no_signal", bug_id, "no crash in any run"))
+            res.log_lines.append(f"  [NO CRASH] {bug_id}")
+        elif len(set(signals_seen)) > 1:
+            res.issue_records.append(
+                ("inconsistent_signal", bug_id, f"signals={signals_seen}"))
+            res.log_lines.append(f"  [INCONSISTENT] {bug_id}: {signals_seen}")
+        elif signals_seen[0] not in CATCHABLE_SIGNALS:
+            res.issue_records.append(("non_catchable", bug_id, signals_seen[0]))
+            res.log_lines.append(f"  [NON-CATCHABLE] {bug_id}: {signals_seen[0]}")
+        else:
+            res.issue_records.append(
+                ("flaky_crash", bug_id, f"crashed {len(signals_seen)}/3 runs"))
+            res.log_lines.append(f"  [FLAKY] {bug_id}: {len(signals_seen)}/3 runs")
+
+    return res
+
+
+def run(db_path=DB_PATH, resume=False, bug_id=None,
+        docker_image_override=None, no_docker=False, workers=1):
     con = get_db_connection(db_path)
     cur = con.cursor()
 
@@ -193,120 +262,29 @@ def run(db_path=DB_PATH, resume=False, bug_id=None, docker_image=None):
 
     if not built:
         print("[crash_filter] No bugs to process.")
+        con.close()
         return
 
-    print(f"[crash_filter] Running GDB on {len(built)} bug(s), 3 runs each "
-          f"(resume={resume})")
+    rows = [dict(r) for r in built]
+    print(f"[crash_filter] Running GDB on {len(rows)} bug(s), 3 runs each "
+          f"(resume={resume}, workers={workers})")
 
     issues = IssueTracker("crash_filter")
-    eligible_count = 0
-    missing_trigger = 0
-
-    for row in tqdm(built, desc="Crash filter", unit="bug"):
-        bug_id     = row["bug_id"]
-        project    = row["project"]
-        bug_index  = row["bug_index"]
-        trigger    = row["trigger_command"]
-        signals_seen = []
-
-        if not trigger:
-            missing_trigger += 1
-            issues.record("missing_trigger", bug_id, "no trigger_command in DB")
-
-        # When running against an already-checked-out workspace (e.g. the
-        # smoke sandbox) re-running checkout is wasted work. Skip if present.
-        workspace_dir = get_workspace_dir(project, bug_index, buggy=True)
-        if workspace_dir.exists():
-            class _OK: returncode = 0; stderr = ""; stdout = ""
-            co = _OK()
-        else:
-            co = checkout_bug(project, bug_index, buggy=True, timeout=180)
-        if co.returncode != 0:
-            err = (co.stderr or co.stdout or "checkout failed")[:2000]
-            for run_num in range(1, 4):
-                raw_path = FILTER_RUNS_DIR / f"{bug_id}_run{run_num}.txt"
-                raw_path.parent.mkdir(parents=True, exist_ok=True)
-                raw_path.write_text(f"CHECKOUT_FAILED: {err}")
-                cur.execute(
-                    """
-                    INSERT INTO filter_log
-                        (bug_id, run_number, crashed, signal, gdb_exit_code, raw_output_path)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                    """,
-                    (bug_id, run_num, 0, None, -1, str(raw_path)),
-                )
-            issues.record("bugscpp_error", bug_id, "checkout_failed")
-            cur.execute(
-                "UPDATE test_cases SET crash_reproducible = 0 WHERE bug_id = ?",
-                (bug_id,),
-            )
-            con.commit()
-            continue
-
-        for run_num in range(1, 4):
-
-            crashed, signal, exit_code, raw_path, err_kind = run_gdb_in_workspace(
-                bug_id, project, bug_index, run_num, trigger,
-                docker_image=docker_image,
-            )
-
-            cur.execute(
-                """
-                INSERT INTO filter_log
-                    (bug_id, run_number, crashed, signal, gdb_exit_code, raw_output_path)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (bug_id, run_num, 1 if crashed else 0, signal, exit_code, raw_path),
-            )
-
-            if err_kind:
-                issues.record(err_kind, bug_id, f"run{run_num}")
-            if crashed:
-                signals_seen.append(signal)
-
-        # Reproducible = same catchable signal on all 3 runs
-        reproducible = (
-            len(signals_seen) == 3
-            and len(set(signals_seen)) == 1
-            and signals_seen[0] in CATCHABLE_SIGNALS
-        )
-
-        if reproducible:
-            cur.execute(
-                """
-                UPDATE test_cases
-                SET crash_signal = ?, crash_reproducible = 1
-                WHERE bug_id = ?
-                """,
-                (signals_seen[0], bug_id),
-            )
-            eligible_count += 1
-            tqdm.write(f"  [REPRO:{signals_seen[0]}] {bug_id}")
-        else:
-            cur.execute(
-                "UPDATE test_cases SET crash_reproducible = 0 WHERE bug_id = ?",
-                (bug_id,),
-            )
-            # Categorize why it failed the crash filter
-            if not signals_seen:
-                issues.record("no_signal", bug_id, "no crash in any run")
-                tqdm.write(f"  [NO CRASH] {bug_id}")
-            elif len(set(signals_seen)) > 1:
-                issues.record("inconsistent_signal", bug_id,
-                              f"signals={signals_seen}")
-                tqdm.write(f"  [INCONSISTENT] {bug_id}: {signals_seen}")
-            elif signals_seen[0] not in CATCHABLE_SIGNALS:
-                issues.record("non_catchable", bug_id, signals_seen[0])
-                tqdm.write(f"  [NON-CATCHABLE] {bug_id}: {signals_seen[0]}")
-            else:
-                issues.record("flaky_crash", bug_id,
-                              f"crashed {len(signals_seen)}/3 runs")
-                tqdm.write(f"  [FLAKY] {bug_id}: {len(signals_seen)}/3 runs")
-
-        con.commit()  # commit per-bug so progress survives interruptions
-
+    counters = run_pipeline_step(
+        bug_rows=rows,
+        work_fn=process_one,
+        ctx={"docker_image_override": docker_image_override,
+             "no_docker": no_docker},
+        workers=workers,
+        desc="Crash filter",
+        con=con,
+        issue_tracker=issues,
+    )
     con.close()
-    print(f"[crash_filter] Done: {eligible_count}/{len(built)} bugs crash reproducibly")
+
+    eligible_count = counters.get("eligible", 0)
+    missing_trigger = counters.get("missing_trigger", 0)
+    print(f"[crash_filter] Done: {eligible_count}/{len(rows)} bugs crash reproducibly")
     if missing_trigger:
         print(f"[crash_filter] WARNING: {missing_trigger} bugs had no trigger_command "
               f"in test_cases — GDB launched with no argv, which usually means "
@@ -324,8 +302,15 @@ if __name__ == "__main__":
     parser.add_argument("--db", default=str(DB_PATH),
                         help="Path to sqlite DB (default: data/corpus.db)")
     parser.add_argument("--docker-image", default=None,
-                        help="Run gdb inside this docker image with workspace "
-                             "mounted at /work (e.g. chatdbgpro/gdb-libtiff:latest)")
+                        help="Override the per-project chatdbgpro/gdb-<project>:latest "
+                             "image for ALL bugs in this run (useful for debugging). "
+                             "Default: each bug uses its own project image.")
+    parser.add_argument("--no-docker", action="store_true",
+                        help="Run gdb natively on the host instead of in docker "
+                             "(only use if gdb + project build env are installed locally)")
+    parser.add_argument("--workers", type=int, default=1,
+                        help="Number of parallel workers (default: 1 = serial)")
     args = parser.parse_args()
     run(db_path=args.db, resume=args.resume,
-        bug_id=args.bug_id, docker_image=args.docker_image)
+        bug_id=args.bug_id, docker_image_override=args.docker_image,
+        no_docker=args.no_docker, workers=args.workers)
