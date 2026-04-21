@@ -8,6 +8,7 @@ import os
 import sqlite3
 import subprocess
 import json
+import shlex
 from collections import Counter
 from pathlib import Path
 
@@ -31,6 +32,7 @@ CATCHABLE_SIGNALS = {"SIGSEGV", "SIGABRT", "SIGFPE", "SIGBUS"}
 BUGSCPP_REPO = Path(os.environ.get("BUGSCPP_REPO", PROJECT_ROOT.parent / "bugscpp"))
 # Taxonomy lives inside the bugscpp/ Python package subdirectory
 BUGSCPP_TAXONOMY_DIR = BUGSCPP_REPO / "bugscpp" / "taxonomy"
+WORKSPACES_DIR = DATA_DIR / "workspaces"
 
 # Projects to skip (demo/sanitizer variants that aren't real bugs)
 SKIP_PROJECTS = {"example"}
@@ -104,6 +106,57 @@ def run_bugscpp(args, timeout=300, check=False):
         timeout=timeout,
         check=check,
     )
+
+
+def get_workspace_dir(project: str, bug_index: int, buggy: bool = True) -> Path:
+    """
+    Return expected checkout directory for a bug workspace.
+    Layout follows BugsC++ docs:
+      <target>/<project>/<buggy|fixed>-<index>
+    where target is data/workspaces/<project>-<index>.
+    """
+    state = "buggy" if buggy else "fixed"
+    target = WORKSPACES_DIR / f"{project}-{bug_index}"
+    return target / project / f"{state}-{bug_index}"
+
+
+def checkout_bug(project: str, bug_index: int, buggy: bool = True, timeout: int = 180):
+    """Run bugscpp checkout for a bug into the canonical workspace target."""
+    target = str(WORKSPACES_DIR / f"{project}-{bug_index}")
+    args = ["checkout", project, str(bug_index), "--target", target]
+    if buggy:
+        args.append("--buggy")
+    return run_bugscpp(args, timeout=timeout)
+
+
+def tokenize_trigger(trigger_command: str | None) -> list[str]:
+    """Split trigger command into argv list for subprocess/GDB."""
+    if not trigger_command:
+        return []
+    return shlex.split(trigger_command)
+
+
+def read_taxonomy_patch(project: str, bug_index: int) -> str:
+    """
+    Read patch data from BugsC++ taxonomy patch directory.
+    Expected files:
+      <idx:04d>-buggy.patch
+      <idx:04d>-common.patch
+    Returns concatenated patch text in stable order.
+    """
+    patch_dir = BUGSCPP_TAXONOMY_DIR / project / "patch"
+    idx = f"{bug_index:04d}"
+    paths = [
+        patch_dir / f"{idx}-buggy.patch",
+        patch_dir / f"{idx}-common.patch",
+    ]
+
+    chunks = []
+    for p in paths:
+        if p.exists():
+            chunks.append(p.read_text())
+
+    return "\n".join(c.strip("\n") for c in chunks if c).strip() + ("\n" if chunks else "")
 
 
 def _extract_bug_type(tags):

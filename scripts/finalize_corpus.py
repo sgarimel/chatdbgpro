@@ -14,6 +14,8 @@ Usage:
 Prints a summary breakdown after marking the corpus.
 """
 
+import argparse
+
 from utils import DB_PATH, get_db_connection
 
 
@@ -98,4 +100,8 @@ def finalize(db_path=DB_PATH):
 
 
 if __name__ == "__main__":
-    finalize()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--db", default=str(DB_PATH),
+                        help="Path to sqlite DB (default: data/corpus.db)")
+    args = parser.parse_args()
+    finalize(db_path=args.db)
