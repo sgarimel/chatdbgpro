@@ -41,6 +41,8 @@ export LD_LIBRARY_PATH="$(find /work -type d -name .libs -printf '%p:')${LD_LIBR
 exec gdb -batch \
     -ex 'set pagination off' \
     -ex 'set confirm off' \
+    -ex 'set follow-fork-mode child' \
+    -ex 'set detach-on-fork on' \
     -ex 'run' \
     -ex 'bt' \
     -ex 'quit' \
@@ -72,6 +74,8 @@ GDB_BATCH_ARGS = [
     "-batch",
     "-ex", "set pagination off",
     "-ex", "set confirm off",
+    "-ex", "set follow-fork-mode child",
+    "-ex", "set detach-on-fork on",
     "-ex", "run",
     "-ex", "bt",
     "-ex", "quit",

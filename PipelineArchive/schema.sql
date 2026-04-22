@@ -28,6 +28,13 @@ CREATE TABLE IF NOT EXISTS test_cases (
     -- Trigger command (relative to build dir inside container)
     trigger_command     TEXT,               -- e.g. "./tiff2pdf input.tif /dev/null"
 
+    -- Full reproducible GDB command populated by scripts/persist_gdb_commands.py
+    -- after a successful build. Stored verbatim as a shell string that
+    -- subprocess can run (with shell=True) to reproduce the crash.
+    -- Includes docker run, bind mount, image tag, gdb flags, and argv.
+    -- crash_filter.py simply executes it 3x and parses the signal.
+    gdb_command         TEXT,
+
     -- Relative paths from data/ directory
     backtrace_path      TEXT,               -- e.g. "backtraces/libtiff-2.txt"
     patch_path          TEXT,               -- e.g. "patches/libtiff-2.diff"
@@ -60,5 +67,26 @@ CREATE TABLE IF NOT EXISTS build_log (
     success     INTEGER NOT NULL,           -- 1 or 0
     error_msg   TEXT,                       -- NULL if success
     built_at    TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY (bug_id) REFERENCES test_cases(bug_id)
+);
+
+-- One row per case[N] trigger-resolution attempt (F5).
+-- Populated by seed_db.py --resolve-case-triggers.
+-- harness:    "extra_tests" (literal lines), "ctest_json" (concrete argv from
+--             ctest --show-only=json-v1), "templated" (rendered from
+--             common.test.commands with DPP_TEST_INDEX substituted; gdb
+--             attaches to the bash wrapper, not the underlying binary), or
+--             "unsupported" (no handler matched).
+-- status:     "resolved" (high-fidelity argv), "wrapped" (bash wrapper, lower
+--             fidelity), "unsupported" (no trigger emitted), "error" (handler
+--             raised).
+CREATE TABLE IF NOT EXISTS trigger_resolution_log (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    bug_id      TEXT NOT NULL,
+    harness     TEXT NOT NULL,
+    case_index  INTEGER,
+    status      TEXT NOT NULL,
+    reason      TEXT,
+    resolved_at TEXT DEFAULT (datetime('now')),
     FOREIGN KEY (bug_id) REFERENCES test_cases(bug_id)
 );
