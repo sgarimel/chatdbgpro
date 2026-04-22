@@ -24,6 +24,12 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except (AttributeError, OSError):
+    pass
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DB = REPO_ROOT / "data" / "corpus.db"
 WORKSPACES_DIR = REPO_ROOT / "data" / "workspaces"
@@ -64,6 +70,25 @@ def _docker_env() -> dict:
 def _bind_path(p: Path) -> str:
     """Return a host path string that docker can use as the source of -v."""
     return str(p.resolve())
+
+
+def force_rmtree(path: Path) -> None:
+    """rmtree that survives Windows read-only git pack files."""
+    if not path.exists():
+        return
+
+    def _onerror(func, p, exc_info):
+        try:
+            os.chmod(p, 0o700)
+            func(p)
+        except OSError:
+            pass
+
+    # Python 3.12+: onexc; older: onerror
+    try:
+        shutil.rmtree(path, onexc=_onerror)
+    except TypeError:
+        shutil.rmtree(path, onerror=_onerror)
 
 
 # ─── gdb_command construction ────────────────────────────────────────────────
@@ -117,10 +142,15 @@ def build_gdb_command(
     workspace: Path,
     gdb_image: str,
     trigger_argv: list[str],
-) -> tuple[str | None, list[str]]:
-    """Return (full docker-run shell string, resolved argv)."""
+) -> tuple[str | None, list[str] | None, list[str]]:
+    """Return (posix shell string for DB, docker argv list for subprocess, resolved argv).
+
+    The shell string is what the eval driver runs on Linux. The argv list is
+    what we run locally — passing argv avoids cmd.exe mangling of bash's
+    single-quote escape sequences on Windows.
+    """
     if not trigger_argv:
-        return None, trigger_argv
+        return None, None, trigger_argv
 
     if trigger_argv[:2] == ["bash", "-c"]:
         # Shell metacharacters present; let bash drive and rely on
@@ -133,11 +163,18 @@ def build_gdb_command(
     gdb_cmd_str = " ".join(shlex.quote(p) for p in gdb_cmd_parts)
     inner = f"{GDB_PREAMBLE}; exec {gdb_cmd_str}"
 
-    docker_cmd = (
+    docker_shell = (
         f'docker run --rm -v "{_bind_path(workspace)}:/work" -w //work '
         f'{shlex.quote(gdb_image)} bash -c {shlex.quote(inner)}'
     )
-    return docker_cmd, argv
+    docker_argv = [
+        "docker", "run", "--rm",
+        "-v", f"{_bind_path(workspace)}:/work",
+        "-w", "//work",
+        gdb_image,
+        "bash", "-c", inner,
+    ]
+    return docker_shell, docker_argv, argv
 
 
 # ─── Backtrace parsing ───────────────────────────────────────────────────────
@@ -295,8 +332,7 @@ def process_bug(con: sqlite3.Connection, bug: dict, log) -> None:
 
     # 1) Checkout buggy
     buggy_target = WORKSPACES_DIR / case_id
-    if buggy_target.exists():
-        shutil.rmtree(buggy_target, ignore_errors=True)
+    force_rmtree(buggy_target)
     r = run_bugscpp(
         ["checkout", project, str(idx), "--buggy", "--target", str(buggy_target)],
         timeout=300,
@@ -309,7 +345,8 @@ def process_bug(con: sqlite3.Connection, bug: dict, log) -> None:
         return
     update["workspace_path"] = str(buggy.resolve())
 
-    # 2) Build
+    # 2) Build (clean any orphan container from a prior interrupted build first)
+    cleanup_stale_dpp_container(project, log)
     r = run_bugscpp(["build", str(buggy)], timeout=900)
     if r.returncode != 0:
         update["build_error"] = stderr_tail(r)
@@ -333,12 +370,12 @@ def process_bug(con: sqlite3.Connection, bug: dict, log) -> None:
         write_update(con, case_id, update)
         return
 
-    gdb_cmd, resolved_argv = build_gdb_command(buggy, gdb_image, trigger_argv)
-    if gdb_cmd is None:
+    gdb_shell, gdb_argv, resolved_argv = build_gdb_command(buggy, gdb_image, trigger_argv)
+    if gdb_shell is None:
         log(f"[{case_id}] BUILT, GDB CMD UNAVAILABLE")
         write_update(con, case_id, update)
         return
-    update["gdb_command"] = gdb_cmd
+    update["gdb_command"] = gdb_shell
 
     # 4) Run 3x
     signals: list[str | None] = []
@@ -346,7 +383,7 @@ def process_bug(con: sqlite3.Connection, bug: dict, log) -> None:
     for i in range(3):
         try:
             r = subprocess.run(
-                gdb_cmd, shell=True,
+                gdb_argv,
                 capture_output=True, text=True, timeout=240,
                 env=_docker_env(),
             )
@@ -381,8 +418,7 @@ def process_bug(con: sqlite3.Connection, bug: dict, log) -> None:
 
     # 7) Patch extraction (fixed checkout, diff, cleanup)
     fixed_target = WORKSPACES_DIR / f"{case_id}-fixed"
-    if fixed_target.exists():
-        shutil.rmtree(fixed_target, ignore_errors=True)
+    force_rmtree(fixed_target)
     rfix = run_bugscpp(
         ["checkout", project, str(idx), "--target", str(fixed_target)],
         timeout=300,
@@ -397,7 +433,7 @@ def process_bug(con: sqlite3.Connection, bug: dict, log) -> None:
         except Exception as e:
             log(f"[{case_id}] DIFF ERROR: {e}")
         finally:
-            shutil.rmtree(fixed_target, ignore_errors=True)
+            force_rmtree(fixed_target)
     else:
         log(f"[{case_id}] FIXED CHECKOUT FAIL")
 
@@ -419,7 +455,7 @@ def process_bug(con: sqlite3.Connection, bug: dict, log) -> None:
 
     write_update(con, case_id, update)
     sig = update["crash_signal"] or "no-crash"
-    incl = "✓" if update["included_in_corpus"] else "✗"
+    incl = "OK" if update["included_in_corpus"] else "--"
     log(f"[{case_id}] {incl} {sig} user_frame={update['user_frame_file']}:{update['user_frame_line']}")
 
 
@@ -433,8 +469,20 @@ def write_update(con: sqlite3.Connection, case_id: str, u: dict) -> None:
 
 # ─── Project worker ──────────────────────────────────────────────────────────
 
+def cleanup_stale_dpp_container(project: str, log) -> None:
+    """Remove any leftover `<project>-dpp` container from a prior run."""
+    name = f"{project}-dpp"
+    r = subprocess.run(
+        ["docker", "rm", "-f", name],
+        capture_output=True, text=True, env=_docker_env(),
+    )
+    if r.returncode == 0 and r.stdout.strip():
+        log(f"[project={project}] removed stale container {name}")
+
+
 def process_project(con: sqlite3.Connection, project: str, bugs: list[dict], log) -> None:
     log(f"[project={project}] {len(bugs)} bugs")
+    cleanup_stale_dpp_container(project, log)
     for bug in bugs:
         try:
             process_bug(con, bug, log)
