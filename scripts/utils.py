@@ -38,6 +38,11 @@ WORKSPACES_DIR = DATA_DIR / "workspaces"
 SKIP_PROJECTS = {"example"}
 
 
+def gdb_image_for(project: str) -> str:
+    """Per-project gdb-enabled image built by scripts/ensure_gdb_image.py."""
+    return f"chatdbgpro/gdb-{project}:latest"
+
+
 class IssueTracker:
     """
     Categorical counter for pipeline failure modes. Scripts bump a named
