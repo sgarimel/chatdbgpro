@@ -128,15 +128,36 @@ class GDBDialog(DBGDialog):
             last_error_type = "SIGSEGV"
         try:
             frame = gdb.selected_frame()
-            block = frame.block()
         except gdb.error:
             self.fail(
                 "Must be attached to a program that fails to use `why` or `chat`."
             )
-        except RuntimeError:
+
+        # Walk older frames until we find one with debug info and a source
+        # mapping. The crash site often lands in stripped system code
+        # (libc memcpy, abort's raise, etc.) while the bug lives one or
+        # more frames up in user code. Pre-select that user frame so every
+        # downstream call to gdb.selected_frame() (source extraction,
+        # locals, frame summaries) sees it instead of the stripped frame.
+        original_frame = frame
+        user_frame = None
+        while frame is not None:
+            try:
+                frame.block()
+                if frame.find_sal().symtab is not None:
+                    user_frame = frame
+                    break
+            except RuntimeError:
+                pass
+            frame = frame.older()
+
+        if user_frame is None:
             self.fail(
                 "Your program must be compiled with debug information (`-g`) to use `why` or `chat`."
             )
+
+        if user_frame is not original_frame:
+            user_frame.select()
 
     def _get_frame_summaries(
         self, max_entries: int = 20
