@@ -1,4 +1,4 @@
-"""Top-level entry point: schema -> seed -> build_and_probe."""
+"""Top-level entry point: schema -> seed -> build."""
 from __future__ import annotations
 
 import argparse
@@ -28,16 +28,16 @@ def main():
     con.executescript(SCHEMA.read_text())
     con.close()
 
-    print("[run_all] seeding bugs table")
+    print("[run_all] seeding bugs table (reads taxonomy patches)")
     r = subprocess.run(
         [sys.executable, str(REPO_ROOT / "pipeline2" / "seed.py"), "--db", str(db)],
     )
     if r.returncode != 0:
         sys.exit(f"seed failed: {r.returncode}")
 
-    print("[run_all] build + probe")
+    print("[run_all] building buggy workspaces")
     cmd = [
-        sys.executable, str(REPO_ROOT / "pipeline2" / "build_and_probe.py"),
+        sys.executable, str(REPO_ROOT / "pipeline2" / "build.py"),
         "--db", str(db),
         "--workers", str(args.workers),
     ]
