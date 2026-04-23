@@ -28,6 +28,7 @@ from bench.common import (  # noqa: E402
     RESULTS_DIR,
     build_matrix,
     discover_cases,
+    discover_docker_cases,
     run_id_for,
 )
 from bench.drivers import get_driver  # noqa: E402
@@ -55,17 +56,22 @@ def _driver_for_tier(
     cache: dict[int, Driver],
     debugger_flag: str | None,
     dry_run: bool,
+    docker: bool = False,
 ) -> Driver:
-    if tier in cache:
-        return cache[tier]
-    if tier == 3:
+    cache_key = (tier, docker)
+    if cache_key in cache:
+        return cache[cache_key]
+    if docker:
+        driver = get_driver(tier, docker=True, dry_run=dry_run)
+        print(f"[orchestrator] tier{tier} using Docker driver")
+    elif tier == 3:
         from bench.drivers.tier3_gdb import pick_debugger
         debugger = pick_debugger(debugger_flag)
         print(f"[orchestrator] tier3 using debugger: {debugger}")
         driver = get_driver(3, debugger=debugger, dry_run=dry_run)
     else:
         driver = get_driver(tier)
-    cache[tier] = driver
+    cache[cache_key] = driver
     return driver
 
 
@@ -89,9 +95,19 @@ def main() -> int:
                    help="Results subdirectory name. Default: timestamp.")
     p.add_argument("--dry-run", action="store_true",
                    help="Compile only, skip debugger invocation.")
+    p.add_argument("--docker", action="store_true",
+                   help="Run BugsCPP corpus cases inside Docker containers.")
+    p.add_argument("--db", default=None,
+                   help="Path to corpus.db (only with --docker). Default: data/corpus.db")
+    p.add_argument("--bug-ids", nargs="*", default=None,
+                   help="Filter by bug_id (only with --docker, e.g. libtiff-2 jerryscript-1).")
     args = p.parse_args()
 
-    cases = discover_cases(only=args.cases)
+    if args.docker:
+        db_path = Path(args.db) if args.db else None
+        cases = discover_docker_cases(db_path, only=args.bug_ids)
+    else:
+        cases = discover_cases(only=args.cases)
     if not cases:
         sys.stderr.write("No cases match the filter.\n")
         return 2
@@ -107,7 +123,7 @@ def main() -> int:
     )
     print(f"[orchestrator] {len(specs)} runs → {out_root}")
 
-    driver_cache: dict[int, Driver] = {}
+    driver_cache: dict = {}
     index: list[dict] = []
 
     for i, spec in enumerate(specs, 1):
@@ -120,6 +136,7 @@ def main() -> int:
                 cache=driver_cache,
                 debugger_flag=args.debugger,
                 dry_run=args.dry_run,
+                docker=args.docker,
             )
             result = driver.run(spec, run_dir, timeout=args.timeout)
         except Exception as e:

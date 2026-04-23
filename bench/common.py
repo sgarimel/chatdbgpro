@@ -10,9 +10,10 @@ from __future__ import annotations
 import json
 import platform as _platform
 import shutil
+import sqlite3
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
@@ -29,6 +30,7 @@ CASES_DIR = BENCH_DIR / "cases"
 CONFIGS_DIR = BENCH_DIR / "configs"
 RESULTS_DIR = BENCH_DIR / "results"
 WORKSPACE_CACHE = BENCH_DIR / ".workspace-cache"
+DATA_DIR = REPO_DIR / "data"
 
 
 def current_platform() -> str:
@@ -295,7 +297,7 @@ def finalize_result(
 
 
 def build_matrix(
-    cases: list[Case],
+    cases: list,
     models: list[str],
     tool_configs: list[Path],
     trials: int,
@@ -316,3 +318,88 @@ def build_matrix(
                                 tier=tier,
                             ))
     return specs
+
+
+# ---------------------------------------------------------------------------
+# BugsCPP Docker-based cases (from corpus.db)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class DockerCase:
+    """A BugsCPP test case loaded from the corpus SQLite database."""
+    bug_id: str
+    project: str
+    bug_index: int
+    docker_image: str
+    trigger_command: str
+    crash_signal: str | None = None
+    user_frame_function: str | None = None
+    user_frame_file: str | None = None
+    user_frame_line: int | None = None
+    patch_path: str | None = None
+
+    # Duck-type compatibility with Case so run_id_for / finalize_result work.
+    @property
+    def case_id(self) -> str:
+        return self.bug_id
+
+    @property
+    def language(self) -> str:
+        return "c"
+
+    @property
+    def kind(self) -> str:
+        return "docker_bugscpp"
+
+    def platform_supported(self) -> bool:
+        return True  # Docker handles cross-platform
+
+
+def discover_docker_cases(
+    db_path: Path | None = None,
+    only: list[str] | None = None,
+) -> list[DockerCase]:
+    """Load cases from the corpus DB that have a trigger command.
+
+    If `only` is given, filters by bug_id. Otherwise returns all cases
+    that have a trigger_command (needed to launch gdb --args)."""
+    if db_path is None:
+        db_path = DATA_DIR / "corpus.db"
+    if not db_path.exists():
+        raise FileNotFoundError(f"Corpus DB not found: {db_path}")
+
+    con = sqlite3.connect(str(db_path))
+    con.row_factory = sqlite3.Row
+
+    sql = """
+        SELECT bug_id, project, bug_index, docker_image, trigger_command,
+               crash_signal, user_frame_function, user_frame_file,
+               user_frame_line, patch_path
+        FROM test_cases
+        WHERE trigger_command IS NOT NULL
+    """
+    params: tuple = ()
+    if only:
+        placeholders = ",".join("?" for _ in only)
+        sql += f" AND bug_id IN ({placeholders})"
+        params = tuple(only)
+    sql += " ORDER BY bug_id"
+
+    rows = con.execute(sql, params).fetchall()
+    con.close()
+
+    cases = []
+    for r in rows:
+        cases.append(DockerCase(
+            bug_id=r["bug_id"],
+            project=r["project"],
+            bug_index=r["bug_index"],
+            docker_image=r["docker_image"],
+            trigger_command=r["trigger_command"],
+            crash_signal=r["crash_signal"],
+            user_frame_function=r["user_frame_function"],
+            user_frame_file=r["user_frame_file"],
+            user_frame_line=r["user_frame_line"],
+            patch_path=r["patch_path"],
+        ))
+    return cases

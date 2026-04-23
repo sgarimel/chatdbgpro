@@ -8,7 +8,10 @@ from __future__ import annotations
 from bench.drivers.base import Driver
 
 
-def get_driver(tier: int, **kwargs) -> Driver:
+def get_driver(tier: int, *, docker: bool = False, **kwargs) -> Driver:
+    if docker:
+        from bench.drivers.docker_gdb import DockerDriver
+        return DockerDriver(tier=tier, **kwargs)
     if tier == 3:
         from bench.drivers.tier3_gdb import Tier3Driver
         return Tier3Driver(**kwargs)
