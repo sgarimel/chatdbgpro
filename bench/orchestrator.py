@@ -121,7 +121,7 @@ def main() -> int:
     specs = build_matrix(
         cases, args.models, cfgs, args.trials, args.context_lines, args.tiers,
     )
-    print(f"[orchestrator] {len(specs)} runs → {out_root}")
+    print(f"[orchestrator] {len(specs)} runs -> {out_root}")
 
     driver_cache: dict = {}
     index: list[dict] = []
