@@ -13,29 +13,17 @@ Requires:
 from __future__ import annotations
 
 import os
-import shlex
 import shutil
 import subprocess
 import time
 from pathlib import Path
 
 from bench.common import (
-    DATA_DIR,
     REPO_DIR,
     DockerCase,
     RunSpec,
     finalize_result,
 )
-
-# Re-use the libtool resolution logic from the pipeline scripts.
-# Imported as a standalone function so we don't pull in the full
-# scripts/ package (which has its own relative imports).
-WORKSPACES_DIR = DATA_DIR / "workspaces"
-
-
-def _workspace_dir(project: str, bug_index: int) -> Path:
-    """Expected checkout path for a BugsCPP workspace."""
-    return WORKSPACES_DIR / f"{project}-{bug_index}" / project / f"buggy-{bug_index}"
 
 
 # Bash snippet executed inside the container. It:
@@ -75,41 +63,11 @@ def _build_gdb_session(question: str, tool_config_name: str) -> str:
     lines = [
         "set pagination off",
         "set confirm off",
-        "source chatdbg.chatdbg_gdb",
+        "source /chatdbg-src/chatdbg/chatdbg_gdb.py",
         "run",
         f"why {question}",
     ]
     return "\n".join(lines)
-
-
-def _parse_trigger(trigger_command: str) -> list[str]:
-    """Parse a BugsCPP trigger command into argv.
-
-    Trigger commands come in two forms:
-      - Plain: tools/gif2tiff input.tif /dev/null
-      - Wrapped: bash -c "tools/gif2tiff input.tif /dev/null"
-      - Wrapped with exit check: bash -c "cmd ; [ $? -eq 1 ]"
-
-    For the wrapped forms, we unwrap to get the inner command and
-    split it, dropping any trailing exit-code checks."""
-    trigger = trigger_command.strip()
-
-    # Unwrap bash -c "..."
-    if trigger.startswith("bash -c "):
-        # Extract the quoted inner command
-        inner = trigger[len("bash -c "):]
-        # Strip outer quotes
-        if (inner.startswith('"') and inner.endswith('"')) or \
-           (inner.startswith("'") and inner.endswith("'")):
-            inner = inner[1:-1]
-        # Drop trailing exit-code checks like "; [ $? -eq 1 ]"
-        for sep in [" ; [", " ;[", " && ["]:
-            idx = inner.find(sep)
-            if idx != -1:
-                inner = inner[:idx]
-        return shlex.split(inner.strip())
-
-    return shlex.split(trigger)
 
 
 class DockerDriver:
@@ -123,8 +81,9 @@ class DockerDriver:
         run_dir.mkdir(parents=True, exist_ok=True)
         case: DockerCase = spec.case  # type: ignore[assignment]
 
-        # Check workspace exists
-        workdir = _workspace_dir(case.project, case.bug_index)
+        # Check workspace exists. pipeline2 stores the canonical absolute path
+        # in corpus.db because workspaces can live outside bench/.
+        workdir = case.workspace_path
         if not workdir.exists():
             return finalize_result(
                 run_dir, spec,
@@ -133,23 +92,9 @@ class DockerDriver:
             )
 
         # Ensure gdb-enabled Docker image exists.
-        # Uses Anika's ensure_gdb_image.py (scripts/) which builds from
-        # docker/gdb-base.Dockerfile with the per-project base image.
-        scripts_dir = str(REPO_DIR / "scripts")
-        import sys
-        if scripts_dir not in sys.path:
-            sys.path.insert(0, scripts_dir)
-        from ensure_gdb_image import ensure
         try:
-            if not ensure(case.project):
-                (run_dir / "docker_build.log").write_text(
-                    f"ensure_gdb_image failed for {case.project}\n"
-                )
-                return finalize_result(
-                    run_dir, spec,
-                    status="docker_build_failed",
-                    exit_code=-1, elapsed_s=0.0,
-                )
+            from pipeline2.ensure_image import ensure_gdb_image
+            image_tag = ensure_gdb_image(case.project)
         except Exception as e:
             (run_dir / "docker_build.log").write_text(str(e))
             return finalize_result(
@@ -157,8 +102,11 @@ class DockerDriver:
                 status="docker_build_failed",
                 exit_code=-1, elapsed_s=0.0,
             )
-        from utils import gdb_image_for
-        image_tag = gdb_image_for(case.project)
+        if image_tag != case.gdb_image:
+            (run_dir / "docker_build.log").write_text(
+                f"DB image {case.gdb_image!r} differs from local tag {image_tag!r}\n"
+            )
+            image_tag = case.gdb_image
 
         if self.dry_run:
             return finalize_result(
@@ -166,8 +114,7 @@ class DockerDriver:
                 status="dry_run", exit_code=0, elapsed_s=0.0,
             )
 
-        # Parse trigger command into argv
-        trigger_argv = _parse_trigger(case.trigger_command)
+        trigger_argv = case.trigger_argv
         if not trigger_argv:
             (run_dir / "error.log").write_text(
                 f"Empty trigger command for {case.bug_id}\n"
@@ -212,7 +159,11 @@ class DockerDriver:
             "-e", f"CHATDBG_CONTEXT={spec.context_lines}",
             "-e", "CHATDBG_FORMAT=text",
             "-e", "CHATDBG_LOG=/results/chatdbg.log.yaml",
-            "-e", "PYTHONPATH=/chatdbg-src",
+            # PYTHONPATH must include both the bind-mounted ChatDBG source
+            # and the venv where gdb-base.Dockerfile installed ChatDBG's
+            # runtime deps (litellm, openai, llm_utils, ...). The venv path
+            # is fixed by the Dockerfile.
+            "-e", "PYTHONPATH=/chatdbg-src:/opt/chatdbg-venv/lib/python3.11/site-packages",
             *env_flags,
             # Image
             image_tag,

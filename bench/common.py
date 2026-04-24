@@ -330,8 +330,9 @@ class DockerCase:
     bug_id: str
     project: str
     bug_index: int
-    docker_image: str
-    trigger_command: str
+    gdb_image: str
+    trigger_argv: list[str]
+    workspace_path: Path
     crash_signal: str | None = None
     user_frame_function: str | None = None
     user_frame_file: str | None = None
@@ -359,10 +360,11 @@ def discover_docker_cases(
     db_path: Path | None = None,
     only: list[str] | None = None,
 ) -> list[DockerCase]:
-    """Load cases from the corpus DB that have a trigger command.
+    """Load pipeline2 BugsCPP cases from the corpus DB.
 
     If `only` is given, filters by bug_id. Otherwise returns all cases
-    that have a trigger_command (needed to launch gdb --args)."""
+    included in the corpus that have a trigger argv (needed to launch
+    gdb --args)."""
     if db_path is None:
         db_path = DATA_DIR / "corpus.db"
     if not db_path.exists():
@@ -371,12 +373,26 @@ def discover_docker_cases(
     con = sqlite3.connect(str(db_path))
     con.row_factory = sqlite3.Row
 
+    tables = {
+        r["name"] for r in con.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        )
+    }
+    if "bugs" not in tables:
+        con.close()
+        raise RuntimeError(
+            f"{db_path} does not contain pipeline2 table 'bugs'. "
+            "Run pipeline2/seed.py or pipeline2/run_all.py first."
+        )
+
     sql = """
-        SELECT bug_id, project, bug_index, docker_image, trigger_command,
+        SELECT bug_id, project, bug_index, gdb_image, trigger_argv_json,
+               workspace_path,
                crash_signal, user_frame_function, user_frame_file,
                user_frame_line, patch_path
-        FROM test_cases
-        WHERE trigger_command IS NOT NULL
+        FROM bugs
+        WHERE trigger_argv_json IS NOT NULL
+          AND included_in_corpus = 1
     """
     params: tuple = ()
     if only:
@@ -394,8 +410,9 @@ def discover_docker_cases(
             bug_id=r["bug_id"],
             project=r["project"],
             bug_index=r["bug_index"],
-            docker_image=r["docker_image"],
-            trigger_command=r["trigger_command"],
+            gdb_image=r["gdb_image"],
+            trigger_argv=json.loads(r["trigger_argv_json"]),
+            workspace_path=Path(r["workspace_path"]),
             crash_signal=r["crash_signal"],
             user_frame_function=r["user_frame_function"],
             user_frame_file=r["user_frame_file"],
