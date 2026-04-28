@@ -447,8 +447,11 @@ def write_docker_case_yaml(case: DockerCase, run_dir: Path) -> bool:
     if not source_in_workspace.exists():
         return False
 
-    # Slice ±50 lines around patch_first_line
-    full_source = source_in_workspace.read_text()
+    # Slice ±50 lines around patch_first_line. Source files in BugsCPP
+    # workspaces are not always pure ASCII/UTF-8 (latin-1 fragments,
+    # generated parser tables, etc.); decode permissively so the
+    # backfill never aborts mid-corpus on a single odd byte.
+    full_source = source_in_workspace.read_text(encoding="utf-8", errors="replace")
     lines = full_source.splitlines(keepends=True)
     if case.patch_first_line and case.patch_first_line > 0:
         center = case.patch_first_line - 1  # 0-indexed
@@ -459,7 +462,7 @@ def write_docker_case_yaml(case: DockerCase, run_dir: Path) -> bool:
         # No line info — include the whole file (truncated by judge if needed)
         sliced = full_source
 
-    (run_dir / source_basename).write_text(sliced)
+    (run_dir / source_basename).write_text(sliced, encoding="utf-8")
 
     # Build criteria from ground truth
     loc = f"{case.patch_first_file}:{case.patch_first_line}" if case.patch_first_line else case.patch_first_file or "unknown"
