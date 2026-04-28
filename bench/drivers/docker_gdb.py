@@ -23,6 +23,7 @@ from bench.common import (
     DockerCase,
     RunSpec,
     finalize_result,
+    write_docker_case_yaml,
 )
 
 
@@ -193,6 +194,10 @@ class DockerDriver:
         elapsed = time.time() - start
         (run_dir / "stdout.log").write_text(proc.stdout or "")
         (run_dir / "stderr.log").write_text(proc.stderr or "")
+
+        # Write case.yaml + sliced source for the judge pipeline
+        write_docker_case_yaml(case, run_dir)
+
         return finalize_result(
             run_dir, spec,
             status=status, exit_code=exit_code, elapsed_s=elapsed,

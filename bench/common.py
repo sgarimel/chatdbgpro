@@ -338,6 +338,11 @@ class DockerCase:
     user_frame_file: str | None = None
     user_frame_line: int | None = None
     patch_path: str | None = None
+    patch_diff: str | None = None
+    patch_first_file: str | None = None
+    patch_first_line: int | None = None
+    bug_type: str | None = None
+    db_language: str | None = None
 
     # Duck-type compatibility with Case so run_id_for / finalize_result work.
     @property
@@ -346,7 +351,7 @@ class DockerCase:
 
     @property
     def language(self) -> str:
-        return "c"
+        return self.db_language or "c"
 
     @property
     def kind(self) -> str:
@@ -389,7 +394,9 @@ def discover_docker_cases(
         SELECT bug_id, project, bug_index, gdb_image, trigger_argv_json,
                workspace_path,
                crash_signal, user_frame_function, user_frame_file,
-               user_frame_line, patch_path
+               user_frame_line, patch_path,
+               patch_diff, patch_first_file, patch_first_line,
+               bug_type, language
         FROM bugs
         WHERE trigger_argv_json IS NOT NULL
           AND included_in_corpus = 1
@@ -418,5 +425,70 @@ def discover_docker_cases(
             user_frame_file=r["user_frame_file"],
             user_frame_line=r["user_frame_line"],
             patch_path=r["patch_path"],
+            patch_diff=r["patch_diff"],
+            patch_first_file=r["patch_first_file"],
+            patch_first_line=r["patch_first_line"],
+            bug_type=r["bug_type"],
+            db_language=r["language"],
         ))
     return cases
+
+
+def write_docker_case_yaml(case: DockerCase, run_dir: Path) -> bool:
+    """Write case.yaml and sliced source file into run_dir for the judge.
+
+    Returns True if successful, False if the source file couldn't be found."""
+    source_basename = Path(case.patch_first_file).name if case.patch_first_file else None
+    if not source_basename:
+        return False
+
+    # Find the source file in the workspace
+    source_in_workspace = case.workspace_path / case.patch_first_file
+    if not source_in_workspace.exists():
+        return False
+
+    # Slice ±50 lines around patch_first_line
+    full_source = source_in_workspace.read_text()
+    lines = full_source.splitlines(keepends=True)
+    if case.patch_first_line and case.patch_first_line > 0:
+        center = case.patch_first_line - 1  # 0-indexed
+        start = max(0, center - 50)
+        end = min(len(lines), center + 51)
+        sliced = "".join(lines[start:end])
+    else:
+        # No line info — include the whole file (truncated by judge if needed)
+        sliced = full_source
+
+    (run_dir / source_basename).write_text(sliced)
+
+    # Build criteria from ground truth
+    loc = f"{case.patch_first_file}:{case.patch_first_line}" if case.patch_first_line else case.patch_first_file or "unknown"
+    func = case.user_frame_function or "unknown"
+    crash_note = f" (crash signal: {case.crash_signal})" if case.crash_signal else ""
+    bug_class = f" The bug class is {case.bug_type}." if case.bug_type else ""
+
+    root_cause = (
+        f"Diagnosis must identify the defect at {loc} "
+        f"in function {func}{crash_note}.{bug_class}"
+    )
+
+    patch_text = case.patch_diff or "(no patch available)"
+    local_fix = f"An acceptable fix is consistent with this developer patch:\n{patch_text}"
+    global_fix = (
+        f"Same as local_fix. The fix must address the underlying cause, "
+        f"not just suppress the crash signal.\n{patch_text}"
+    )
+
+    case_data = {
+        "id": case.bug_id,
+        "language": case.language,
+        "source_file": source_basename,
+        "criteria": {
+            "root_cause": root_cause,
+            "local_fix": local_fix,
+            "global_fix": global_fix,
+        },
+    }
+    with open(run_dir / "case.yaml", "w") as f:
+        yaml.dump(case_data, f, default_flow_style=False, sort_keys=False)
+    return True
