@@ -469,14 +469,20 @@ def write_docker_case_yaml(case: DockerCase, run_dir: Path) -> bool:
 
     root_cause = (
         f"Diagnosis must identify the defect at {loc} "
-        f"in function {func}{crash_note}.{bug_class}"
+        f"in function {func}{crash_note}."
     )
 
     patch_text = case.patch_diff or "(no patch available)"
-    local_fix = f"An acceptable fix is consistent with this developer patch:\n{patch_text}"
+    local_fix = (
+        f"The model's suggested code change is consistent with this "
+        f"developer patch (correct file, correct site, equivalent fix):\n{patch_text}"
+    )
     global_fix = (
-        f"Same as local_fix. The fix must address the underlying cause, "
-        f"not just suppress the crash signal.\n{patch_text}"
+        f"The model's reasoning correctly explains WHY the bug exists — "
+        f"not just what line to change, but the underlying cause "
+        f"(e.g. missing bounds check, use-after-free pattern, integer overflow). "
+        f"The explanation must go beyond 'change line X' and demonstrate "
+        f"understanding of the root cause.{bug_class}"
     )
 
     case_data = {
