@@ -227,6 +227,22 @@ across the matrix.
 
 ---
 
+## Validation — each fix exercised and confirmed
+
+| Fix | Test | Evidence |
+|---|---|---|
+| A1 | Tight `--timeout 5` on real case | Orchestrator returned in 6s, `result.json` status=timeout, elapsed_s=5.018, zero orphan lldb processes |
+| A2 | Code-path inspection (race is intermittent) | Retry only triggers on `"attach failed" + "could not pause"` stderr signature; harmless on success |
+| A3 | Pre-seeded `result.json` with status=ok, ran orchestrator with `--skip-existing` | Logged `[skipped — prior ok]`, made zero API calls (used invalid key, run still succeeded) |
+| A4 | Computed cache key for cjson + mutated patch_ops | Original key `0b0855802d1ff590` ≠ mutated key `36ad150acd19acc8`; sentinel filename now includes hash |
+| A5 | `--cases lua-string-use-after-free cjson-parse-string-oob` (default) | Logged "skipping 1 unverified case(s): ['lua-string-use-after-free']"; with `--include-unverified` both ran |
+| A6 | Code-path inspection | Loop `for attempts in range(1, 3)` with temperature=0 retry; `judge_attempts` recorded in score.json |
+| A7 | Re-judged Gemini-FL empty-response runs with `--overwrite` | All 6 empty runs in synthetic suite converted from `status=ok` to `status=no_prose_synthesis`, 0 judge tokens billed each |
+| A8 | Called `_repo_venv_site_packages()` on host (macOS) and inside Linux container | macOS: returns venv path. Linux: returns None (Mach-O .so detected as non-ELF) |
+| S3 | Heatmap regeneration | New exclusion summary shows: `no_prose_synthesis (6 runs)`, `build_failed (4)`, `compile_failed (9)` — 19 cells now visibly distinguished from genuine 0/3 model failures |
+
+End-to-end smoke after all fixes: orchestrator ran, judge re-scored, heatmap regenerated, no orphan processes. The benchmark now fails loudly and recoverably instead of failing silently.
+
 ## Summary of fixes in this PR
 
 | ID | Issue | File |
