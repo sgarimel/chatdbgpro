@@ -208,11 +208,32 @@ GPT-5.5 / Nemotron-30B / Qwen-30B all hit 3/3; Gemini-3.1-Flash-Lite
 scored 0/3. **First real-codebase data point** — extends the synthetic
 results onto an upstream library.
 
-The other 4 injected cases are gated by harness/toolchain issues we now
-have logged (lua's Linux-only Makefile target, mongoose's Linux-only
-sanitizer config, sqlite + zlib hit an lldb-on-macOS attach hang that
-trips the orchestrator's timeout path; the timeout handler bug that
-masked these as "error" was fixed in this PR).
+The other 4 injected cases are stubs with `verified: false` — they have
+`bug.patch` files with approximate line numbers but no `patch_ops` (the
+text-substitution form the driver actually applies), so the bug is
+never injected even when the build succeeds. Mongoose additionally
+expects a `test/msan_http_parse.c` harness that doesn't ship with
+upstream 7.15. Documented but not fixed in this PR; calibration is
+multi-hour per case.
+
+### + 3 new synthetic cases (this PR)
+
+Added to extend bug-class coverage:
+
+| Case | Class | Sanitizer | Why discriminating |
+|---|---|---|---|
+| `stack-buffer-overflow-strcpy` | stack OOB write | ASan | Tests size-arithmetic reasoning. Gemini-FL: 0/3, others 3/3. |
+| `vector-iter-after-pushback` | iterator UAF | ASan | All 4 models: 3/3 — saturated. |
+| `shift-int-overflow` | UB shift count | UBSan | Tests type-promotion reasoning. GPT-5.5 / Qwen 3/3, Gemini-FL & Nemotron 2/3. |
+
+Final headline numbers (19 cases × 4 models, judge=gpt-4o):
+
+| Model | Mean total |
+|---|---|
+| GPT-5.5 | **2.84** |
+| Qwen-30B-A3B | 2.44 |
+| Nemotron-30B-A3B | 2.42 |
+| Gemini-3.1-Flash-Lite | 1.05 |
 
 Key takeaways:
 1. **GPT-5.5 is the only model that reliably solves uninit-stack-accumulator**

@@ -14,6 +14,7 @@ SUITES = [
     ROOT / "bench" / "results" / "paper-cases",
     ROOT / "bench" / "results" / "full-synthetic-v1-stripped",
     ROOT / "bench" / "results" / "injected-cases",
+    ROOT / "bench" / "results" / "new-cases",
 ]
 OUT = ROOT / "bench" / "analysis_artifacts"
 FIG = OUT / "figs"
