@@ -85,7 +85,8 @@ def lldb_binary() -> str:
 
 
 def _repo_venv_site_packages() -> str | None:
-    """Return the bench venv's site-packages path, if a venv exists.
+    """Return the bench venv's site-packages path, if a venv exists
+    AND its compiled extensions match the current platform.
 
     Two layouts are supported:
       `.venv-bench-39` — built against Python 3.9 (Apple's bundled lldb).
@@ -94,16 +95,92 @@ def _repo_venv_site_packages() -> str | None:
       `.venv-bench`     — built against a newer Python (e.g. for a future
                          lldb that ships with one).
 
-    The 3.9 venv is preferred when present, since Apple's lldb is the
-    one we actually launch on macOS arm64 (see `lldb_binary` above)."""
+    Cross-platform safety [A8]: when this driver runs inside a Linux
+    container with the host repo bind-mounted, a macOS-arm64 .so on
+    PYTHONPATH crashes the embedded interpreter with a misleading
+    ImportError ("circular import in tiktoken"). Detect the platform of
+    the venv's first compiled .so and only return the path if it
+    matches the running interpreter.
+    """
+    import sysconfig
+    host_ext_suffix = sysconfig.get_config_var("EXT_SUFFIX") or ""
     for name in (".venv-bench-39", ".venv-bench"):
         venv = REPO_DIR / name
         if not venv.exists():
             continue
         matches = list((venv / "lib").glob("python*/site-packages"))
-        if matches:
-            return str(matches[0])
+        if not matches:
+            continue
+        site_packages = matches[0]
+        # Walk a small set of .so files to confirm platform compatibility.
+        sample_so = next(site_packages.rglob("*.so"), None)
+        if sample_so is None:
+            return str(site_packages)
+        try:
+            magic = sample_so.open("rb").read(4)
+        except OSError:
+            return str(site_packages)
+        # ELF: 0x7F 'E' 'L' 'F'. Mach-O: 0xCFFA EDFE / 0xFEED FACF / etc.
+        is_elf = magic[:4] == b"\x7fELF"
+        is_macho = magic[:4] in (b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xce",
+                                  b"\xfe\xed\xfa\xcf", b"\xca\xfe\xba\xbe")
+        running_on_linux = platform.system() == "Linux"
+        if running_on_linux and not is_elf:
+            return None  # macOS .so on Linux interpreter
+        if not running_on_linux and is_elf:
+            return None  # ELF .so on macOS interpreter
+        # Stronger check: ext suffix should match if we have one.
+        if host_ext_suffix and not list(site_packages.rglob(f"*{host_ext_suffix}")):
+            # Sample present but no match for our specific suffix —
+            # likely Python version mismatch. Skip rather than crash.
+            return None
+        return str(site_packages)
     return None
+
+
+def _run_debugger(
+    argv: list[str],
+    stdin_for_proc,
+    env: dict,
+    run_dir: Path,
+    timeout: float,
+) -> tuple[str, str, int, bool]:
+    """Spawn the debugger in its own process group so we can kill the whole
+    tree on timeout. Returns (stdout, stderr, exit_code, timed_out).
+
+    A1: setsid + killpg ensures a stuck lldb child doesn't outlive the
+    Python parent's timeout. We previously observed the orchestrator
+    blocked for 47 minutes despite a 240s subprocess.run timeout because
+    lldb owned its own process group and ignored the SIGTERM Python sent.
+    """
+    import os, signal
+    proc = subprocess.Popen(
+        argv,
+        stdin=subprocess.PIPE if isinstance(stdin_for_proc, str)
+              else (stdin_for_proc if stdin_for_proc is not None else subprocess.DEVNULL),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+        cwd=run_dir,
+        start_new_session=True,
+    )
+    try:
+        if isinstance(stdin_for_proc, str):
+            stdout, stderr = proc.communicate(input=stdin_for_proc, timeout=timeout)
+        else:
+            stdout, stderr = proc.communicate(timeout=timeout)
+        return (stdout or "", stderr or "", proc.returncode, False)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        try:
+            stdout, stderr = proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            stdout, stderr = "", ""
+        return (stdout or "", stderr or "", -1, True)
 
 
 class Tier3Driver:
@@ -213,39 +290,40 @@ class Tier3Driver:
         else:
             raise ValueError(f"Unknown debugger: {self.debugger}")
 
+        # Run the debugger session, with up to one retry on the
+        # macOS-arm64 lldb attach race (A2). Each attempt enforces the
+        # outer timeout via a process-group kill (A1).
         start = time.time()
-        try:
-            proc = subprocess.run(
-                argv,
-                input=stdin_for_proc if isinstance(stdin_for_proc, str) else None,
-                stdin=stdin_for_proc if not isinstance(stdin_for_proc, str) else None,
-                text=True,
-                capture_output=True,
-                env=env,
-                cwd=run_dir,
-                timeout=timeout,
+        attempts = 0
+        proc = None
+        status = "no_collect"
+        exit_code = -1
+        while attempts < 2:
+            attempts += 1
+            stdout_text, stderr_text, exit_code, timed_out = _run_debugger(
+                argv, stdin_for_proc, env, run_dir, timeout)
+            (run_dir / "stdout.log").write_text(stdout_text)
+            (run_dir / "stderr.log").write_text(stderr_text)
+            if timed_out:
+                elapsed = time.time() - start
+                return finalize_result(
+                    run_dir, spec,
+                    status="timeout", exit_code=-1, elapsed_s=elapsed,
+                )
+            if collect_path.exists():
+                status = "ok"
+                break
+            # Retry only on the specific lldb attach race.
+            attach_failed = (
+                "attach failed" in stderr_text and "could not pause" in stderr_text
             )
-            status = "ok" if collect_path.exists() else "no_collect"
-            exit_code = proc.returncode
-        except subprocess.TimeoutExpired as e:
-            # subprocess.TimeoutExpired.stdout/stderr are bytes even when the
-            # original call used text=True. Coerce so write_text doesn't
-            # TypeError out and mask the real status as "error".
-            def _decode(x):
-                if isinstance(x, bytes):
-                    return x.decode("utf-8", errors="replace")
-                return x or ""
-            (run_dir / "stdout.log").write_text(_decode(e.stdout))
-            (run_dir / "stderr.log").write_text(_decode(e.stderr))
-            elapsed = time.time() - start
-            return finalize_result(
-                run_dir, spec,
-                status="timeout", exit_code=-1, elapsed_s=elapsed,
-            )
+            if attach_failed and attempts < 2:
+                # Wipe stale build/-internal state lldb may have cached.
+                continue
+            status = "no_collect"
+            break
 
         elapsed = time.time() - start
-        (run_dir / "stdout.log").write_text(proc.stdout or "")
-        (run_dir / "stderr.log").write_text(proc.stderr or "")
         return finalize_result(
             run_dir, spec,
             status=status, exit_code=exit_code, elapsed_s=elapsed,

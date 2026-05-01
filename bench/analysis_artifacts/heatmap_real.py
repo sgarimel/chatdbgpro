@@ -38,11 +38,12 @@ for suite in SUITES:
         if not (sj.exists() and rj.exists()): continue
         score = json.loads(sj.read_text())
         res = json.loads(rj.read_text())
-        # Skip runs that never produced a real session (compile_failed,
-        # skipped_platform, no_collect, timeout) — judge scored 0/0/0 on
-        # empty input, which would render as a misleading all-red row.
-        if res.get("status") not in ("ok",):
-            continue
+        # S3: distinguish harness failure (status != "ok") and
+        # no_prose_synthesis (A7) from genuine model failure. The
+        # heatmap previously rendered all of these identically as
+        # 0/0/0 red, which conflated three different things.
+        run_status = res.get("status", "?")
+        score_status = score.get("status", "?")
         key = (res["case_id"], short(res["model"]))
         if key in seen: continue
         seen.add(key)
@@ -51,6 +52,8 @@ for suite in SUITES:
             "suite": suite.name,
             "case_id": res["case_id"],
             "model": short(res["model"]),
+            "run_status": run_status,
+            "score_status": score_status,
             "root_cause": s["root_cause"],
             "local_fix": s["local_fix"],
             "global_fix": s["global_fix"],
@@ -60,7 +63,16 @@ df = pd.DataFrame(rows)
 df.to_csv(OUT/"judge_scores.csv", index=False)
 print(df.to_string())
 
-pivot = df.pivot_table(index="model", columns="case_id", values="total", aggfunc="mean")
+# S3: filter at pivot time so the heatmap reflects model performance,
+# not harness flakes. Runs filtered out are still in judge_scores.csv
+# with their run_status / score_status so the audit can be reproduced.
+ok_mask = (df["run_status"] == "ok") & (df["score_status"] == "ok")
+filtered = df[~ok_mask]
+if len(filtered):
+    print("\n== rows excluded from heatmap (harness or no-prose) ==")
+    print(filtered.groupby(["score_status","run_status"]).size().to_string())
+df_ok = df[ok_mask]
+pivot = df_ok.pivot_table(index="model", columns="case_id", values="total", aggfunc="mean")
 order = [m for m in ["GPT-5.5","Gemini-3.1-Flash-Lite","Nemotron-30B","Qwen-30B"] if m in pivot.index]
 pivot = pivot.loc[order]
 
@@ -89,7 +101,7 @@ print("wrote", out_png)
 # also per-axis breakout
 fig2, axes = plt.subplots(1, 3, figsize=(max(18, 1.0 + 0.95*pivot.shape[1]*3), 1.4 + 0.7*len(pivot)), sharey=True)
 for ax, col, vmax in zip(axes, ["root_cause","local_fix","global_fix"], [1,1,1]):
-    pv = df.pivot_table(index="model", columns="case_id", values=col, aggfunc="mean").loc[order]
+    pv = df_ok.pivot_table(index="model", columns="case_id", values=col, aggfunc="mean").loc[order]
     im = ax.imshow(pv.values.astype(float), vmin=0, vmax=1, cmap=cmap, aspect="auto")
     ax.set_xticks(range(pv.shape[1])); ax.set_xticklabels(pv.columns, rotation=35, ha="right", fontsize=8)
     ax.set_yticks(range(pv.shape[0])); ax.set_yticklabels(pv.index)

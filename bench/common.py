@@ -188,14 +188,27 @@ def prepare_injected_workspace(
                                   f"case {case.case_id}: missing repo.url or repo.sha\n")
 
     workdir = WORKSPACE_CACHE / case.case_id
-    sentinel = workdir / ".prepared.ok"
     build_cfg = case.meta.get("build", {})
     binary_rel = build_cfg.get("binary")
     binary_path = workdir / binary_rel if binary_rel else None
 
+    # A4: hash-keyed sentinel — invalidate the cached build whenever
+    # any field that influences the build changes (repo sha, build
+    # commands, patch_ops, asset list). Previously the sentinel was a
+    # static `.prepared.ok` and stale builds silently survived
+    # case.yaml edits, hiding calibration mistakes.
+    import hashlib
+    cache_key_blob = json.dumps({
+        "repo": case.meta.get("repo", {}),
+        "build": build_cfg,
+        "patch_ops": case.meta.get("bug", {}).get("patch_ops", []),
+    }, sort_keys=True).encode("utf-8")
+    cache_key = hashlib.sha256(cache_key_blob).hexdigest()[:16]
+    sentinel = workdir / f".prepared.{cache_key}.ok"
+
     if sentinel.exists() and not rebuild and binary_path and binary_path.exists():
         return InjectedPrepResult(workdir, binary_path, "ok",
-                                  f"reusing cached workspace: {workdir}\n")
+                                  f"reusing cached workspace: {workdir} (key={cache_key})\n")
 
     if workdir.exists():
         shutil.rmtree(workdir)

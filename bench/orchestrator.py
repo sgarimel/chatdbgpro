@@ -101,6 +101,13 @@ def main() -> int:
                    help="Path to corpus.db (only with --docker). Default: data/corpus.db")
     p.add_argument("--bug-ids", nargs="*", default=None,
                    help="Filter by bug_id (only with --docker, e.g. libtiff-2 jerryscript-1).")
+    p.add_argument("--skip-existing", action="store_true",
+                   help="Skip runs whose <run_dir>/result.json already exists with status=ok. "
+                        "Other statuses (timeout, no_collect, ...) are still re-run. [A3]")
+    p.add_argument("--include-unverified", action="store_true",
+                   help="Include cases marked verified: false in case.yaml. By default these "
+                        "are skipped at discovery time to avoid wasting API calls on stub "
+                        "cases that don't actually inject the bug. [A5]")
     args = p.parse_args()
 
     if args.docker:
@@ -111,6 +118,26 @@ def main() -> int:
     if not cases:
         sys.stderr.write("No cases match the filter.\n")
         return 2
+
+    # A5: drop unverified injected stubs unless explicitly opted in.
+    # These ship with `verified: false` and a placeholder bug.patch
+    # whose line numbers don't match upstream — running them burns API
+    # quota without producing a real bug to debug.
+    if not args.include_unverified:
+        kept, dropped = [], []
+        for c in cases:
+            meta = getattr(c, "meta", {}) or {}
+            if meta.get("verified") is False:
+                dropped.append(getattr(c, "case_id", "?"))
+            else:
+                kept.append(c)
+        if dropped:
+            print(f"[orchestrator] skipping {len(dropped)} unverified case(s): "
+                  f"{dropped}. Pass --include-unverified to run them anyway.")
+        cases = kept
+        if not cases:
+            sys.stderr.write("All matching cases are unverified.\n")
+            return 2
 
     cfgs = _resolve_tool_configs(args.tool_configs)
 
@@ -128,8 +155,21 @@ def main() -> int:
 
     for i, spec in enumerate(specs, 1):
         rid = run_id_for(spec)
-        print(f"[{i}/{len(specs)}] {rid}")
         run_dir = out_root / rid
+        # A3: --skip-existing reuses a prior status=ok run instead of
+        # re-running. Other statuses (timeout, no_collect) are re-run
+        # because they're typically transient lldb attach flakes.
+        if args.skip_existing and (run_dir / "result.json").exists():
+            try:
+                prior = json.loads((run_dir / "result.json").read_text())
+                if prior.get("status") == "ok":
+                    print(f"[{i}/{len(specs)}] {rid}  [skipped — prior ok]")
+                    index.append(prior)
+                    (out_root / "index.json").write_text(json.dumps(index, indent=2))
+                    continue
+            except Exception:
+                pass
+        print(f"[{i}/{len(specs)}] {rid}")
         try:
             driver = _driver_for_tier(
                 spec.tier,
