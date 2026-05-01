@@ -228,8 +228,15 @@ class Tier3Driver:
             status = "ok" if collect_path.exists() else "no_collect"
             exit_code = proc.returncode
         except subprocess.TimeoutExpired as e:
-            (run_dir / "stdout.log").write_text(e.stdout or "")
-            (run_dir / "stderr.log").write_text(e.stderr or "")
+            # subprocess.TimeoutExpired.stdout/stderr are bytes even when the
+            # original call used text=True. Coerce so write_text doesn't
+            # TypeError out and mask the real status as "error".
+            def _decode(x):
+                if isinstance(x, bytes):
+                    return x.decode("utf-8", errors="replace")
+                return x or ""
+            (run_dir / "stdout.log").write_text(_decode(e.stdout))
+            (run_dir / "stderr.log").write_text(_decode(e.stderr))
             elapsed = time.time() - start
             return finalize_result(
                 run_dir, spec,
@@ -320,8 +327,15 @@ class Tier3Driver:
             status = "ok" if collect_path.exists() else "no_collect"
             exit_code = proc.returncode
         except subprocess.TimeoutExpired as e:
-            (run_dir / "stdout.log").write_text(e.stdout or "")
-            (run_dir / "stderr.log").write_text(e.stderr or "")
+            # subprocess.TimeoutExpired.stdout/stderr are bytes even when the
+            # original call used text=True. Coerce so write_text doesn't
+            # TypeError out and mask the real status as "error".
+            def _decode(x):
+                if isinstance(x, bytes):
+                    return x.decode("utf-8", errors="replace")
+                return x or ""
+            (run_dir / "stdout.log").write_text(_decode(e.stdout))
+            (run_dir / "stderr.log").write_text(_decode(e.stderr))
             elapsed = time.time() - start
             return finalize_result(
                 run_dir, spec,

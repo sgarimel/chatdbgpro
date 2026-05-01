@@ -74,11 +74,31 @@ def build_user_prompt(run_dir: Path) -> tuple[str, dict] | None:
     case = load_yaml(case_yaml)
     result = load_json(result_json)
     criteria = case.get("criteria", {})
-    source_file = case["source_file"]
-    source_path = run_dir / source_file
-    if not source_path.exists():
+    # For synthetic cases, source_file is a sibling of case.yaml. For
+    # `kind: injected_repo` cases the source lives in the workspace
+    # cache under bench/.workspace-cache/<case_id>/<bug.root_cause_file>;
+    # fall back to that when the synthetic file isn't present.
+    source_file = case.get("source_file")
+    source = None
+    if source_file:
+        source_path = run_dir / source_file
+        if source_path.exists():
+            try:
+                source = source_path.read_text()
+            except UnicodeDecodeError:
+                source = source_path.read_text(errors="replace")
+    if source is None:
+        rc_file = (case.get("bug", {}) or {}).get("root_cause_file")
+        if rc_file:
+            cached = (BENCH_DIR / ".workspace-cache" / case.get("id", "") / rc_file)
+            if cached.exists():
+                try:
+                    source = cached.read_text()
+                except UnicodeDecodeError:
+                    source = cached.read_text(errors="replace")
+                source_file = rc_file
+    if source is None:
         return None
-    source = source_path.read_text()
     if len(source) > MAX_SRC_CHARS:
         source = source[:MAX_SRC_CHARS] + "\n/* ... source truncated ... */\n"
 
