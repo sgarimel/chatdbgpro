@@ -29,6 +29,18 @@ def get_driver(tier: int, *, docker: bool = False, **kwargs) -> Driver:
         # site (mini supplies its own).
         kwargs.pop("debugger", None)
         return Tier2Driver(**kwargs)
+    if tier == 4:
+        from bench.drivers.tier4_claude import Tier4Driver
+        # Tier 4 = Claude Code (the CLI) as the agent. No debugger
+        # kwarg (Claude has its own integrated tool registry).
+        kwargs.pop("debugger", None)
+        # Tier4Driver doesn't accept `mini_model_class` either.
+        kwargs.pop("mini_model_class", None)
+        kwargs.pop("prefer_linux", None)
+        # Tier4Driver doesn't use step_limit (Claude has cost-budget
+        # capping instead). Drop it gracefully if dispatch passes it.
+        kwargs.pop("step_limit", None)
+        return Tier4Driver(**kwargs)
     raise ValueError(f"Unknown tier: {tier}")
 
 
