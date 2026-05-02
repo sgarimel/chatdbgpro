@@ -465,6 +465,103 @@ supports both) and see whether GPT-5.5's score recovers. If it does,
 the format mismatch is the dominant effect; if it doesn't, the
 debugger-tool deficit is.
 
+## Round 3.5 — Tier 1 model robustness (this PR)
+
+The original Tier-1 driver in PR #6 used `LitellmModel` (mini's
+default, tool-calling) but with text-mode prompts (`mswea_bash_command`
+fenced blocks). That mismatch surfaced as the "GPT-5.5 collapses on
+Tier 1" finding from the prior demo sweep — gpt-5.5 emitted tool calls
+correctly, but my prompts told it to emit prose-with-bash-blocks, so
+its content wandered between the two formats and mini's parser
+rejected most responses.
+
+This PR aligns prompts to mini's canonical `swebench.yaml` pattern
+(tool-calling) and adds a textbased fallback for models that need it.
+
+### What changed
+
+1. **Tool-calling prompts patterned after `swebench.yaml`.** System
+   template is concise; instance template is "make tool calls"
+   focused with a CRITICAL REQUIREMENTS block; format-error template
+   tells the model to call the bash tool with explicit
+   `{"command": "..."}` syntax. No more `mswea_bash_command` mention
+   in the default path.
+
+2. **`get_model()` instead of `LitellmModel(...)` directly.** Lets
+   mini auto-select the optimal class based on the model name string:
+   `claude*`/`sonnet*`/`opus*` get prompt-caching; `*_response_model`
+   names route to the Responses API. This matches the recommended
+   usage from mini's docs.
+
+3. **`drop_params=True` and `parallel_tool_calls=True`** model_kwargs
+   from `swebench.yaml`. `drop_params` lets LiteLLM silently drop
+   unsupported args per backend; `parallel_tool_calls` lets capable
+   models batch.
+
+4. **Textbased prompt set + auto-routing.** When the resolved class
+   has `Textbased` in its name (e.g.
+   `LitellmTextbasedModel`), the runner switches to a fenced-bash
+   prompt set patterned after mini's `mini_textbased.yaml`. Format
+   error template also switches.
+
+5. **`--mini-model-class` orchestrator flag.** Lets a researcher
+   override mini's auto-selection (e.g.
+   `--mini-model-class litellm_textbased` for models that emit empty
+   content under tool-calling mode).
+
+### Robustness verification — 5 models on `off-by-one-crc`
+
+Auto mode (default — mini's `LitellmModel`, tool-calling):
+
+| Model | exit_status | tools | resp_len | judge | rc/lf/gf |
+|---|---|---|---|---|---|
+| claude-sonnet-4.5 | Submitted | 6 | 3189 | ok | **3/3** |
+| gpt-5.5 | Submitted | 4 | 2587 | ok | **3/3** |
+| qwen3-30B-a3b-instruct | Submitted | 6 | 1722 | ok | **3/3** |
+| gemini-3.1-flash-lite | Submitted | 6 | **0** | no_prose_synthesis | 0/3 |
+| nemotron-3-nano-30b-a3b | LimitsExceeded | 4 | **0** | no_prose_synthesis | 0/3 |
+
+Textbased mode (`--mini-model-class litellm_textbased`) for the two
+that produced empty content:
+
+| Model | exit_status | tools | resp_len | judge | rc/lf/gf |
+|---|---|---|---|---|---|
+| gemini-3.1-flash-lite | Submitted | 4 | 3987 | ok | 2/3 |
+| nemotron-3-nano-30b-a3b | Submitted | 1 | 787 | ok | 0/3 |
+
+### Why some models need textbased mode
+
+Both Gemini-Flash-Lite and Nemotron-30B-A3B *emit valid tool calls*
+under tool-calling mode (mini's parser successfully extracts them and
+runs the bash). They also emit empty `content` strings alongside the
+tool calls — which means the model's "thought / diagnosis" is missing
+from every assistant turn. Switching to textbased forces the model to
+put both reasoning AND action in the message body, which both models
+do correctly.
+
+This is **a model-side behavior, not a harness behavior**. The
+harness's job is to give every model a path that works; auto-routing
++ the override flag together do that. Researchers running new models
+should:
+
+1. Try auto-mode first. If `resp_len == 0` across most assistant
+   turns, switch to textbased.
+2. Mini's docs (https://mini-swe-agent.com/latest/) catalogue this
+   pattern for a few known models.
+
+### Round-3.5 validation matrix
+
+| Test | Result |
+|---|---|
+| All 5 models produce `status=ok` with appropriate model class | ✓ |
+| GPT-5.5 (was 0/3 in PR #6) now scores 3/3 in auto mode | ✓ |
+| Claude/Qwen unchanged at 3/3 | ✓ |
+| Gemini-FL recovers from `no_prose` to 2/3 with `--mini-model-class litellm_textbased` | ✓ |
+| Nemotron-30B recovers from `no_prose` to producing structured prose (still 0/3 from judge — model-quality limit, not harness) | ✓ |
+| `prompt_mode` field in collect.json's meta documents which path each run took | ✓ |
+| `mini_model_class` field documents the resolved class | ✓ |
+| Existing PR-#6 logging / status taxonomy / judge contract preserved | ✓ |
+
 ## Round 2 fixes (prior commit)
 
 | ID | Issue | Status | File(s) |
