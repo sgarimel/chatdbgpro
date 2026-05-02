@@ -822,6 +822,89 @@ delivers a working debugger.
 - **Linux hosts.** Native Tier 2 path (PR #8) was already correct
   on Linux; `--tier2-linux never` keeps that behavior.
 
+## Round 6 — Tier 2 injected_repo via container (this PR)
+
+PR #9 routed Tier 2 synthetic cases through a Linux container so gdb
+could actually run binaries on macOS hosts. But injected_repo cases
+(cJSON, lua, sqlite, ...) returned `unsupported_combo` because their
+build commands ran on the host (macOS clang → mach-o binary the
+container can't execute).
+
+This PR closes the gap: when the container path receives an injected
+case, the runner does `prepare_injected_workspace` *inside* the
+container, so build commands run on Linux clang and produce ELF
+binaries gdb can execute.
+
+### What changed
+
+1. **`bench.common.prepare_injected_workspace`** accepts a
+   `cache_dir` parameter (additive, defaults to module-level
+   `WORKSPACE_CACHE`). The container path passes
+   `bench/.workspace-cache-linux/` so ELF builds don't trample
+   mach-o builds in `bench/.workspace-cache/`.
+
+2. **`tier2_runner.py`** gained `--injected-case-dir` and
+   `--injected-workspace-cache` flags. When set, the runner imports
+   `bench.common` (the container has pyyaml — explicitly installed
+   in the Dockerfile), runs prep, then launches the agent against
+   the just-built binary. Single subprocess does both.
+
+3. **`Tier2Driver._run_in_linux_container_injected`** handles the
+   `case.kind == "injected_repo"` path. Surfaces `debug.stdin_data`
+   to the model in `task.md` (so the model knows where to read the
+   trigger input from in `gdb> run < /path/to/stdin.bin` or via
+   bash `cat`).
+
+4. **Dockerfile additions:** `git` (for `git clone` in prep),
+   `gcc` / `g++` / `make` / `cmake` / `autoconf` / `libtool` /
+   `pkg-config` (for cases that build via `make` or
+   `./configure && make`).
+
+5. **Status taxonomy:** runner exit code `12` distinguishes
+   "injected prep failed" (clone / patch / build error) from `11`
+   "compile failed" (synthetic case clang error) so the heatmap
+   filter shows the right diagnosis.
+
+### Verification — cjson × gpt-5.5
+
+```
+=== Tier 2 injected smoke: cjson × gpt-5.5 ===
+status: ok                       (was unsupported_combo before)
+tools: bash=4 gdb=5
+all 3 labels: True
+exit_status: Submitted
+gdb real-run calls: 2/5         (verified Starting program / AddressSanitizer
+                                  surfaced in gdb output inside container)
+judge: rc=1 lf=1 gf=1            (3/3 perfect)
+```
+
+Compare to PR #9's behavior (before this fix): same case returned
+`status=unsupported_combo` with an explanatory error.log. Now the
+case actually runs, the agent uses both bash and gdb, and gdb
+executes the patched cJSON binary with ASan flagging the OOB read.
+
+### Round-6 validation matrix
+
+| Test | Result |
+|---|---|
+| `prepare_injected_workspace(case, cache_dir=X)` writes to X instead of `WORKSPACE_CACHE` | ✓ (parameter test) |
+| Native Linux Tier 2 path unchanged (no `cache_dir` argument passed) | ✓ (defaults to `WORKSPACE_CACHE`) |
+| `tier2_runner.py --injected-case-dir X` runs prep then agent in one subprocess | ✓ (cjson smoke) |
+| Container has git + autotools + clang + gdb + pyyaml + mini-swe-agent | ✓ (Dockerfile audit) |
+| `git clone` + `git checkout` work in container without /etc/passwd entry | ✓ (`GIT_AUTHOR_*` env vars set; clone+checkout don't need authoring) |
+| `bench/.workspace-cache-linux/` is created on first run; reused on subsequent runs | ✓ (verified) |
+| `debug.stdin_data` plumbing surfaces the trigger file path to the model | ✓ (task.md inspection) |
+| gdb actually executes the inferior (Starting program / ASan output visible) | ✓ (2/5 gdb calls show real_run output for cjson) |
+| Judge consumes injected-container collect.json without per-tier branching | ✓ (cjson 3/3) |
+| Process-group timeout SIGKILLs the entire docker-run + container | ✓ (Round-1 invariant inherited) |
+
+### What remains out of scope
+
+- **Re-verifying the 4 stubs** (lua, mongoose, sqlite, zlib) needs
+  per-case calibration of `bug.patch_ops` (currently `verified:
+  false`). Not a harness issue — fixing those is per-case work
+  documented in HARD_BUGS.md.
+
 ## Round 2 fixes (prior commit)
 
 | ID | Issue | Status | File(s) |

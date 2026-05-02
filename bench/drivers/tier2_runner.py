@@ -673,9 +673,13 @@ def main() -> int:
     p.add_argument("--task-file", required=True, type=Path)
     p.add_argument("--cwd", default=None,
                    help="Working directory for the agent's bash sandbox + "
-                        "starting cwd for the gdb session. Default = run-dir.")
-    p.add_argument("--gdb-binary", required=True, type=Path,
-                   help="Path to the buggy binary that gdb will load.")
+                        "starting cwd for the gdb session. Default = run-dir. "
+                        "When --injected-case-dir is set this is overridden "
+                        "by the prep result's workdir.")
+    p.add_argument("--gdb-binary", default=None, type=Path,
+                   help="Path to the buggy binary that gdb will load. Required "
+                        "for synthetic cases. Auto-resolved from prep when "
+                        "--injected-case-dir is set.")
     p.add_argument("--gdb-args", default="[]",
                    help="JSON list of args passed to the inferior binary "
                         "(go after `gdb --args <binary>`).")
@@ -683,10 +687,54 @@ def main() -> int:
     p.add_argument("--cost-limit", type=float, default=0.5)
     p.add_argument("--mini-model-class", default=None,
                    help="Override mini's auto model-class selection.")
+    # Injected-case prep mode: when set, the runner imports
+    # bench.common (works inside the Docker image which has pyyaml)
+    # and runs prepare_injected_workspace BEFORE launching the
+    # agent. Lets the macOS host route an injected case through the
+    # Linux container so the build commands run on Linux clang and
+    # produce an ELF binary gdb can actually execute. Native Tier 2
+    # (Linux host) doesn't need this — its synthetic and injected
+    # paths both have working binaries on the host.
+    p.add_argument("--injected-case-dir", default=None, type=Path,
+                   help="If set, run prepare_injected_workspace on this case "
+                        "before launching the agent. Overrides --gdb-binary "
+                        "and --cwd from the prep result.")
+    p.add_argument("--injected-workspace-cache", default=None, type=Path,
+                   help="Workspace cache dir for the injected prep step. "
+                        "Defaults to bench/.workspace-cache (the host's "
+                        "cache); the Linux-container driver passes "
+                        "bench/.workspace-cache-linux so ELF builds don't "
+                        "trample mach-o builds.")
     args = p.parse_args()
 
     run_dir = args.run_dir.resolve()
     task = args.task_file.read_text()
+
+    # Injected-prep step happens here (before agent setup) so a
+    # build failure short-circuits with a clean status instead of
+    # spinning up the model and timing out.
+    if args.injected_case_dir is not None:
+        prep_status, prep_workdir, prep_binary, prep_log = _run_injected_prep(
+            args.injected_case_dir, args.injected_workspace_cache, run_dir,
+        )
+        # Always write the prep log alongside the run for diagnosis.
+        (run_dir / "compile.log").write_text(prep_log)
+        if prep_status != "ok":
+            sys.stderr.write(
+                f"[tier2-runner] injected prep failed: status={prep_status}\n"
+            )
+            # Exit code 12 distinguishes prep failure from compile_failed (11).
+            # The driver reads this and surfaces the right status.
+            return 12
+        # Override agent paths from the prep result.
+        args.gdb_binary = prep_binary
+        if args.cwd is None:
+            args.cwd = str(prep_workdir)
+
+    if args.gdb_binary is None:
+        sys.stderr.write("[tier2-runner] --gdb-binary required (or set --injected-case-dir)\n")
+        return 2
+
     agent_cwd = Path(args.cwd or run_dir)
     gdb_args = json.loads(args.gdb_args)
 
@@ -822,6 +870,48 @@ def _mini_version() -> str:
         return version("mini-swe-agent")
     except Exception:
         return "unknown"
+
+
+def _run_injected_prep(
+    case_dir: Path,
+    workspace_cache: Path | None,
+    run_dir: Path,
+) -> tuple[str, Path | None, Path | None, str]:
+    """Clone + patch + build an injected_repo case from inside the
+    container. Returns (status, workdir, binary, log).
+
+    The runner is normally standalone (no `bench.*` imports) so it
+    can run in mini's host venv where bench's deps may be missing.
+    Inside the Linux container we control the deps — pyyaml is
+    explicitly installed in tier2_runner.Dockerfile — so the
+    conditional import works. If a future deployment removes pyyaml
+    we want to fail loudly rather than silently, hence ImportError
+    is propagated.
+    """
+    # Make /work/bench importable. The runner runs from /work as cwd
+    # in the container (bind-mounted from $REPO), but Python's
+    # import path may not include it.
+    import sys as _sys
+    if "/work" not in _sys.path:
+        _sys.path.insert(0, "/work")
+    # The container's python can be /usr/bin/python3 (Ubuntu 24.04)
+    # or whatever the user's local Linux has. Both have pyyaml from
+    # the image's pip install (or system). Failure here means the
+    # deployment is broken — propagate.
+    import yaml
+    from bench.common import Case, prepare_injected_workspace
+
+    if not (case_dir / "case.yaml").exists():
+        return ("missing_case_yaml", None, None,
+                f"case.yaml not found at {case_dir}\n")
+
+    with open(case_dir / "case.yaml") as f:
+        meta = yaml.safe_load(f)
+    case = Case(case_id=meta.get("id", case_dir.name),
+                case_dir=case_dir, meta=meta)
+
+    prep = prepare_injected_workspace(case, cache_dir=workspace_cache)
+    return prep.status, prep.workdir, prep.binary, prep.log
 
 
 if __name__ == "__main__":

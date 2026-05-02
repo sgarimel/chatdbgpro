@@ -145,6 +145,41 @@ def _build_injected_task(case: Case, workdir: Path, binary: Path) -> str:
     )
 
 
+def _build_injected_task_for_container(
+    case: Case, container_workspace_cache: str,
+    *, stdin_file: str | None = None,
+) -> str:
+    """Task description for the container-injected path. The workspace
+    is built inside the container (Linux ELF) and the agent's cwd is
+    set to the workspace root. We don't know the binary's relative
+    path until prep finishes, so we describe by build.binary instead."""
+    binary_rel = case.meta.get("build", {}).get("binary", "(see case.yaml)")
+    description = case.meta.get("description", "").strip()
+    stdin_note = ""
+    if stdin_file:
+        stdin_note = (
+            f"\n\nThe failing-input bytes for this bug have been written to "
+            f"`{stdin_file}`. To reproduce the crash:\n"
+            f"  - In gdb: `run < {stdin_file}`\n"
+            f"  - Or in bash: `cat {stdin_file} | ./{binary_rel}`\n"
+        )
+    return (
+        f"You're debugging a real-codebase bug in `{case.case_id}` "
+        f"(an open-source C/C++ project).\n\n"
+        f"{description}\n\n"
+        f"You are at the project root (cloned upstream source tree). "
+        f"The buggy binary is at `./{binary_rel}` and a stateful gdb "
+        f"session is pre-loaded with it (with the failing-test argv "
+        f"already configured)."
+        f"{stdin_note}\n\n"
+        f"Use `gdb` for runtime debugging (set breakpoints in the "
+        f"upstream source files, run, step, print). Use `bash` to "
+        f"navigate the source tree (`grep -rn`, `find`, `nl`). "
+        f"Identify the root cause and propose both a local fix and a "
+        f"structural global fix.\n"
+    )
+
+
 def _check_mini_venv(run_dir: Path) -> bool:
     if not MINI_VENV_PYTHON.exists():
         (run_dir / "error.log").write_text(
@@ -203,24 +238,8 @@ class Tier2Driver:
         # Round 5 for the validation evidence.
         if self._use_linux_container:
             if spec.case.kind == "injected_repo":
-                # Injected cases need their build commands to run on
-                # Linux too. prepare_injected_workspace currently uses
-                # macOS subprocess.run and would produce a mach-o
-                # binary the container can't execute. Out of scope
-                # for this PR; report cleanly so sweeps don't crash.
-                (run_dir / "error.log").write_text(
-                    "Tier 2 + injected_repo + Linux container is not yet "
-                    "supported. The repo build commands run on the host "
-                    "(macOS clang); the container's Linux clang would need "
-                    "to rebuild via prepare_injected_workspace, which is "
-                    "macOS-host-bound today. For real-codebase Tier 2 "
-                    "experiments, run from a Linux host.\n"
-                )
-                return finalize_result(
-                    run_dir, spec,
-                    status="unsupported_combo",
-                    exit_code=-1, elapsed_s=0.0,
-                )
+                return self._run_in_linux_container_injected(
+                    spec, run_dir, timeout=timeout)
             return self._run_in_linux_container(spec, run_dir, timeout=timeout)
 
         if spec.case.kind == "injected_repo":
@@ -504,6 +523,172 @@ class Tier2Driver:
                 status="compile_failed", exit_code=11, elapsed_s=elapsed,
             )
 
+        status = "ok" if (run_dir / "collect.json").exists() else "no_collect"
+        return finalize_result(
+            run_dir, spec,
+            status=status, exit_code=exit_code, elapsed_s=elapsed,
+        )
+
+    # ---- Linux-container path for injected_repo cases -------------------
+
+    def _run_in_linux_container_injected(
+        self, spec: RunSpec, run_dir: Path, *, timeout: float,
+    ) -> dict:
+        """Container path for injected_repo cases on Darwin host.
+
+        Difference from the synthetic path: instead of compiling one
+        source file with clang, the container runs
+        `prepare_injected_workspace` from inside (cloning the upstream
+        repo, applying patch_ops, running the case's build commands).
+        The runner is invoked with `--injected-case-dir` so it does
+        prep + agent in a single subprocess. Workspaces land in
+        `bench/.workspace-cache-linux/<case_id>/` so ELF builds don't
+        collide with mach-o builds in `bench/.workspace-cache/`.
+
+        stdin_data (e.g. cjson's malformed JSON trigger) is written
+        to `<run_dir>/stdin.bin` and surfaced in task.md so the model
+        knows where to read it from when it issues `gdb> run < ...`.
+        """
+        if self.dry_run:
+            return finalize_result(
+                run_dir, spec, status="dry_run", exit_code=0, elapsed_s=0.0,
+            )
+
+        ok, msg = _ensure_image()
+        if not ok:
+            (run_dir / "error.log").write_text(
+                f"Failed to build {TIER2_DOCKER_IMAGE} image:\n{msg}\n"
+            )
+            return finalize_result(
+                run_dir, spec,
+                status="docker_build_failed", exit_code=-1, elapsed_s=0.0,
+            )
+
+        # Container-side path translation.
+        repo_str = str(REPO_DIR)
+        def to_container(host_path: Path) -> str:
+            s = str(host_path.resolve())
+            if not s.startswith(repo_str):
+                raise ValueError(
+                    f"Path {s} is outside the repo ({repo_str}); cannot "
+                    f"bind-mount it into the container."
+                )
+            return "/work" + s[len(repo_str):]
+
+        c_run_dir = to_container(run_dir)
+        c_case_dir = to_container(spec.case.case_dir)
+        c_task = to_container(run_dir / "task.md")
+        # Separate cache dir for container-built (Linux ELF) workspaces
+        # so a host-side mach-o build at the same case_id can't be
+        # mistaken for a working binary by the container's gdb.
+        host_workspace_cache = REPO_DIR / "bench" / ".workspace-cache-linux"
+        host_workspace_cache.mkdir(parents=True, exist_ok=True)
+        c_workspace_cache = to_container(host_workspace_cache)
+
+        # debug.stdin_data plumbing: write the trigger input to a
+        # known file so the model can `run < /path/to/stdin.bin` in
+        # gdb, or `cat /path/to/stdin.bin | ./binary` from bash.
+        debug_cfg = spec.case.meta.get("debug", {}) or {}
+        gdb_args = debug_cfg.get("args", []) or []
+        stdin_data = debug_cfg.get("stdin_data")
+        c_stdin_file = None
+        if stdin_data is not None:
+            stdin_file = run_dir / "stdin.bin"
+            if isinstance(stdin_data, str):
+                stdin_file.write_bytes(stdin_data.encode())
+            else:
+                stdin_file.write_bytes(stdin_data)
+            c_stdin_file = to_container(stdin_file)
+
+        task = _build_injected_task_for_container(
+            spec.case, c_workspace_cache, stdin_file=c_stdin_file,
+        )
+        (run_dir / "task.md").write_text(task)
+
+        runner_args_inside = [
+            "python3", "/work/bench/drivers/tier2_runner.py",
+            "--run-dir", c_run_dir,
+            "--model", spec.model,
+            "--task-file", c_task,
+            "--gdb-args", json.dumps([str(a) for a in gdb_args]),
+            "--step-limit", str(self.step_limit),
+            "--cost-limit", str(self.cost_limit),
+            "--injected-case-dir", c_case_dir,
+            "--injected-workspace-cache", c_workspace_cache,
+        ]
+        if self.mini_model_class:
+            runner_args_inside += ["--mini-model-class", self.mini_model_class]
+        runner_cmd = " ".join(shlex.quote(s) for s in runner_args_inside)
+        in_container_script = (
+            f"set -o pipefail\n"
+            f"{runner_cmd}\n"
+        )
+
+        (run_dir / "session.cmds").write_text(
+            "# Tier-2 Linux-container invocation (injected_repo case).\n"
+            "# Build image:\n"
+            f"#   docker build -t {TIER2_DOCKER_IMAGE} \\\n"
+            f"#     -f bench/drivers/tier2_runner.Dockerfile .\n"
+            "# Then run inside the container:\n"
+            + in_container_script
+        )
+
+        env_flags: list[str] = []
+        for key in ("OPENROUTER_API_KEY", "OPENAI_API_KEY",
+                    "OPENROUTER_API_BASE", "ANTHROPIC_API_KEY"):
+            val = os.environ.get(key)
+            if val:
+                env_flags += ["-e", f"{key}={val}"]
+
+        docker_argv = [
+            "docker", "run", "--rm",
+            "--cap-add=SYS_PTRACE",
+            "--security-opt", "seccomp=unconfined",
+            "--user", f"{os.getuid()}:{os.getgid()}",
+            "-e", "HOME=/tmp",
+            # git asks for user.email when running operations that
+            # might author commits. Our prep does only clone+checkout
+            # but newer git versions can be stricter; provide identity
+            # to avoid surprise failures.
+            "-e", "GIT_AUTHOR_NAME=tier2-runner",
+            "-e", "GIT_AUTHOR_EMAIL=tier2-runner@chatdbg.local",
+            "-e", "GIT_COMMITTER_NAME=tier2-runner",
+            "-e", "GIT_COMMITTER_EMAIL=tier2-runner@chatdbg.local",
+            "-v", f"{REPO_DIR.resolve()}:/work",
+            *env_flags,
+            TIER2_DOCKER_IMAGE,
+            "bash", "-c", in_container_script,
+        ]
+
+        env = os.environ.copy()
+        env.pop("PYTHONPATH", None)
+
+        t0 = time.time()
+        stdout, stderr, exit_code, timed_out = _run_debugger(
+            docker_argv,
+            stdin_for_proc=None,
+            env=env,
+            run_dir=run_dir,
+            timeout=timeout,
+        )
+        elapsed = time.time() - t0
+        (run_dir / "stdout.log").write_text(stdout)
+        (run_dir / "stderr.log").write_text(stderr)
+
+        if timed_out:
+            return finalize_result(
+                run_dir, spec,
+                status="timeout", exit_code=-1, elapsed_s=elapsed,
+            )
+        # Runner exit codes:
+        #   0  ok / agent submitted
+        #  11  compile_failed (synthetic only — not used here)
+        #  12  injected prep failed (clone/patch/build error)
+        if exit_code == 12:
+            return finalize_result(
+                run_dir, spec,
+                status="build_failed", exit_code=12, elapsed_s=elapsed,
+            )
         status = "ok" if (run_dir / "collect.json").exists() else "no_collect"
         return finalize_result(
             run_dir, spec,

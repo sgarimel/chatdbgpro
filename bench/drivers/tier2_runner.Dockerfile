@@ -31,6 +31,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         # links fail on x86_64). gdb is the whole point of this image.
         clang gdb \
         libclang-rt-18-dev \
+        # gcc + make + autotools for injected_repo cases that build
+        # via plain `make` or `./configure && make` (cjson, lua, ...)
+        gcc g++ make cmake autoconf libtool pkg-config \
+        # git for prepare_injected_workspace's `git clone` + checkout
+        git \
         # python + pip for mini-swe-agent. python3.12 is Ubuntu
         # 24.04's default; mini supports >=3.10.
         python3 python3-pip python3-venv \
