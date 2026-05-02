@@ -34,7 +34,7 @@ def get_driver(tier: int, *, docker: bool = False, **kwargs) -> Driver:
         # Tier 4 = Claude Code (the CLI) as the agent. No debugger
         # kwarg (Claude has its own integrated tool registry).
         kwargs.pop("debugger", None)
-        # Tier4Driver doesn't accept `mini_model_class` either.
+        # Tier4Driver doesn't accept these mini-specific kwargs.
         kwargs.pop("mini_model_class", None)
         kwargs.pop("prefer_linux", None)
         # Tier4Driver doesn't use step_limit (Claude has cost-budget

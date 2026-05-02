@@ -16,33 +16,53 @@ Architecture
           ├── compile_case() / prepare_injected_workspace()  (same as Tier 3)
           └── subprocess: claude -p <task>                   (Claude Code CLI)
                  --output-format stream-json
-                 --bare                          (strict ANTHROPIC_API_KEY auth,
-                                                  no plugins, no auto-CLAUDE.md,
-                                                  no hooks — clean baseline)
+                 [--bare]                        (optional clean baseline mode;
+                                                  see "Bare mode" below)
                  --no-session-persistence        (don't pollute ~/.claude state)
                  --dangerously-skip-permissions  (sandbox is the run_dir)
                  --max-budget-usd <cost_limit>
                  --model <alias-or-full-name>
                  --add-dir <run_dir>             (allow tool access here)
               └── stdout: line-delimited JSON events (system/assistant/user/result)
-                  Driver parses → trajectory.jsonl + collect.json (judge schema)
+                  Driver parses → claude_events.jsonl + collect.json (judge schema)
 
-Why `--bare`
-------------
-Without `--bare`, Claude Code reads any CLAUDE.md it finds while
-walking up from cwd, plus user/project settings, hooks, MCP servers,
-auto-loaded skills, plugin caches, etc. For benchmark reproducibility
-we strip all of that — every Tier-4 run sees the same agent
-configuration regardless of which workstation issues it. `--bare`
-also forces strict `ANTHROPIC_API_KEY` auth (no keychain / OAuth
-fallback), which makes the harness self-documenting about credentials.
+Auth — three working paths
+--------------------------
+Claude Code accepts auth from any of these sources (checked in
+order):
 
-Auth
-----
-Tier 4 requires `ANTHROPIC_API_KEY` in the environment. If missing,
-the driver returns `status="missing_dep"` with an explanatory
-error.log rather than failing inside Claude with a cryptic auth
-message.
+  1. `ANTHROPIC_API_KEY`        — direct API key (pay-per-use billing)
+  2. `ANTHROPIC_AUTH_TOKEN`     — alternative auth token
+  3. `CLAUDE_CODE_OAUTH_TOKEN`  — long-lived OAuth token from
+                                  `claude setup-token` (uses your
+                                  Claude.ai subscription quota,
+                                  e.g. Pro / Max)
+  4. Keychain OAuth login       — `claude /login` interactive session
+                                  (only honored when --bare is OFF)
+
+For Pro / Max subscription users (#3 or #4), Tier 4 sweeps don't
+incur additional API charges — they spend against the existing
+subscription quota. For API-key users (#1, #2), each sweep bills the
+key directly with the `--max-budget-usd` cap as a hard limit per run.
+
+Bare mode
+---------
+By default the driver runs `claude --bare` for reproducibility:
+- skip CLAUDE.md auto-discovery (no leaked project context)
+- skip hooks (no surprise behaviors)
+- skip plugins (consistent tool surface)
+- skip auto-memory (no leaked previous-run state)
+- strict env-var auth (#1, #2, #3 only; keychain ignored)
+
+Trade-off: `--bare` blocks the keychain auth path (#4). If a
+researcher only has a keychain OAuth session (no env var), the
+driver auto-falls-back to NON-bare mode so the run can proceed.
+
+Override via `--tier4-bare {auto,always,never}`:
+  auto    (default) — bare if any env-var auth exists, else fall
+                       back to keychain (non-bare)
+  always  — fail with `missing_dep` if no env-var auth set
+  never   — always disable bare, use whatever auth Claude finds
 
 Output schema
 -------------
@@ -293,6 +313,48 @@ def _build_injected_task(case: Case, workdir: Path, binary: Path,
     )
 
 
+# Auth env-var precedence — checked in order. Mirrors the order
+# Claude Code itself uses internally (verified against the binary's
+# embedded strings list).
+AUTH_ENV_VARS = (
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+)
+
+
+def _present_auth_env() -> str | None:
+    """Return the name of the first auth env var that is set + non-empty,
+    or None. Used to decide whether `--bare` mode is viable (it requires
+    one of these) vs falling back to the keychain path."""
+    for name in AUTH_ENV_VARS:
+        if os.environ.get(name):
+            return name
+    return None
+
+
+def _has_keychain_login() -> bool:
+    """Probe `claude auth status` for an active keychain session.
+    Returns False if claude isn't installed (caller surfaces that
+    separately) or if the user isn't logged in."""
+    try:
+        out = subprocess.run(
+            [CLAUDE_BIN, "auth", "status"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if out.returncode != 0:
+            return False
+        # `claude auth status` returns JSON; loggedIn=true means we
+        # have a usable keychain session.
+        try:
+            data = json.loads(out.stdout or "{}")
+        except json.JSONDecodeError:
+            return False
+        return bool(data.get("loggedIn"))
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+
+
 class Tier4Driver:
     """Same interface as Tier1Driver / Tier2Driver / Tier3Driver."""
 
@@ -303,9 +365,12 @@ class Tier4Driver:
         *,
         dry_run: bool = False,
         cost_limit: float = 0.5,
+        bare: str = "auto",
     ):
         self.dry_run = dry_run
         self.cost_limit = cost_limit
+        # bare ∈ {"auto", "always", "never"}
+        self.bare = bare
 
     # ---- main entry ----------------------------------------------------
 
@@ -325,20 +390,9 @@ class Tier4Driver:
         # Dry-run path skips the auth + CLI checks so researchers can
         # verify the dispatch / matrix without setting up credentials.
         if not self.dry_run:
-            # Auth must be present before we burn API quota.
-            if not os.environ.get("ANTHROPIC_API_KEY"):
-                (run_dir / "error.log").write_text(
-                    "Tier 4 requires ANTHROPIC_API_KEY in the environment. "
-                    "Tier 4 calls the Claude Code CLI in --bare mode which "
-                    "strictly uses ANTHROPIC_API_KEY (no OAuth or keychain "
-                    "fallback). Set it from your shell:\n\n"
-                    "  export ANTHROPIC_API_KEY=sk-ant-...\n"
-                )
-                return finalize_result(
-                    run_dir, spec,
-                    status="missing_dep", exit_code=-1, elapsed_s=0.0,
-                )
-            # Verify claude CLI is installed before running.
+            # Verify claude CLI is installed FIRST so the auth probe
+            # (which calls `claude auth status`) doesn't error out
+            # opaquely on machines without claude.
             try:
                 ver = subprocess.run(
                     [CLAUDE_BIN, "--version"],
@@ -351,6 +405,45 @@ class Tier4Driver:
                     f"Claude Code CLI not found or not working: {e}\n\n"
                     f"Install:\n  npm install -g @anthropic-ai/claude-code\n"
                     f"Or set CLAUDE_BIN to the binary path."
+                )
+                return finalize_result(
+                    run_dir, spec,
+                    status="missing_dep", exit_code=-1, elapsed_s=0.0,
+                )
+
+            # Resolve which auth path is viable. Three options in
+            # precedence order: env-var auth > keychain auth (if not
+            # bare-only) > error.
+            env_var = _present_auth_env()
+            keychain = _has_keychain_login()
+            if not env_var and not keychain:
+                (run_dir / "error.log").write_text(
+                    "Tier 4 requires Claude Code authentication. Three "
+                    "options:\n\n"
+                    "  1. ANTHROPIC_API_KEY=sk-ant-...      "
+                    "(pay-per-use API key)\n"
+                    "  2. ANTHROPIC_AUTH_TOKEN=...           "
+                    "(alternative auth token)\n"
+                    "  3. CLAUDE_CODE_OAUTH_TOKEN=...        "
+                    "(long-lived OAuth — generate with `claude setup-token`,\n"
+                    "                                          uses your Pro/Max\n"
+                    "                                          subscription quota)\n"
+                    "  4. `claude /login` (keychain session — only works\n"
+                    "     when --tier4-bare={auto,never})\n"
+                )
+                return finalize_result(
+                    run_dir, spec,
+                    status="missing_dep", exit_code=-1, elapsed_s=0.0,
+                )
+            if self.bare == "always" and not env_var:
+                (run_dir / "error.log").write_text(
+                    "Tier 4 was invoked with --tier4-bare=always but no "
+                    "Claude Code auth env var is set. --bare mode strictly "
+                    "uses one of:\n"
+                    f"  {', '.join(AUTH_ENV_VARS)}\n"
+                    "Either set one of those, or pass "
+                    "--tier4-bare=auto / --tier4-bare=never to allow the "
+                    "keychain login path.\n"
                 )
                 return finalize_result(
                     run_dir, spec,
@@ -427,10 +520,32 @@ class Tier4Driver:
                        agent_cwd: Path, task: str, timeout: float,
                        extra_dirs: list[Path] | None = None) -> dict:
         model_arg = _resolve_model(spec.model)
+        # Resolve --bare:
+        #   "always" → always pass --bare (auth check guaranteed
+        #               env-var present above)
+        #   "never"  → never pass --bare (let claude use keychain or
+        #               whatever it has)
+        #   "auto"   → --bare iff an auth env var is set; otherwise
+        #               drop --bare so keychain auth works
+        env_var = _present_auth_env()
+        if self.bare == "always":
+            use_bare = True
+        elif self.bare == "never":
+            use_bare = False
+        else:  # "auto"
+            use_bare = env_var is not None
+        auth_path = (
+            f"env:{env_var}" if env_var else
+            ("keychain" if not use_bare else "none")
+        )
+
         argv = [
             CLAUDE_BIN, "-p", task,
             "--output-format", "stream-json",
-            "--bare",
+        ]
+        if use_bare:
+            argv.append("--bare")
+        argv += [
             "--no-session-persistence",
             "--dangerously-skip-permissions",
             "--verbose",
@@ -441,9 +556,13 @@ class Tier4Driver:
         for d in (extra_dirs or []):
             argv += ["--add-dir", str(d.resolve())]
 
-        # session.cmds for hand-rerun
+        # session.cmds for hand-rerun. Document auth path so a
+        # researcher reproducing the run knows which credential was used.
         (run_dir / "session.cmds").write_text(
-            "# Tier-4 (Claude Code) invocation. Set ANTHROPIC_API_KEY before running.\n"
+            f"# Tier-4 (Claude Code) invocation. auth={auth_path}, "
+            f"bare={'on' if use_bare else 'off'}.\n"
+            f"# Auth options: ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN /\n"
+            f"#               CLAUDE_CODE_OAUTH_TOKEN / `claude /login`.\n"
             + " ".join(shlex.quote(a) for a in argv) + "\n"
         )
 
@@ -513,6 +632,8 @@ class Tier4Driver:
                 "tier": 4,
                 "claude_resolved_model": stats.get("model"),
                 "claude_cost_limit_usd": self.cost_limit,
+                "claude_bare_mode": use_bare,
+                "claude_auth_path": auth_path,
             },
             "instructions": "(Claude Code's built-in system prompt; see --bare mode docs)",
             "queries": [

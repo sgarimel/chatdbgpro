@@ -59,6 +59,7 @@ def _driver_for_tier(
     docker: bool = False,
     mini_model_class: str | None = None,
     tier2_linux: str | None = None,
+    tier4_bare: str | None = None,
 ) -> Driver:
     cache_key = (tier, docker)
     if cache_key in cache:
@@ -102,9 +103,12 @@ def _driver_for_tier(
     elif tier == 4:
         # Tier 4 = Claude Code (the CLI) as the agent. No debugger
         # kwarg, no mini config; just budget-capped invocation of the
-        # `claude` binary in --bare mode.
-        driver = get_driver(4, dry_run=dry_run)
-        print("[orchestrator] tier4 using Claude Code (CLI, --bare)")
+        # `claude` binary, optionally in --bare mode.
+        kwargs = {"dry_run": dry_run}
+        if tier4_bare:
+            kwargs["bare"] = tier4_bare
+        driver = get_driver(4, **kwargs)
+        print(f"[orchestrator] tier4 using Claude Code (CLI, bare={tier4_bare or 'auto'})")
     else:
         driver = get_driver(tier)
     cache[cache_key] = driver
@@ -175,6 +179,15 @@ def main() -> int:
                         "'openrouter_textbased', 'openrouter_response', 'portkey', "
                         "'portkey_response', 'requesty'. Default = auto-select via "
                         "mini's get_model_class(model_name).")
+    p.add_argument("--tier4-bare", default="auto",
+                   choices=["auto", "always", "never"],
+                   help="(--tiers 4 only) Whether to pass --bare to claude. "
+                        "'auto' (default) — bare if an auth env var "
+                        "(ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN / "
+                        "CLAUDE_CODE_OAUTH_TOKEN) is set, else fall back "
+                        "to keychain (non-bare); 'always' — fail if no env "
+                        "var; 'never' — never bare, use whatever auth "
+                        "Claude can find (including keychain OAuth).")
     p.add_argument("--tier2-linux", default="auto",
                    choices=["auto", "always", "never"],
                    help="(--tiers 2 only) Whether to run Tier 2 inside a Linux/amd64 "
@@ -261,6 +274,7 @@ def main() -> int:
                 docker=args.docker,
                 mini_model_class=args.mini_model_class,
                 tier2_linux=args.tier2_linux,
+                tier4_bare=args.tier4_bare,
             )
             result = driver.run(spec, run_dir, timeout=args.timeout)
         except Exception as e:

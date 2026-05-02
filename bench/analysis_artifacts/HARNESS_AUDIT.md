@@ -1017,6 +1017,75 @@ The driver is wired and dry-run validated. A live smoke needs an
 `ANTHROPIC_API_KEY` from the user; the harness path is otherwise
 identical in shape to Tier 1's PR #6 → PR #7 validation flow.
 
+## Round 8 — Tier 4 supports OAuth + keychain auth (this PR)
+
+PR #11 hardcoded `--bare` mode for Tier 4, which strictly required
+`ANTHROPIC_API_KEY` and explicitly blocked OAuth/keychain. That was
+overly aggressive — most Claude Code users (Pro/Max subscribers) are
+authenticated via `claude /login` keychain, not via API key.
+
+This PR makes Tier 4 accept any of four auth paths:
+
+| # | Auth source | Billing |
+|---|---|---|
+| 1 | `ANTHROPIC_API_KEY` env var | API key (pay-per-use) |
+| 2 | `ANTHROPIC_AUTH_TOKEN` env var | API token |
+| 3 | `CLAUDE_CODE_OAUTH_TOKEN` env var | Subscription quota (long-lived; from `claude setup-token`) |
+| 4 | `claude /login` keychain | Subscription quota (interactive login) |
+
+`--bare` mode supports paths 1–3; path 4 requires `--bare` off.
+
+### New `--tier4-bare {auto,always,never}` flag
+
+| Mode | Behavior |
+|---|---|
+| `auto` (default) | `--bare` if any env-var auth set, else fall back to keychain (non-bare) |
+| `always` | Require env-var auth; fail with `missing_dep` otherwise |
+| `never` | Never `--bare`; let claude pick whatever auth is available |
+
+The driver verifies auth state at the start of every run via
+`claude auth status` and `os.environ.get(...)`. If neither env var
+NOR keychain is available, returns `status="missing_dep"` with all
+four options spelled out in `error.log`.
+
+### Live verification
+
+Smoke with this researcher's existing keychain login (Max
+subscription, no env var set):
+
+```
+$ python -m bench.orchestrator --tiers 4 \
+    --cases off-by-one-crc --models sonnet \
+    --tool-configs tier4_claude_code --trials 1 --name t4-smoke
+
+[orchestrator] tier4 using Claude Code (CLI, bare=auto)
+status: ok
+bare: False           ← auto-detected: no env var → drop --bare
+auth: keychain        ← Claude Code used the keychain OAuth session
+tools: {'Bash': 2}
+num_turns: 3
+all 3 labels present
+judge: rc=1 lf=1 gf=1 (3/3 perfect)
+```
+
+Wall time 24s, claude resolved `sonnet` to `claude-sonnet-4-6`,
+zero API charges (counted against the Max subscription quota).
+
+### Reproducibility caveat
+
+When `--bare` is OFF, Claude Code reads:
+- CLAUDE.md files walking up from cwd (project context)
+- user/project settings (hooks, plugins, skills)
+- auto-memory state
+
+For benchmark reproducibility across machines, prefer:
+- env-var auth + `--tier4-bare always` for shareable sweeps
+- keychain auth + `--tier4-bare auto` for local development on
+  one machine
+
+The driver records `claude_bare_mode` and `claude_auth_path` in
+`collect.json` meta so any analysis can filter by the auth regime.
+
 ## Round 2 fixes (prior commit)
 
 | ID | Issue | Status | File(s) |
