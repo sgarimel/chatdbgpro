@@ -57,6 +57,7 @@ def _driver_for_tier(
     debugger_flag: str | None,
     dry_run: bool,
     docker: bool = False,
+    mini_model_class: str | None = None,
 ) -> Driver:
     cache_key = (tier, docker)
     if cache_key in cache:
@@ -73,8 +74,14 @@ def _driver_for_tier(
         # Tier 1 = mini-swe-agent (bash-only). Driver shells out to
         # .venv-bench (Py 3.14, where mini is installed) — the
         # orchestrator's own .venv-bench-39 is too old for mini v2.
-        driver = get_driver(1, dry_run=dry_run)
-        print("[orchestrator] tier1 using mini-swe-agent (bash-only)")
+        # The optional model-class override propagates from the
+        # `--mini-model-class` flag through to the runner subprocess.
+        kwargs = {"dry_run": dry_run}
+        if mini_model_class:
+            kwargs["mini_model_class"] = mini_model_class
+        driver = get_driver(1, **kwargs)
+        klass_label = mini_model_class or "auto"
+        print(f"[orchestrator] tier1 using mini-swe-agent (bash-only, model_class={klass_label})")
     else:
         driver = get_driver(tier)
     cache[cache_key] = driver
@@ -137,6 +144,14 @@ def main() -> int:
     p.add_argument("--strict-schema", action="store_true",
                    help="Fail at discovery time if any case.yaml fails schema validation. "
                         "Default is to warn and skip the offending case. [C7]")
+    p.add_argument("--mini-model-class", default=None,
+                   help="(--tiers 1 only) Override mini-swe-agent's automatic model-class "
+                        "selection. One of: 'litellm' (default — tool-calling), "
+                        "'litellm_textbased' (regex-extracted fenced bash), "
+                        "'litellm_response' (Responses API), 'openrouter', "
+                        "'openrouter_textbased', 'openrouter_response', 'portkey', "
+                        "'portkey_response', 'requesty'. Default = auto-select via "
+                        "mini's get_model_class(model_name).")
     args = p.parse_args()
 
     if args.docker:
@@ -212,6 +227,7 @@ def main() -> int:
                 debugger_flag=args.debugger,
                 dry_run=args.dry_run,
                 docker=args.docker,
+                mini_model_class=args.mini_model_class,
             )
             result = driver.run(spec, run_dir, timeout=args.timeout)
         except Exception as e:

@@ -124,10 +124,16 @@ class Tier1Driver:
         dry_run: bool = False,
         step_limit: int = 15,
         cost_limit: float = 0.5,
+        mini_model_class: str | None = None,
     ):
         self.dry_run = dry_run
         self.step_limit = step_limit
         self.cost_limit = cost_limit
+        # Optional override for mini's auto model-class selection.
+        # Empty/None means auto (LitellmModel, which is tool-calling).
+        # Useful escape hatch for text-only models or for explicit
+        # ablations across mini's model class taxonomy.
+        self.mini_model_class = mini_model_class
 
     def run(self, spec: RunSpec, run_dir: Path, *, timeout: float) -> dict:
         run_dir.mkdir(parents=True, exist_ok=True)
@@ -237,7 +243,7 @@ class Tier1Driver:
         """Argv for the mini-side subprocess. Kept as one function so
         synthetic and injected paths share the contract — the judge
         treats both kinds of runs identically."""
-        return [
+        argv = [
             str(MINI_VENV_PYTHON), str(TIER1_RUNNER),
             "--run-dir", str(run_dir.resolve()),
             "--model", spec.model,
@@ -246,6 +252,9 @@ class Tier1Driver:
             "--step-limit", str(self.step_limit),
             "--cost-limit", str(self.cost_limit),
         ]
+        if self.mini_model_class:
+            argv += ["--mini-model-class", self.mini_model_class]
+        return argv
 
     def _spawn_runner(self, spec: RunSpec, run_dir: Path,
                       argv: list[str], *, timeout: float) -> dict:

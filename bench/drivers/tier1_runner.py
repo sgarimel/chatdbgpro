@@ -2,9 +2,9 @@
 
 Runs in the `.venv-bench` Python where `mini-swe-agent` (>=v2.2.8) is
 installed. Reads the task description from a file, instantiates a
-`DefaultAgent` with `LocalEnvironment` and `LitellmModel`, runs the
-agent until it submits or hits a step/cost limit, and writes two files
-into the run directory:
+`DefaultAgent` with `LocalEnvironment` and a `mini-swe-agent`-selected
+model class, runs the agent until it submits or hits a step/cost
+limit, and writes two files into the run directory:
 
     trajectory.json    mini-swe-agent's native serialize() format
                        (full message list + cost + exit_status)
@@ -12,6 +12,36 @@ into the run directory:
                        Tier3Driver's ChatDBG run produces — so the
                        existing judge.py can score it without any
                        per-tier branching.
+
+## Robustness across models
+
+This runner mirrors the tool-calling pattern from mini's canonical
+`swebench.yaml` config. The key choices:
+
+  * **Tool-calling, not fenced bash blocks.** Mini's `LitellmModel`
+    (the default class returned by `get_model()`) calls
+    `litellm.completion(tools=[BASH_TOOL])` and parses the response's
+    `tool_calls` field. Modern API models — gpt, claude, gemini, qwen
+    via OpenRouter — all support this protocol natively, so the agent
+    works without per-model prompt engineering.
+
+  * **`get_model()` (not `LitellmModel(...)` directly).** Mini's
+    `get_model_class()` chooses the optimal class from the model name
+    string ('claude' → caching enabled; 'response' models → Responses
+    API). Bypassing this loses Anthropic prompt-cache savings and
+    forces every model down the LiteLLM Chat Completions path. Defer
+    to mini.
+
+  * **`drop_params=True` and `parallel_tool_calls=True` model kwargs.**
+    Same as `swebench.yaml`. `drop_params` lets LiteLLM silently drop
+    arguments unsupported by a given backend (e.g. some local-served
+    models reject `parallel_tool_calls`); `parallel_tool_calls` lets
+    capable models batch multiple bash commands per turn.
+
+  * **`--mini-model-class` override.** For text-completion-only models
+    (rare today) or for explicitly testing alternative protocols
+    (`litellm_textbased`, `litellm_response`, `openrouter`), the
+    orchestrator can pass a class hint that bypasses the auto-routing.
 
 Standalone: this module does NOT import from bench.* — it runs in
 mini's venv where bench.common may not import (different Python
@@ -22,24 +52,151 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import sys
 import time
 from pathlib import Path
 from datetime import datetime
 
 
-# Strict bash-only system template. Mini's default template encourages
-# the agent to also write/edit files; for a debugging benchmark we want
-# investigation, not patching, so the workflow guidance is rewritten.
+# System template — concise. Heavy lifting is in the instance template
+# so per-case task framing carries the full context. Modeled after
+# `mini.yaml` and `swebench.yaml`'s system templates: short identity
+# statement, no format guidance (format guidance belongs in the
+# instance template where the task lives, not in the system message
+# whose prefix is cached for many turns).
 DEBUG_SYSTEM_TEMPLATE = """\
-You are an expert software engineer debugging a C/C++ program. You
-have a single tool: bash.
+You are an expert software engineer debugging C/C++ programs. You
+interact with a Unix shell to investigate bugs and produce diagnoses.
+"""
 
-Your response must contain exactly ONE bash code block with ONE command
-(or commands connected with && or ||). Include a THOUGHT section before
-your command where you explain your reasoning process. Format your
-response as shown in <format_example>.
+
+# Instance template — patterned after `swebench.yaml`'s instance
+# template (which mini uses for production SWE-bench evaluations).
+# Tool-calling first, with explicit per-step rules and a CRITICAL
+# REQUIREMENTS block that all the model providers we tested respect.
+DEBUG_INSTANCE_TEMPLATE = """\
+{{task}}
+
+<instructions>
+# Task Instructions
+
+## Overview
+
+You're a software engineer interacting continuously with a computer
+shell to debug a C/C++ program. Your job is to investigate and produce
+a structured diagnosis — NOT to write a patch into the source tree.
+
+For each response:
+
+1. Include a THOUGHT section explaining your reasoning and analysis.
+2. Provide ONE OR MORE `bash` tool calls to execute commands.
+
+## Recommended Workflow
+
+1. List the files in the working directory and read the relevant source.
+2. Run the binary to observe the failure (stack trace, sanitizer
+   report, exit code, etc.).
+3. If the program crashes, run gdb in batch mode for a backtrace
+   (`gdb -batch -ex 'run' -ex 'bt' --args ./build/prog`).
+4. Read source around the failing frame; understand the data flow.
+5. Form a diagnosis grounded in the evidence you collected.
+
+3-8 investigation steps is typical. Don't over-explore — the judge
+scores diagnosis quality, not step count.
+
+## Command Execution Rules
+
+You operate in an environment where:
+1. You issue at least one `bash` tool call per response.
+2. The system executes the command(s) in a subshell.
+3. You see the result(s).
+4. You write your next response.
+
+**CRITICAL REQUIREMENTS:**
+
+- Your response SHOULD include reasoning text explaining your analysis.
+- Your response MUST include AT LEAST ONE `bash` tool call. You can
+  emit multiple tool calls in one response when commands are
+  independent (e.g. `ls -la` and `cat program.c` in parallel).
+- Each command runs in a new subshell — `cd` and `export` don't
+  persist. Prefix with `cd /path && ...` to chain.
+- Use non-interactive flags. Avoid editors / pagers (`vi`, `less`).
+
+## Submission
+
+When you've finished investigating, submit your diagnosis. Your final
+response MUST include all three labelled paragraphs in the THOUGHT
+text BEFORE the submit `bash` call:
+
+  ROOT CAUSE: <file:line and what is wrong, in your own words. Don't
+              just paraphrase the sanitizer report — explain why the
+              defect produces this failure.>
+
+  LOCAL FIX:  <minimal code change that resolves the immediate
+              symptom. Show the diff or replacement code.>
+
+  GLOBAL FIX: <structural design change that prevents this CLASS of
+              bug — e.g. type changes, API redesign, compile-time
+              check, RAII wrapper, bounded view type, invariant.
+              NOT just a bigger version of the local fix.>
+
+Then submit using this exact `bash` tool call:
+
+    bash tool: {"command": "echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"}
+
+The judge reads your THOUGHT prose. If you submit without writing the
+three labelled sections, your run scores 0.
+
+<system_information>
+{{system}} {{release}} {{machine}}
+</system_information>
+</instructions>
+"""
+
+
+# Format-error template — used when the model's response can't be
+# parsed (no tool calls found, malformed action, unknown tool name).
+# Mirrors `swebench.yaml`'s template: explicit reminder that the bash
+# tool is the ONLY path forward, with a worked example. Without this
+# (the LitellmModel default is the bare `{{ error }}` template which
+# echoes the parser error text), the model gets a cryptic re-prompt
+# and often loops.
+TOOLCALL_FORMAT_ERROR = """\
+Tool call error:
+
+<error>
+{{error}}
+</error>
+
+Every response must include at least one `bash` tool call. Call the
+`bash` tool with your shell command as the `command` argument:
+
+  Tool: bash
+  Arguments: {"command": "your_command_here"}
+
+If you have completed your investigation and are ready to submit your
+diagnosis, your final response MUST include the structured ROOT CAUSE
+/ LOCAL FIX / GLOBAL FIX paragraphs followed by:
+
+  Tool: bash
+  Arguments: {"command": "echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"}
+"""
+
+
+# ----- Text-based-mode templates -----
+# When the resolved model class is textbased (litellm_textbased,
+# openrouter_textbased), the parser regex-extracts ```mswea_bash_command```
+# blocks from message content. Tool-calling-style prompts produce zero
+# matches, so we substitute prompt + format-error templates that match
+# the parser. Patterned after mini's own `mini_textbased.yaml`.
+TEXTBASED_SYSTEM_TEMPLATE = """\
+You are an expert software engineer debugging C/C++ programs. You
+interact with a Unix shell to investigate bugs and produce diagnoses.
+
+Your response must contain exactly ONE bash code block with ONE
+command (or commands connected with && or ||). Include a THOUGHT
+section before your command where you explain your reasoning process.
+Format your response as shown in <format_example>.
 
 <format_example>
 Your reasoning and analysis here. Explain why you want to perform the action.
@@ -49,49 +206,49 @@ your_command_here
 ```
 </format_example>
 
-Useful tools available via bash:
-  ls, cat, head, tail, grep, find, file, nm, objdump, strings, wc
-  ./build/prog [args...]                 — run the buggy binary
-  gdb -batch -ex 'run' -ex 'bt' --args ./build/prog [args]   — get a backtrace
-  lldb -batch -o 'run' -o 'bt' ./build/prog                  — alternative
-  nl -ba <file> | sed -n 'N,Mp'           — read source lines
-
-DO NOT use interactive programs (vim, less, top, etc). Each command runs
-in a fresh subshell so `cd` and exported environment variables do not
-persist between commands. Use `cd /path && cmd` or `VAR=val cmd` if you
-need to chain.
-
 Failure to follow these rules will cause your response to be rejected.
 """
 
 
-# Instance template injects the per-case task. Final-answer extraction
-# expects the model to put its diagnosis in a THOUGHT block before
-# issuing the COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT command.
-DEBUG_INSTANCE_TEMPLATE = """\
+TEXTBASED_INSTANCE_TEMPLATE = """\
 {{task}}
 
-Use bash to investigate. Run the binary, run gdb in batch mode if it
-crashes, read source files. After 3-8 steps you should have enough
-evidence.
+## Workflow
 
-To finish, submit with this exact bash command (and write your
-diagnosis BEFORE it, in the same response):
+1. Read the source files and understand the program.
+2. Run the binary to observe the failure.
+3. If a crash, run gdb in batch mode for a backtrace:
+   `gdb -batch -ex 'run' -ex 'bt' --args ./build/prog`
+4. Read source around the failing line.
+5. Form a diagnosis grounded in the evidence you collected.
 
-```mswea_bash_command
-echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT
-```
+## Final response (REQUIRED FORMAT)
 
-Your final response must include three labelled paragraphs in the
-THOUGHT before the submit bash command:
+When you've finished investigating, your final response must contain
+the structured diagnosis BEFORE the submit bash block, in the SAME
+response, like this:
 
-ROOT CAUSE: <file:line and what is wrong, in your own words>
-LOCAL FIX: <minimal patch>
-GLOBAL FIX: <structural change preventing this class of bug>
+  ROOT CAUSE: <file:line and what is wrong, in your own words>
 
-Reminder: every response must contain exactly one bash code block. If
-you write only prose without a bash block, your response is rejected.
-Each command runs in a fresh subshell.
+  LOCAL FIX:  <minimal code change>
+
+  GLOBAL FIX: <structural change preventing this CLASS of bug>
+
+  ```mswea_bash_command
+  echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT
+  ```
+
+The diagnosis prose must be in the THOUGHT (text outside the bash
+block). The submit command must be the bash block in the SAME
+response. If you submit without writing all three labelled paragraphs
+your run scores 0.
+
+## Rules
+
+1. Every response must contain exactly one bash code block.
+2. Each command runs in a new subshell — `cd` and `export` don't
+   persist. Prefix with `cd /path && ...` to chain.
+3. Use non-interactive flags. Avoid editors / pagers (`vi`, `less`).
 
 <system_information>
 {{system}} {{release}} {{machine}}
@@ -99,10 +256,43 @@ Each command runs in a fresh subshell.
 """
 
 
+TEXTBASED_FORMAT_ERROR = """\
+Format error:
+
+<error>
+{{error}}
+</error>
+
+Please always provide EXACTLY ONE action in triple backticks. Format
+your response like this:
+
+  THOUGHT: your reasoning and analysis
+
+  ```mswea_bash_command
+  your_command_here
+  ```
+
+If you want to submit your diagnosis, write the structured ROOT CAUSE
+/ LOCAL FIX / GLOBAL FIX paragraphs as your THOUGHT, then end with:
+
+  ```mswea_bash_command
+  echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT
+  ```
+"""
+
+
+def _is_textbased(model_class_name: str) -> bool:
+    """Mini's textbased model classes use regex extraction of fenced
+    bash blocks instead of tool-calling. Detect by class-name suffix
+    so we cover both litellm_textbased and openrouter_textbased."""
+    return "Textbased" in model_class_name
+
+
 def _action_text(a) -> str:
     """Pull the bash command out of a mini action record. Mini v2.2.x
-    uses dicts with a `command` key; older versions used `text`. Always
-    return a string, even if the field is None or the action is malformed."""
+    uses dicts with a `command` key (tool-calling mode) or `text` key
+    (text-based mode). Always return a string, even if the field is
+    None or the action is malformed."""
     if isinstance(a, dict):
         for key in ("command", "text", "action"):
             v = a.get(key)
@@ -118,24 +308,20 @@ def _extract_response(messages: list[dict]) -> str:
     """Build the response text the judge will score. We concatenate ALL
     non-empty assistant THOUGHT content in order, joined with a
     separator. This way the judge sees the model's complete diagnostic
-    prose regardless of which turn carries the diagnosis — early-turn
-    THOUGHT (often the model's overall plan) is included alongside the
-    final-turn THOUGHT (the structured ROOT CAUSE / LOCAL FIX /
-    GLOBAL FIX block).
+    prose regardless of which turn carries the diagnosis — the early
+    turn's THOUGHT (often the model's overall plan) is included
+    alongside the final-turn THOUGHT (structured ROOT CAUSE / LOCAL FIX
+    / GLOBAL FIX block).
 
     Why concatenate rather than pick one turn:
-    - Models that use OpenAI tool-calling sometimes emit empty content
-      on their FINAL action (the submit), putting the diagnosis on a
-      prior turn instead.
-    - Models following mini's fenced-bash format put the diagnosis
-      THOUGHT directly before each action.
+    - Tool-calling models often have NO content on submit-only turns
+      (the message body is empty when emitting just a tool call).
+    - The diagnostic prose may live on the second-to-last assistant
+      turn (where the THOUGHT was) while the last turn is just the
+      submit tool call.
     - The judge's prompt asks "did the response satisfy the criteria?"
-      — concatenated prose preserves all the model's claims so the
-      judge has the full picture.
-
-    Mini's `submission` field is included when non-empty (preferred for
-    SWE-bench-style tasks where the submission carries the patch); for
-    debugging tasks it's typically empty.
+      — concatenated prose preserves all model claims so the judge
+      sees the full diagnostic picture.
     """
     parts: list[str] = []
     for m in messages:
@@ -143,8 +329,8 @@ def _extract_response(messages: list[dict]) -> str:
             c = (m.get("content") or "").strip()
             if c:
                 parts.append(c)
-    # Append the exit submission if non-empty (it's redundant for our
-    # use-case, but cheap and lets the format generalize).
+    # Append the exit submission if non-empty (cheap, generalizes to
+    # SWE-bench-style tasks where submission carries the final patch).
     for m in reversed(messages):
         if m.get("role") == "exit":
             sub = ((m.get("extra") or {}).get("submission") or "").strip()
@@ -162,8 +348,9 @@ def _extract_actions(messages: list[dict]) -> list[dict]:
     per-tier branching.
 
     Mini message structure (v2.2.x):
-      role='assistant' with extra.actions = [{command: str, tool_call_id: str}, ...]
-      role='tool' with content = the observation
+      role='assistant' with extra.actions = [{command: str, ...}, ...]
+      role='tool'      with content = the observation
+      role='user'      with content = format-error / interrupt
     """
     out: list[dict] = []
     actions_pending: list = []
@@ -175,11 +362,9 @@ def _extract_actions(messages: list[dict]) -> list[dict]:
                 actions_pending.append(a)
         elif role == "tool" and actions_pending:
             obs_len = len(m.get("content") or "")
-            # In v2 each tool message corresponds to ONE action; flush
-            # actions_pending in order and pair each with this tool's
-            # observation length. Multi-action assistant messages are
-            # rare but possible; pairing left-to-right is the
-            # least-wrong approximation.
+            # In tool-calling mode each tool message corresponds to ONE
+            # action — pop FIFO so multi-action assistant turns pair
+            # left-to-right with their observation messages.
             a = actions_pending.pop(0)
             cmd = _action_text(a)
             first = (cmd.strip().split() or [""])[0].split("/")[-1] or "bash"
@@ -223,40 +408,85 @@ def _tally_tokens(messages: list[dict]) -> tuple[int, int]:
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--run-dir", required=True, type=Path)
-    p.add_argument("--model", required=True)
+    p.add_argument("--model", required=True,
+                   help="LiteLLM-style model name, e.g. "
+                        "'openrouter/openai/gpt-5.5'. Passed to mini's "
+                        "get_model() for class auto-selection.")
     p.add_argument("--task-file", required=True, type=Path)
     p.add_argument("--cwd", default=None,
                    help="Working directory for the agent's bash sandbox. "
                         "Default = run-dir (synthetic cases). For injected "
-                        "cases, pass the workspace cache path so the agent "
-                        "lands in the cloned source tree.")
-    p.add_argument("--step-limit", type=int, default=30)
+                        "cases, pass the workspace cache path.")
+    p.add_argument("--step-limit", type=int, default=15)
     p.add_argument("--cost-limit", type=float, default=0.5)
+    p.add_argument("--mini-model-class", default=None,
+                   help="Mini model-class shortcut to override auto-selection. "
+                        "One of: litellm, litellm_textbased, litellm_response, "
+                        "openrouter, openrouter_textbased, openrouter_response, "
+                        "portkey, portkey_response, requesty. "
+                        "Empty string means auto.")
     args = p.parse_args()
 
     run_dir = args.run_dir.resolve()
     task = args.task_file.read_text()
     agent_cwd = args.cwd or str(run_dir)
 
-    # Mini imports — must happen in the .venv-bench Python. The two
-    # PydanticUndefined defaults (system_template, instance_template)
-    # are filled in via kwargs.
+    # Imports must happen here (mini's own globals print on first import)
     from minisweagent.agents.default import DefaultAgent
     from minisweagent.environments.local import LocalEnvironment
-    from minisweagent.models.litellm_model import LitellmModel
+    from minisweagent.models import get_model
 
-    # cost_tracking="ignore_errors" because litellm's price database
-    # doesn't include every model on OpenRouter (e.g. openai/gpt-5.5,
-    # google/gemini-3.1-flash-lite-preview as of mini 2.2.8). Without
-    # this, mini's default `cost_tracking="default"` raises a
-    # RuntimeError before the first model call and the run dies with
-    # 0 tool calls. We track tokens directly via message['extra']['usage']
-    # below, so losing mini's cost field is acceptable.
-    model = LitellmModel(model_name=args.model, cost_tracking="ignore_errors")
+    # ----- model selection -----
+    # Build the config dict mini's get_model() expects. The model_class
+    # field is popped out by get_model() itself; the rest is passed to
+    # the resolved class's constructor.
+    #
+    # cost_tracking="ignore_errors" — litellm's price DB doesn't include
+    # every OpenRouter route (gpt-5.5, gemini-3.1-flash-lite-preview,
+    # nemotron-3-nano-* as of mini 2.2.8). Without this, mini raises
+    # RuntimeError before the first turn. Tokens are still counted via
+    # message['extra']['response']['usage'] so we don't lose accuracy
+    # on token usage; we just don't get a $ figure for unmapped models.
+    model_config: dict = {
+        "cost_tracking": "ignore_errors",
+        # model_kwargs passed straight to litellm.completion. Same set
+        # as swebench.yaml — drop_params for backend compatibility,
+        # parallel_tool_calls so capable models can batch.
+        "model_kwargs": {
+            "drop_params": True,
+            "temperature": 0.0,
+            "parallel_tool_calls": True,
+        },
+    }
+    if args.mini_model_class:
+        model_config["model_class"] = args.mini_model_class
+
+    # Resolve the model class first (without constructing yet) so we can
+    # pick the matching prompt set. The textbased classes use a regex
+    # parser; the default tool-calling classes use the API tool_calls
+    # field. Prompts must match the parser or the model loops on
+    # FormatError ad infinitum.
+    from minisweagent.models import get_model_class
+    klass = get_model_class(args.model, args.mini_model_class or "")
+    is_textbased = _is_textbased(klass.__name__)
+    if is_textbased:
+        system_template = TEXTBASED_SYSTEM_TEMPLATE
+        instance_template = TEXTBASED_INSTANCE_TEMPLATE
+        model_config["format_error_template"] = TEXTBASED_FORMAT_ERROR
+    else:
+        system_template = DEBUG_SYSTEM_TEMPLATE
+        instance_template = DEBUG_INSTANCE_TEMPLATE
+        model_config["format_error_template"] = TOOLCALL_FORMAT_ERROR
+
+    # get_model adds Anthropic prompt-caching when the model name
+    # contains 'claude'/'sonnet'/'opus'. We delegate auto-selection
+    # logic to mini rather than reimplementing it.
+    model = get_model(args.model, model_config)
+
     env = LocalEnvironment(
         cwd=agent_cwd,
         env={
-            # Tame interactive helpers that pollute output streams
+            # Tame interactive helpers — same set as swebench.yaml.
             "PAGER": "cat",
             "MANPAGER": "cat",
             "LESS": "-R",
@@ -268,11 +498,12 @@ def main() -> int:
 
     agent = DefaultAgent(
         model, env,
-        system_template=DEBUG_SYSTEM_TEMPLATE,
-        instance_template=DEBUG_INSTANCE_TEMPLATE,
+        system_template=system_template,
+        instance_template=instance_template,
         step_limit=args.step_limit,
         cost_limit=args.cost_limit,
-        # Save mini's native trajectory format alongside our collect.json
+        # Save mini's native trajectory format alongside collect.json
+        # so trajectory inspection tools (mini's `inspector` UI) work.
         output_path=run_dir / "trajectory.json",
     )
 
@@ -280,17 +511,12 @@ def main() -> int:
     exit_status = "unknown"
     submission = ""
     try:
-        result = agent.run(
-            task=task,
-            cost_limit_dollar=f"${args.cost_limit:.2f}",
-        )
+        result = agent.run(task=task)
         exit_status = result.get("exit_status", "unknown") if result else "unknown"
         submission = result.get("submission", "") if result else ""
     except Exception as e:
         exit_status = type(e).__name__
         sys.stderr.write(f"[tier1-runner] agent.run raised {exit_status}: {e}\n")
-        # save() is invoked in agent.run's finally clause, so trajectory
-        # should already be on disk; bubble exception non-fatally.
     elapsed = time.time() - t0
 
     messages = agent.messages
@@ -298,23 +524,29 @@ def main() -> int:
     tool_calls = _extract_actions(messages)
     p_tok, c_tok = _tally_tokens(messages)
 
-    # tool_frequency over `verb` (the first token of the command) so it's
-    # actually informative — same shape Tier3 uses for ChatDBG tool names.
     freq: dict[str, int] = {}
     for tc in tool_calls:
         freq[tc.get("verb", "bash")] = freq.get(tc.get("verb", "bash"), 0) + 1
+
+    # Capture which model class mini actually instantiated. This is the
+    # robustness story we're telling — model_class is the routing
+    # decision that determines tool-calling vs text-mode.
+    model_class_used = type(model).__module__ + "." + type(model).__name__
 
     collect = {
         "meta": {
             "uid": run_dir.name,
             "time": datetime.now().isoformat(timespec="seconds"),
             "model": args.model,
-            "tool_config": "tier1_bash_only.json",   # informational only
+            "tool_config": "tier1_bash_only.json",
             "enabled_tools": ["bash"],
             "agent": "mini-swe-agent",
             "agent_version": _mini_version(),
+            "mini_model_class": model_class_used,
+            "mini_model_kwargs": model_config["model_kwargs"],
+            "prompt_mode": "textbased" if is_textbased else "toolcalling",
         },
-        "instructions": DEBUG_SYSTEM_TEMPLATE,
+        "instructions": system_template,
         "queries": [
             {
                 "user_text": task,
@@ -344,11 +576,9 @@ def main() -> int:
 
     print(
         f"[tier1-runner] exit_status={exit_status} elapsed={elapsed:.1f}s "
-        f"steps={len(tool_calls)} cost=${float(getattr(agent, 'cost', 0.0) or 0.0):.4f}"
+        f"steps={len(tool_calls)} cost=${float(getattr(agent, 'cost', 0.0) or 0.0):.4f} "
+        f"model_class={type(model).__name__}"
     )
-    # Non-zero exit ONLY for genuine harness failures, not "model didn't
-    # submit" — Tier3 uses status=ok even when the model gave up, so
-    # match that.
     return 0
 
 
