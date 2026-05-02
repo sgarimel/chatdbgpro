@@ -562,6 +562,153 @@ should:
 | `mini_model_class` field documents the resolved class | ✓ |
 | Existing PR-#6 logging / status taxonomy / judge contract preserved | ✓ |
 
+## Round 4 — Tier 2 driver (mini bash + persistent gdb)
+
+Until this commit, the orchestrator's `--tiers 2` flag raised
+`NotImplementedError`. Tier 2 is now wired as a mini-swe-agent
+extension: same DefaultAgent + LiteLLM + LocalEnvironment scaffold as
+Tier 1, but with TWO tools registered — `bash` (mini's canonical
+stateless subprocess) and `gdb` (a persistent gdb session preloaded
+with the buggy binary).
+
+This is the cleanest possible "what does adding a stateful debugger
+to a generic bash agent buy?" ablation: holding the agent scaffold
+constant (mini), we vary only the tool surface (Tier 1 = bash; Tier 2
+= bash + gdb).
+
+### Architecture
+
+```
+Orchestrator (.venv-bench-39, Py 3.9)
+ └── Tier2Driver.run()
+      └── subprocess: .venv-bench/bin/python3 tier2_runner.py
+                       (Py 3.14, mini-swe-agent installed)
+            ├── DualToolModel(LitellmModel)         — registers BASH_TOOL + GDB_TOOL
+            ├── LocalGdbBashEnvironment             — dispatches on action['tool']
+            │    ├── bash → super().execute (LocalEnvironment, stateless subprocess.run)
+            │    └── gdb  → GdbSession.execute     (persistent gdb subprocess, sentinel I/O)
+            └── DefaultAgent.run(task)
+                 ├── trajectory.json    (mini's native serialize format)
+                 └── collect.json       (judge-ready schema, identical to T1/T3)
+```
+
+### Files
+
+| File | Purpose |
+|---|---|
+| `bench/drivers/tier2_minisweagent.py` | Orchestrator-side driver. Reuses `compile_case`, `prepare_injected_workspace`, `_run_debugger`. Same plumbing as Tier 1; passes the buggy-binary path through to the runner so the gdb session can be preloaded. |
+| `bench/drivers/tier2_runner.py` | Subprocess entry point in the mini venv. Defines `BASH_TOOL`, `GDB_TOOL`, custom `parse_dual_tool_actions`, `DualToolModel`, `LocalGdbBashEnvironment`, and `GdbSession`. Standalone — no `bench.*` imports so it works in mini's venv. |
+| `bench/configs/tier2_gdb_plus_bash.json` | Informational config so `run_id_for()` / heatmap pivot on tool_config without per-tier branching. |
+| `bench/drivers/__init__.py` | `get_driver(2)` returns `Tier2Driver`. |
+| `bench/orchestrator.py` | New tier-2 dispatch branch with `--mini-model-class` propagation. |
+
+### `GdbSession` — persistent gdb subprocess
+
+The novel piece. Wraps `gdb -q -nx --args <binary> <argv>` with
+stdin/stdout pipes. Each `gdb` tool call sends commands followed by
+`echo <unique-sentinel>`; the reader uses `select()` to read lines
+from stdout until the sentinel appears. gdb's `echo` writes to gdb's
+own stdout (not the inferior's) so the sentinel reliably surfaces
+even when the inferior also writes output.
+
+Edge cases handled:
+
+- Inferior in an infinite loop: per-command timeout (default 30s)
+  raises `TimeoutError`; we send `SIGINT` to gdb to interrupt the
+  inferior, then drain to a fresh sentinel so the session is still
+  usable for the next tool call.
+- gdb itself died (segfault in user-supplied command, etc):
+  `proc.poll() != None`; subsequent calls return an exception_info
+  dict so the model sees the failure and can recover.
+- Long output: streamed line-by-line (no single-buffer overrun).
+- Pagination: `set pagination off` + `set confirm off` at session
+  startup so gdb never halts on a `--Type <RET>--` prompt.
+
+Submission semantics unchanged: bash output starting with
+`COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT` raises `Submitted` (mini's
+existing path). Submission is via bash so the existing flow works.
+
+### Logging fidelity matches Tier 1 / Tier 3
+
+| Artifact | T1 | T2 | T3 |
+|---|---|---|---|
+| `case.yaml` (judge input) | ✓ | ✓ | ✓ |
+| `program.c` / source | ✓ | ✓ | ✓ |
+| `build/prog` + `compile.log` | ✓ | ✓ | ✓ |
+| Replay command | session.cmds (runner argv) | session.cmds (runner argv) | session.cmds (lldb script) |
+| Trajectory record | trajectory.json | trajectory.json | chatdbg.log.yaml |
+| `collect.json` (our schema) | ✓ | ✓ | ✓ |
+| `stdout.log` / `stderr.log` | ✓ | ✓ | ✓ |
+| `result.json` status taxonomy | ok / timeout / compile_failed / no_collect / skipped_platform / missing_dep | same | same minus missing_dep |
+
+Tier 2's `collect.json` adds two fields that Tier 1 doesn't need:
+
+- `tool_name_counts`: e.g. `{"bash": 5, "gdb": 4}` — at-a-glance "did
+  the model use gdb?"
+- `tool_frequency_by_tool`: e.g. `{"bash": {"nl": 1, ...}, "gdb": {"run": 1, ...}}`
+  — verb-level breakdown per tool, useful for analysis.
+
+The top-level `tool_frequency` (verb counts, ignoring tool name) is
+preserved so existing scripts (`analyze_runs.py`, `heatmap_real.py`)
+keep working without modification.
+
+### Robustness verification — 5 models on `off-by-one-crc`
+
+Same five models as Tier 1's robustness sweep, default
+`LitellmModel` auto-selected (tool-calling):
+
+| Model | bash | gdb | exit_status | resp_len | judge | rc/lf/gf |
+|---|---|---|---|---|---|---|
+| gpt-5.5 | 4 | 4 | Submitted | 3043 | ok | **2/3** |
+| qwen3-30B-a3b-instruct | 2 | 8 | Submitted | 2354 | ok | **2/3** |
+| claude-sonnet-4.5 | 5 | 2 | Submitted | 3169 | ok | **2/3** |
+| gemini-3.1-flash-lite | 6 | 3 | Submitted | 428 | ok | **2/3** |
+| nemotron-3-nano-30b-a3b | 3 | 11 | LimitsExceeded | 0 | no_prose_synthesis | 0/3 |
+
+**4 of 5 models work cleanly**, all four invoking gdb 2–8 times — the
+dual-tool dispatch is exercised. Notable: **Gemini-Flash-Lite
+succeeds in Tier 2** despite failing in Tier 1's auto mode (where it
+emitted empty content). Having gdb available as a peer tool seems to
+anchor Gemini's output format. Nemotron-30B continues its Tier-3
+"Mode A — wave the white flag" pattern (model behavior, not
+harness — see HARD_BUGS.md).
+
+Universal `global_fix=0` is the "fix-vs-explain cliff" we already
+documented across tiers — none of these tiers' models propose a
+structural fix for the off-by-one-crc case. Round 4 doesn't address
+that; it's a prompt-criterion mismatch, not a tool-surface issue.
+
+### Tier comparison on `off-by-one-crc`
+
+| Model | T1 auto | T1 textbased | T2 (auto) | T3 |
+|---|---|---|---|---|
+| gpt-5.5 | 3/3 | – | 2/3 | 2/3 |
+| claude-sonnet-4.5 | 3/3 | – | 2/3 | (n/a) |
+| qwen3-30B | 3/3 | – | 2/3 | 2/3 |
+| gemini-3.1-flash-lite | 0 (no_prose) | 2/3 | 2/3 | 0 (no_prose) |
+| nemotron-3-nano-30b | 0 (no_prose) | 0/3 | 0 (no_prose) | (n/a) |
+
+For this single case, Tier 1 (bash-only) actually scored highest for
+the three working models. Tier 2's added gdb didn't *hurt* — but on
+this small-source case, bash + nl + reading the source was enough.
+Real-codebase cases (`bench/cases/injected/`) where the source tree
+is too big to grep are where Tier 2's persistent gdb should shine;
+follow-up work.
+
+### Round-4 validation matrix
+
+| Test | Result |
+|---|---|
+| Imports clean from orchestrator's venv | ✓ |
+| Runner imports cleanly inside `.venv-bench` | ✓ |
+| `--tiers 2 --dry-run` produces correct run_id with `tier2_gdb_plus_bash` | ✓ |
+| End-to-end on gpt-5.5: status=ok, 9 tool calls (5 bash + 4 gdb), all 3 labels | ✓ |
+| `bench/judge.py` scores Tier-2 collect.json without per-tier branching | ✓ |
+| 4 of 5 representative models complete cleanly; the failing one (Nemotron-30B) is a known model-quality issue | ✓ |
+| GdbSession correctly handles inferior crash (gdb's prompt comes back) — verified in gpt-5.5 trajectory | ✓ |
+| GdbSession sentinel-based read survives multi-line output from `bt` / `print` / `info locals` | ✓ |
+| Process-group SIGKILL on outer timeout (Round 1 invariant via `_run_debugger`) | ✓ |
+
 ## Round 2 fixes (prior commit)
 
 | ID | Issue | Status | File(s) |

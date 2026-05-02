@@ -23,12 +23,12 @@ def get_driver(tier: int, *, docker: bool = False, **kwargs) -> Driver:
         kwargs.pop("debugger", None)
         return Tier1Driver(**kwargs)
     if tier == 2:
-        raise NotImplementedError(
-            "Tier 2 (ChatDBG + bash) is not implemented as a separate "
-            "driver. Closest approximation: "
-            "`--tiers 3 --tool-configs tier2_bash_plus_gdb` (ChatDBG "
-            "with bash AND gdb tools both enabled)."
-        )
+        from bench.drivers.tier2_minisweagent import Tier2Driver
+        # Tier 2 = mini-swe-agent with BOTH bash and a persistent gdb
+        # session. Like Tier 1, no debugger kwarg from the dispatch
+        # site (mini supplies its own).
+        kwargs.pop("debugger", None)
+        return Tier2Driver(**kwargs)
     raise ValueError(f"Unknown tier: {tier}")
 
 
