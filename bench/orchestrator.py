@@ -83,7 +83,10 @@ def main() -> int:
                    help="Model paths in LiteLLM format.")
     p.add_argument("--tool-configs", nargs="+", required=True,
                    help="Paths or names (under bench/configs/) of tool-config JSONs.")
-    p.add_argument("--trials", type=int, default=1)
+    p.add_argument("--trials", type=int, default=3,
+                   help="Number of trials per (case, model, config). Default 3 — the previous "
+                        "default of 1 produced single-shot scores with high variance from "
+                        "stochastic models. [S2]")
     p.add_argument("--context-lines", type=int, nargs="+", default=[10],
                    help="Enriched stack-trace depth(s). Paper default: 10.")
     p.add_argument("--tiers", type=int, nargs="+", default=[3],
@@ -101,16 +104,67 @@ def main() -> int:
                    help="Path to corpus.db (only with --docker). Default: data/corpus.db")
     p.add_argument("--bug-ids", nargs="*", default=None,
                    help="Filter by bug_id (only with --docker, e.g. libtiff-2 jerryscript-1).")
+    p.add_argument("--skip-existing", action="store_true",
+                   help="Skip runs whose <run_dir>/result.json already exists with status=ok. "
+                        "Other statuses (timeout, no_collect, ...) are still re-run. [A3]")
+    p.add_argument("--include-unverified", action="store_true",
+                   help="Include cases marked verified: false in case.yaml. By default these "
+                        "are skipped at discovery time to avoid wasting API calls on stub "
+                        "cases that don't actually inject the bug. [A5]")
+    p.add_argument("--crash-only", action="store_true",
+                   help="(--docker only) Only schedule BugsC++ cases that pipeline2/probe.py "
+                        "confirmed actually crash. Drops wrong-output bugs that ChatDBG's "
+                        "lldb-runs-until-crash session can't debug. [S5(a)]")
+    p.add_argument("--skip-system-triggers", action="store_true",
+                   help="(--docker only) Skip BugsC++ cases whose trigger_argv[0] is a shell "
+                        "wrapper (bash/sed/find/make). gdb would attach to the wrapper, not "
+                        "the bug. [S1]")
+    p.add_argument("--breakpoint-at-patch", action="store_true",
+                   help="(--docker only) For non-crashing BugsC++ cases, set a breakpoint at "
+                        "patch_first_file:patch_first_line before `run`. Lets the model "
+                        "inspect locals at the defect site instead of seeing only "
+                        "exit/__libc_start_main. [S5(b)]")
+    p.add_argument("--structural-fix-turn", action="store_true",
+                   help="After the model's first answer, ask a follow-up: 'now propose a "
+                        "structural change that prevents this class of bug'. Stored as a "
+                        "second query in collect.json. [B3]")
+    p.add_argument("--strict-schema", action="store_true",
+                   help="Fail at discovery time if any case.yaml fails schema validation. "
+                        "Default is to warn and skip the offending case. [C7]")
     args = p.parse_args()
 
     if args.docker:
         db_path = Path(args.db) if args.db else None
-        cases = discover_docker_cases(db_path, only=args.bug_ids)
+        cases = discover_docker_cases(
+            db_path, only=args.bug_ids,
+            crash_only=args.crash_only,
+            skip_system_triggers=args.skip_system_triggers,
+        )
     else:
-        cases = discover_cases(only=args.cases)
+        cases = discover_cases(only=args.cases, strict_schema=args.strict_schema)
     if not cases:
         sys.stderr.write("No cases match the filter.\n")
         return 2
+
+    # A5: drop unverified injected stubs unless explicitly opted in.
+    # These ship with `verified: false` and a placeholder bug.patch
+    # whose line numbers don't match upstream — running them burns API
+    # quota without producing a real bug to debug.
+    if not args.include_unverified:
+        kept, dropped = [], []
+        for c in cases:
+            meta = getattr(c, "meta", {}) or {}
+            if meta.get("verified") is False:
+                dropped.append(getattr(c, "case_id", "?"))
+            else:
+                kept.append(c)
+        if dropped:
+            print(f"[orchestrator] skipping {len(dropped)} unverified case(s): "
+                  f"{dropped}. Pass --include-unverified to run them anyway.")
+        cases = kept
+        if not cases:
+            sys.stderr.write("All matching cases are unverified.\n")
+            return 2
 
     cfgs = _resolve_tool_configs(args.tool_configs)
 
@@ -120,6 +174,8 @@ def main() -> int:
 
     specs = build_matrix(
         cases, args.models, cfgs, args.trials, args.context_lines, args.tiers,
+        breakpoint_at_patch=args.breakpoint_at_patch,
+        structural_fix_turn=args.structural_fix_turn,
     )
     print(f"[orchestrator] {len(specs)} runs -> {out_root}")
 
@@ -128,8 +184,21 @@ def main() -> int:
 
     for i, spec in enumerate(specs, 1):
         rid = run_id_for(spec)
-        print(f"[{i}/{len(specs)}] {rid}")
         run_dir = out_root / rid
+        # A3: --skip-existing reuses a prior status=ok run instead of
+        # re-running. Other statuses (timeout, no_collect) are re-run
+        # because they're typically transient lldb attach flakes.
+        if args.skip_existing and (run_dir / "result.json").exists():
+            try:
+                prior = json.loads((run_dir / "result.json").read_text())
+                if prior.get("status") == "ok":
+                    print(f"[{i}/{len(specs)}] {rid}  [skipped — prior ok]")
+                    index.append(prior)
+                    (out_root / "index.json").write_text(json.dumps(index, indent=2))
+                    continue
+            except Exception:
+                pass
+        print(f"[{i}/{len(specs)}] {rid}")
         try:
             driver = _driver_for_tier(
                 spec.tier,

@@ -26,7 +26,16 @@ from bench.common import (
 )
 
 
-def build_lldb_script(binary: Path, case: Case, question: str) -> str:
+STRUCTURAL_FIX_QUESTION = (
+    "Now propose a structural change that prevents this entire class of "
+    "bug — not just a patch at this line. Think about API design, types, "
+    "or invariants that would make the bug inexpressible."
+)
+
+
+def build_lldb_script(binary: Path, case: Case, question: str,
+                      *, breakpoint_spec: str | None = None,
+                      structural_followup: bool = False) -> str:
     args = case.meta.get("run", {}).get("args", [])
     lines = ["command script import chatdbg.chatdbg_lldb"]
     if args:
@@ -35,22 +44,33 @@ def build_lldb_script(binary: Path, case: Case, question: str) -> str:
     stdin_path = case.meta.get("run", {}).get("stdin_file")
     if stdin_path:
         lines.append(f"settings set target.input-path {stdin_path}")
+    if breakpoint_spec:
+        lines.append(f"breakpoint set --file {breakpoint_spec.split(':')[0]} "
+                     f"--line {breakpoint_spec.split(':')[1]}")
     lines.append("run")
     lines.append(f"why {question}")
+    if structural_followup:
+        lines.append(f"why {STRUCTURAL_FIX_QUESTION}")
     # Intentionally omit `quit`: the follow-up input() in DBGDialog.dialog
     # sees EOF and breaks; lldb then sees EOF on its command stream and
     # exits cleanly.
     return "\n".join(lines) + "\n"
 
 
-def build_gdb_script(binary: Path, case: Case, question: str) -> str:
+def build_gdb_script(binary: Path, case: Case, question: str,
+                     *, breakpoint_spec: str | None = None,
+                     structural_followup: bool = False) -> str:
     args = case.meta.get("run", {}).get("args", [])
     lines = ["source -s chatdbg.chatdbg_gdb"]
     if args:
         quoted = " ".join(shlex.quote(str(a)) for a in args)
         lines.append(f"set args {quoted}")
+    if breakpoint_spec:
+        lines.append(f"break {breakpoint_spec}")
     lines.append("run")
     lines.append(f"why {question}")
+    if structural_followup:
+        lines.append(f"why {STRUCTURAL_FIX_QUESTION}")
     return "\n".join(lines) + "\n"
 
 
@@ -85,7 +105,8 @@ def lldb_binary() -> str:
 
 
 def _repo_venv_site_packages() -> str | None:
-    """Return the bench venv's site-packages path, if a venv exists.
+    """Return the bench venv's site-packages path, if a venv exists
+    AND its compiled extensions match the current platform.
 
     Two layouts are supported:
       `.venv-bench-39` — built against Python 3.9 (Apple's bundled lldb).
@@ -94,16 +115,92 @@ def _repo_venv_site_packages() -> str | None:
       `.venv-bench`     — built against a newer Python (e.g. for a future
                          lldb that ships with one).
 
-    The 3.9 venv is preferred when present, since Apple's lldb is the
-    one we actually launch on macOS arm64 (see `lldb_binary` above)."""
+    Cross-platform safety [A8]: when this driver runs inside a Linux
+    container with the host repo bind-mounted, a macOS-arm64 .so on
+    PYTHONPATH crashes the embedded interpreter with a misleading
+    ImportError ("circular import in tiktoken"). Detect the platform of
+    the venv's first compiled .so and only return the path if it
+    matches the running interpreter.
+    """
+    import sysconfig
+    host_ext_suffix = sysconfig.get_config_var("EXT_SUFFIX") or ""
     for name in (".venv-bench-39", ".venv-bench"):
         venv = REPO_DIR / name
         if not venv.exists():
             continue
         matches = list((venv / "lib").glob("python*/site-packages"))
-        if matches:
-            return str(matches[0])
+        if not matches:
+            continue
+        site_packages = matches[0]
+        # Walk a small set of .so files to confirm platform compatibility.
+        sample_so = next(site_packages.rglob("*.so"), None)
+        if sample_so is None:
+            return str(site_packages)
+        try:
+            magic = sample_so.open("rb").read(4)
+        except OSError:
+            return str(site_packages)
+        # ELF: 0x7F 'E' 'L' 'F'. Mach-O: 0xCFFA EDFE / 0xFEED FACF / etc.
+        is_elf = magic[:4] == b"\x7fELF"
+        is_macho = magic[:4] in (b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xce",
+                                  b"\xfe\xed\xfa\xcf", b"\xca\xfe\xba\xbe")
+        running_on_linux = platform.system() == "Linux"
+        if running_on_linux and not is_elf:
+            return None  # macOS .so on Linux interpreter
+        if not running_on_linux and is_elf:
+            return None  # ELF .so on macOS interpreter
+        # Stronger check: ext suffix should match if we have one.
+        if host_ext_suffix and not list(site_packages.rglob(f"*{host_ext_suffix}")):
+            # Sample present but no match for our specific suffix —
+            # likely Python version mismatch. Skip rather than crash.
+            return None
+        return str(site_packages)
     return None
+
+
+def _run_debugger(
+    argv: list[str],
+    stdin_for_proc,
+    env: dict,
+    run_dir: Path,
+    timeout: float,
+) -> tuple[str, str, int, bool]:
+    """Spawn the debugger in its own process group so we can kill the whole
+    tree on timeout. Returns (stdout, stderr, exit_code, timed_out).
+
+    A1: setsid + killpg ensures a stuck lldb child doesn't outlive the
+    Python parent's timeout. We previously observed the orchestrator
+    blocked for 47 minutes despite a 240s subprocess.run timeout because
+    lldb owned its own process group and ignored the SIGTERM Python sent.
+    """
+    import os, signal
+    proc = subprocess.Popen(
+        argv,
+        stdin=subprocess.PIPE if isinstance(stdin_for_proc, str)
+              else (stdin_for_proc if stdin_for_proc is not None else subprocess.DEVNULL),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+        cwd=run_dir,
+        start_new_session=True,
+    )
+    try:
+        if isinstance(stdin_for_proc, str):
+            stdout, stderr = proc.communicate(input=stdin_for_proc, timeout=timeout)
+        else:
+            stdout, stderr = proc.communicate(timeout=timeout)
+        return (stdout or "", stderr or "", proc.returncode, False)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        try:
+            stdout, stderr = proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            stdout, stderr = "", ""
+        return (stdout or "", stderr or "", -1, True)
 
 
 class Tier3Driver:
@@ -188,7 +285,19 @@ class Tier3Driver:
                     env.pop(k, None)
 
         if self.debugger == "lldb":
-            script = build_lldb_script(binary, spec.case, spec.question)
+            # S5(b)/B3: synthetic cases can opt into a breakpoint at
+            # bug.root_cause_lines[0] (uses source_file as the file)
+            # and/or a structural-fix follow-up turn.
+            bp_spec = None
+            if spec.breakpoint_at_patch:
+                rcl = spec.case.meta.get("bug", {}).get("root_cause_lines") or []
+                if rcl:
+                    bp_spec = f"{spec.case.meta.get('source_file')}:{rcl[0]}"
+            script = build_lldb_script(
+                binary, spec.case, spec.question,
+                breakpoint_spec=bp_spec,
+                structural_followup=spec.structural_fix_turn,
+            )
             # We must pass the script via `-s session.cmds`, NOT via stdin.
             # If lldb's command stream comes from stdin then the launched
             # target inherits the same stdin, which (a) lets it consume
@@ -205,7 +314,16 @@ class Tier3Driver:
             ]
             stdin_for_proc = subprocess.DEVNULL
         elif self.debugger == "gdb":
-            script = build_gdb_script(binary, spec.case, spec.question)
+            bp_spec = None
+            if spec.breakpoint_at_patch:
+                rcl = spec.case.meta.get("bug", {}).get("root_cause_lines") or []
+                if rcl:
+                    bp_spec = f"{spec.case.meta.get('source_file')}:{rcl[0]}"
+            script = build_gdb_script(
+                binary, spec.case, spec.question,
+                breakpoint_spec=bp_spec,
+                structural_followup=spec.structural_fix_turn,
+            )
             (run_dir / "session.cmds").write_text(script)
             argv = ["gdb", "-nx", "-batch-silent"]
             argv += ["-ex", "source /dev/stdin", str(binary)]
@@ -213,32 +331,40 @@ class Tier3Driver:
         else:
             raise ValueError(f"Unknown debugger: {self.debugger}")
 
+        # Run the debugger session, with up to one retry on the
+        # macOS-arm64 lldb attach race (A2). Each attempt enforces the
+        # outer timeout via a process-group kill (A1).
         start = time.time()
-        try:
-            proc = subprocess.run(
-                argv,
-                input=stdin_for_proc if isinstance(stdin_for_proc, str) else None,
-                stdin=stdin_for_proc if not isinstance(stdin_for_proc, str) else None,
-                text=True,
-                capture_output=True,
-                env=env,
-                cwd=run_dir,
-                timeout=timeout,
+        attempts = 0
+        proc = None
+        status = "no_collect"
+        exit_code = -1
+        while attempts < 2:
+            attempts += 1
+            stdout_text, stderr_text, exit_code, timed_out = _run_debugger(
+                argv, stdin_for_proc, env, run_dir, timeout)
+            (run_dir / "stdout.log").write_text(stdout_text)
+            (run_dir / "stderr.log").write_text(stderr_text)
+            if timed_out:
+                elapsed = time.time() - start
+                return finalize_result(
+                    run_dir, spec,
+                    status="timeout", exit_code=-1, elapsed_s=elapsed,
+                )
+            if collect_path.exists():
+                status = "ok"
+                break
+            # Retry only on the specific lldb attach race.
+            attach_failed = (
+                "attach failed" in stderr_text and "could not pause" in stderr_text
             )
-            status = "ok" if collect_path.exists() else "no_collect"
-            exit_code = proc.returncode
-        except subprocess.TimeoutExpired as e:
-            (run_dir / "stdout.log").write_text(e.stdout or "")
-            (run_dir / "stderr.log").write_text(e.stderr or "")
-            elapsed = time.time() - start
-            return finalize_result(
-                run_dir, spec,
-                status="timeout", exit_code=-1, elapsed_s=elapsed,
-            )
+            if attach_failed and attempts < 2:
+                # Wipe stale build/-internal state lldb may have cached.
+                continue
+            status = "no_collect"
+            break
 
         elapsed = time.time() - start
-        (run_dir / "stdout.log").write_text(proc.stdout or "")
-        (run_dir / "stderr.log").write_text(proc.stderr or "")
         return finalize_result(
             run_dir, spec,
             status=status, exit_code=exit_code, elapsed_s=elapsed,
@@ -320,8 +446,15 @@ class Tier3Driver:
             status = "ok" if collect_path.exists() else "no_collect"
             exit_code = proc.returncode
         except subprocess.TimeoutExpired as e:
-            (run_dir / "stdout.log").write_text(e.stdout or "")
-            (run_dir / "stderr.log").write_text(e.stderr or "")
+            # subprocess.TimeoutExpired.stdout/stderr are bytes even when the
+            # original call used text=True. Coerce so write_text doesn't
+            # TypeError out and mask the real status as "error".
+            def _decode(x):
+                if isinstance(x, bytes):
+                    return x.decode("utf-8", errors="replace")
+                return x or ""
+            (run_dir / "stdout.log").write_text(_decode(e.stdout))
+            (run_dir / "stderr.log").write_text(_decode(e.stderr))
             elapsed = time.time() - start
             return finalize_result(
                 run_dir, spec,

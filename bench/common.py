@@ -95,9 +95,52 @@ class RunSpec:
     context_lines: int = 10
     tier: int = 3
     question: str = DEFAULT_QUESTION
+    # S5(b): for BugsC++ cases without a crash, set a breakpoint at the
+    # patch site so the model can inspect locals at the defect instead
+    # of staring at exit() / __libc_start_main.
+    breakpoint_at_patch: bool = False
+    # B3: ask a structural-fix follow-up after the first answer.
+    structural_fix_turn: bool = False
 
 
-def discover_cases(only: list[str] | None = None) -> list[Case]:
+def _validate_case_meta(meta: dict, case_dir: Path) -> list[str]:
+    """C7: schema validation for synthetic / injected case.yaml manifests.
+
+    Returns a list of human-readable problems (empty list = valid).
+    Validates only the fields the harness actually consumes — keeps the
+    schema lightweight and additive."""
+    errs: list[str] = []
+    if not isinstance(meta, dict):
+        return [f"{case_dir.name}: case.yaml is not a YAML mapping"]
+    kind = meta.get("kind", "synthetic_single_file")
+    # Required across all kinds:
+    for key in ("id", "language"):
+        if not meta.get(key):
+            errs.append(f"{case_dir.name}: missing required field '{key}'")
+    crit = meta.get("criteria") or {}
+    for axis in ("root_cause", "local_fix", "global_fix"):
+        if not crit.get(axis):
+            errs.append(f"{case_dir.name}: missing criteria.{axis}")
+    if kind == "synthetic_single_file":
+        sf = meta.get("source_file")
+        if not sf:
+            errs.append(f"{case_dir.name}: synthetic case missing source_file")
+        elif not (case_dir / sf).exists():
+            errs.append(f"{case_dir.name}: source_file '{sf}' not on disk")
+        flags = meta.get("build", {}).get("flags")
+        if flags and not isinstance(flags, list):
+            errs.append(f"{case_dir.name}: build.flags must be a list")
+    elif kind == "injected_repo":
+        repo = meta.get("repo") or {}
+        if not repo.get("url") or not repo.get("sha"):
+            errs.append(f"{case_dir.name}: injected case missing repo.url or repo.sha")
+        if not meta.get("bug", {}).get("root_cause_file"):
+            errs.append(f"{case_dir.name}: injected case missing bug.root_cause_file")
+    return errs
+
+
+def discover_cases(only: list[str] | None = None,
+                   strict_schema: bool = False) -> list[Case]:
     """Walk CASES_DIR for case.yaml manifests.
 
     Supports two layouts:
@@ -108,15 +151,28 @@ def discover_cases(only: list[str] | None = None) -> list[Case]:
     A directory without its own case.yaml is treated as a group and its
     immediate subdirectories are scanned. This is intentionally just one
     level of nesting to keep discovery predictable.
+
+    C7: when `strict_schema=True`, raise on any case whose case.yaml
+    fails validation. Default is to print warnings and skip the case
+    so a single typo doesn't kill a whole sweep.
     """
     cases: list[Case] = []
+    schema_errors: list[str] = []
 
     def consider(case_dir: Path) -> None:
         manifest = case_dir / "case.yaml"
         if not manifest.exists():
             return
-        with open(manifest) as f:
-            meta = yaml.safe_load(f)
+        try:
+            with open(manifest) as f:
+                meta = yaml.safe_load(f)
+        except yaml.YAMLError as e:
+            schema_errors.append(f"{case_dir.name}: invalid YAML: {e}")
+            return
+        problems = _validate_case_meta(meta, case_dir)
+        if problems:
+            schema_errors.extend(problems)
+            return
         case_id = meta.get("id", case_dir.name)
         if only and case_id not in only and case_dir.name not in only:
             return
@@ -131,6 +187,12 @@ def discover_cases(only: list[str] | None = None) -> list[Case]:
             for child in sorted(entry.iterdir()):
                 if child.is_dir():
                     consider(child)
+
+    if schema_errors:
+        msg = "case.yaml schema problems:\n  " + "\n  ".join(schema_errors)
+        if strict_schema:
+            raise ValueError(msg)
+        sys.stderr.write(f"[discover] {msg}\n")
 
     return cases
 
@@ -188,14 +250,27 @@ def prepare_injected_workspace(
                                   f"case {case.case_id}: missing repo.url or repo.sha\n")
 
     workdir = WORKSPACE_CACHE / case.case_id
-    sentinel = workdir / ".prepared.ok"
     build_cfg = case.meta.get("build", {})
     binary_rel = build_cfg.get("binary")
     binary_path = workdir / binary_rel if binary_rel else None
 
+    # A4: hash-keyed sentinel — invalidate the cached build whenever
+    # any field that influences the build changes (repo sha, build
+    # commands, patch_ops, asset list). Previously the sentinel was a
+    # static `.prepared.ok` and stale builds silently survived
+    # case.yaml edits, hiding calibration mistakes.
+    import hashlib
+    cache_key_blob = json.dumps({
+        "repo": case.meta.get("repo", {}),
+        "build": build_cfg,
+        "patch_ops": case.meta.get("bug", {}).get("patch_ops", []),
+    }, sort_keys=True).encode("utf-8")
+    cache_key = hashlib.sha256(cache_key_blob).hexdigest()[:16]
+    sentinel = workdir / f".prepared.{cache_key}.ok"
+
     if sentinel.exists() and not rebuild and binary_path and binary_path.exists():
         return InjectedPrepResult(workdir, binary_path, "ok",
-                                  f"reusing cached workspace: {workdir}\n")
+                                  f"reusing cached workspace: {workdir} (key={cache_key})\n")
 
     if workdir.exists():
         shutil.rmtree(workdir)
@@ -303,6 +378,9 @@ def build_matrix(
     trials: int,
     context_lines: list[int],
     tiers: list[int],
+    *,
+    breakpoint_at_patch: bool = False,
+    structural_fix_turn: bool = False,
 ) -> list[RunSpec]:
     specs: list[RunSpec] = []
     for case in cases:
@@ -316,6 +394,8 @@ def build_matrix(
                                 tool_config_path=cfg,
                                 context_lines=ctx, trial=t,
                                 tier=tier,
+                                breakpoint_at_patch=breakpoint_at_patch,
+                                structural_fix_turn=structural_fix_turn,
                             ))
     return specs
 
@@ -361,9 +441,37 @@ class DockerCase:
         return True  # Docker handles cross-platform
 
 
+# Shell-wrapper command names BugsC++ uses for triggers. argv[0] in the
+# corpus is recorded both as bare names ('bash', 'sed') and absolute
+# paths ('/bin/bash'); we match the basename to handle both.
+_SYSTEM_TRIGGER_WRAPPERS = frozenset({
+    "bash", "sh", "zsh", "dash",
+    "sed", "awk", "grep",
+    "find", "make", "cmake", "gmake",
+})
+
+
+def is_system_trigger_wrapper(trigger_argv: list[str]) -> bool:
+    """S1: True if trigger_argv[0] is a known shell wrapper (bash, sed,
+    find, make, ...) rather than the actual buggy binary. The DockerDriver
+    will attach gdb to the wrapper, not the bug — runs from such cases
+    are noise and should be flagged at discovery time.
+
+    Matches both bare command names ('bash') and absolute paths
+    ('/bin/bash', '/usr/local/bin/bash')."""
+    if not trigger_argv:
+        return False
+    head = trigger_argv[0]
+    # basename matching handles both 'bash' and '/usr/bin/bash'
+    name = head.rsplit("/", 1)[-1] if "/" in head else head
+    return name in _SYSTEM_TRIGGER_WRAPPERS
+
+
 def discover_docker_cases(
     db_path: Path | None = None,
     only: list[str] | None = None,
+    crash_only: bool = False,
+    skip_system_triggers: bool = False,
 ) -> list[DockerCase]:
     """Load pipeline2 BugsCPP cases from the corpus DB.
 
@@ -406,13 +514,27 @@ def discover_docker_cases(
         placeholders = ",".join("?" for _ in only)
         sql += f" AND bug_id IN ({placeholders})"
         params = tuple(only)
+    if crash_only:
+        # S5(a): only schedule cases that pipeline2/probe.py confirmed
+        # actually crash. Many BugsC++ "bugs" are wrong-output (clean
+        # exit(0)), and ChatDBG's lldb-runs-until-crash session has
+        # nothing to debug for those. crash_signal is populated by
+        # pipeline2/probe.py — NULL means probe didn't see a signal.
+        sql += " AND crash_signal IS NOT NULL"
     sql += " ORDER BY bug_id"
 
     rows = con.execute(sql, params).fetchall()
     con.close()
 
     cases = []
+    skipped_wrong_binary = []
     for r in rows:
+        trigger_argv = json.loads(r["trigger_argv_json"])
+        if skip_system_triggers and is_system_trigger_wrapper(trigger_argv):
+            # S1: trigger is bash/sed/find/make → gdb attaches to a
+            # shell wrapper instead of the buggy binary. Drop and warn.
+            skipped_wrong_binary.append(r["bug_id"])
+            continue
         cases.append(DockerCase(
             bug_id=r["bug_id"],
             project=r["project"],
@@ -431,6 +553,13 @@ def discover_docker_cases(
             bug_type=r["bug_type"],
             db_language=r["language"],
         ))
+    if skipped_wrong_binary:
+        sys.stderr.write(
+            f"[discover] skipped {len(skipped_wrong_binary)} BugsC++ case(s) "
+            f"whose trigger_argv[0] is a shell wrapper (gdb would attach to "
+            f"bash/sed/find/make, not the bug). Pass skip_system_triggers=False "
+            f"to include them. Sample: {skipped_wrong_binary[:5]}\n"
+        )
     return cases
 
 

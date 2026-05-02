@@ -74,11 +74,31 @@ def build_user_prompt(run_dir: Path) -> tuple[str, dict] | None:
     case = load_yaml(case_yaml)
     result = load_json(result_json)
     criteria = case.get("criteria", {})
-    source_file = case["source_file"]
-    source_path = run_dir / source_file
-    if not source_path.exists():
+    # For synthetic cases, source_file is a sibling of case.yaml. For
+    # `kind: injected_repo` cases the source lives in the workspace
+    # cache under bench/.workspace-cache/<case_id>/<bug.root_cause_file>;
+    # fall back to that when the synthetic file isn't present.
+    source_file = case.get("source_file")
+    source = None
+    if source_file:
+        source_path = run_dir / source_file
+        if source_path.exists():
+            try:
+                source = source_path.read_text()
+            except UnicodeDecodeError:
+                source = source_path.read_text(errors="replace")
+    if source is None:
+        rc_file = (case.get("bug", {}) or {}).get("root_cause_file")
+        if rc_file:
+            cached = (BENCH_DIR / ".workspace-cache" / case.get("id", "") / rc_file)
+            if cached.exists():
+                try:
+                    source = cached.read_text()
+                except UnicodeDecodeError:
+                    source = cached.read_text(errors="replace")
+                source_file = rc_file
+    if source is None:
         return None
-    source = source_path.read_text()
     if len(source) > MAX_SRC_CHARS:
         source = source[:MAX_SRC_CHARS] + "\n/* ... source truncated ... */\n"
 
@@ -181,30 +201,79 @@ def judge_one(
         return None
     prompt, meta = built
 
-    t0 = time.time()
-    resp = litellm.completion(
-        model=judge_model,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": prompt},
-        ],
-        temperature=temperature,
-    )
-    elapsed = time.time() - t0
+    # A7: detect "no prose synthesis" failures — the model engaged the
+    # debugger (n_tools > 0) but emitted essentially no answer
+    # (Gemini-Flash-Lite hits this on ~half of runs). Don't burn judge
+    # API quota; record the discriminator so the heatmap can render
+    # this distinctly from a content-failure 0/0/0.
+    response_text = "(empty)"
+    if (run_dir / "collect.json").exists():
+        try:
+            q = (load_json(run_dir / "collect.json").get("queries") or [{}])[0]
+            response_text = q.get("response") or "(empty)"
+        except Exception:
+            pass
+    n_tools = meta.get("num_tool_calls", 0) or 0
+    if len(response_text.strip()) < 50 and n_tools > 0:
+        score = {
+            "judge_model": judge_model,
+            "status": "no_prose_synthesis",
+            "elapsed_s": 0.0,
+            "judge_input_tokens": 0,
+            "judge_output_tokens": 0,
+            "raw_judge_output": "",
+            "mut": meta,
+            "scores": {"root_cause": 0, "local_fix": 0, "global_fix": 0},
+            "rationale": {
+                "root_cause": (
+                    f"Model engaged the debugger ({n_tools} tool calls) but "
+                    f"emitted only {len(response_text.strip())} chars of prose; "
+                    f"no diagnosis to score against. Likely model-side stop-token "
+                    f"or output-format regression."),
+                "local_fix": "Skipped — no prose to evaluate.",
+                "global_fix": "Skipped — no prose to evaluate.",
+            },
+            "no_prose_response_len": len(response_text.strip()),
+        }
+        score_path.write_text(json.dumps(score, indent=2))
+        return score
 
-    content = resp.choices[0].message.content or ""
-    parsed = extract_json(content)
-    usage = getattr(resp, "usage", None) or {}
-    ptok = getattr(usage, "prompt_tokens", None) or usage.get("prompt_tokens", 0)
-    ctok = getattr(usage, "completion_tokens", None) or usage.get("completion_tokens", 0)
+    # A6: retry up to twice on parse_failed. gpt-4o emits malformed
+    # JSON ~0.5% of the time; without retry that becomes a permanent
+    # 0/0/0 cell in the heatmap.
+    last_content = ""
+    last_usage = {}
+    last_elapsed = 0.0
+    parsed = None
+    attempts = 0
+    for attempts in range(1, 3):
+        t0 = time.time()
+        resp = litellm.completion(
+            model=judge_model,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=temperature if attempts == 1 else 0.0,
+        )
+        last_elapsed = time.time() - t0
+        last_content = resp.choices[0].message.content or ""
+        last_usage = getattr(resp, "usage", None) or {}
+        parsed = extract_json(last_content)
+        if parsed is not None:
+            break
+
+    ptok = getattr(last_usage, "prompt_tokens", None) or (last_usage.get("prompt_tokens", 0) if isinstance(last_usage, dict) else 0)
+    ctok = getattr(last_usage, "completion_tokens", None) or (last_usage.get("completion_tokens", 0) if isinstance(last_usage, dict) else 0)
 
     score = {
         "judge_model": judge_model,
-        "elapsed_s": round(elapsed, 3),
+        "elapsed_s": round(last_elapsed, 3),
         "judge_input_tokens": ptok,
         "judge_output_tokens": ctok,
-        "raw_judge_output": content,
-        "mut": meta,    # metadata about the model-under-test's run
+        "raw_judge_output": last_content,
+        "judge_attempts": attempts,
+        "mut": meta,
     }
     if parsed is None:
         score["status"] = "parse_failed"
