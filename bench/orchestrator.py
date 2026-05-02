@@ -82,6 +82,16 @@ def _driver_for_tier(
         driver = get_driver(1, **kwargs)
         klass_label = mini_model_class or "auto"
         print(f"[orchestrator] tier1 using mini-swe-agent (bash-only, model_class={klass_label})")
+    elif tier == 2:
+        # Tier 2 = mini-swe-agent + persistent gdb session. Same
+        # subprocess plumbing as Tier 1 (.venv-bench shell-out), with
+        # an extra gdb child process the runner manages.
+        kwargs = {"dry_run": dry_run}
+        if mini_model_class:
+            kwargs["mini_model_class"] = mini_model_class
+        driver = get_driver(2, **kwargs)
+        klass_label = mini_model_class or "auto"
+        print(f"[orchestrator] tier2 using mini-swe-agent (bash + gdb, model_class={klass_label})")
     else:
         driver = get_driver(tier)
     cache[cache_key] = driver
