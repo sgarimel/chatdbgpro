@@ -235,14 +235,22 @@ def _apply_patch_ops(workdir: Path, ops: list[dict]) -> tuple[bool, str]:
 
 
 def prepare_injected_workspace(
-    case: Case, *, rebuild: bool = False
+    case: Case, *, rebuild: bool = False,
+    cache_dir: Path | None = None,
 ) -> InjectedPrepResult:
     """Clone repo @ sha, apply patch_ops, run build.commands.
 
-    The built tree lives at WORKSPACE_CACHE/<case_id>/. A sentinel file
-    `.prepared.ok` in that dir marks a successful prep so repeated runs
-    across (model × trial) reuse the same tree. Set `rebuild=True` to
-    blow the cache and start over (useful during step-4 calibration)."""
+    The built tree lives at `<cache_dir or WORKSPACE_CACHE>/<case_id>/`.
+    A sentinel file `.prepared.<hash>.ok` (hash over repo+build+patch_ops)
+    marks a successful prep so repeated runs across (model × trial)
+    reuse the same tree. Set `rebuild=True` to blow the cache and
+    start over (useful during step-4 calibration).
+
+    The optional `cache_dir` argument lets callers separate caches
+    by toolchain so a host-built (mach-o) and container-built (ELF)
+    workspace for the same case_id don't collide. The Tier 2 Linux-
+    container driver passes `cache_dir=bench/.workspace-cache-linux`.
+    """
     repo_info = case.meta.get("repo", {})
     url = repo_info.get("url")
     sha = str(repo_info.get("sha", ""))
@@ -250,7 +258,8 @@ def prepare_injected_workspace(
         return InjectedPrepResult(None, None, "clone_failed",
                                   f"case {case.case_id}: missing repo.url or repo.sha\n")
 
-    workdir = WORKSPACE_CACHE / case.case_id
+    cache_root = cache_dir if cache_dir is not None else WORKSPACE_CACHE
+    workdir = cache_root / case.case_id
     build_cfg = case.meta.get("build", {})
     binary_rel = build_cfg.get("binary")
     binary_path = workdir / binary_rel if binary_rel else None
@@ -275,7 +284,7 @@ def prepare_injected_workspace(
 
     if workdir.exists():
         shutil.rmtree(workdir)
-    WORKSPACE_CACHE.mkdir(parents=True, exist_ok=True)
+    cache_root.mkdir(parents=True, exist_ok=True)
 
     log: list[str] = []
     def run(cmd: list[str], cwd: Path | None = None) -> int:
