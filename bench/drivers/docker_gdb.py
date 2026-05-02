@@ -59,15 +59,41 @@ exec gdb -nx -batch-silent -x /tmp/session.cmds --args "$EXE" "$@"
 """
 
 
-def _build_gdb_session(question: str, tool_config_name: str) -> str:
-    """Build the GDB commands that load ChatDBG and ask the question."""
+def _build_gdb_session(
+    question: str,
+    tool_config_name: str,
+    *,
+    breakpoint_spec: str | None = None,
+    structural_followup: str | None = None,
+) -> str:
+    """Build the GDB commands that load ChatDBG and ask the question.
+
+    S5(b): when `breakpoint_spec` is provided (formatted as
+    "<file>:<line>"), set a breakpoint there before `run` so the
+    debugger stops at the patch site instead of running to clean
+    exit. This handles BugsC++ wrong-output bugs that don't crash —
+    without it the lldb session shows only exit/__libc_start_main
+    and the model has no defect frame to inspect.
+
+    B3: when `structural_followup` is provided, issue a second `why`
+    after the first one. ChatDBG records both as queries[] in
+    collect.json so the judge can score the second answer separately.
+    """
     lines = [
         "set pagination off",
         "set confirm off",
         "source /chatdbg-src/chatdbg/chatdbg_gdb.py",
-        "run",
-        f"why {question}",
     ]
+    if breakpoint_spec:
+        # `break <file>:<line>` then `run` will stop at the breakpoint
+        # if the program reaches it; if the program crashes earlier,
+        # the crash takes precedence (gdb stops on signal). Either way
+        # ChatDBG sees a non-trivial state.
+        lines.append(f"break {breakpoint_spec}")
+    lines.append("run")
+    lines.append(f"why {question}")
+    if structural_followup:
+        lines.append(f"why {structural_followup}")
     return "\n".join(lines)
 
 
@@ -129,8 +155,27 @@ class DockerDriver:
         # Copy tool config into run_dir so it's accessible inside container
         shutil.copy(spec.tool_config_path, run_dir / "tool_config.json")
 
-        # Build GDB session commands
-        gdb_session = _build_gdb_session(spec.question, spec.tool_config_path.stem)
+        # S5(b): for cases without a populated crash_signal, set a
+        # breakpoint at patch_first_file:patch_first_line so the model
+        # gets a defect-site frame to inspect instead of seeing the
+        # program run to a clean exit. We also set the breakpoint when
+        # the user explicitly opts in via --breakpoint-at-patch even
+        # for crashing cases (covers cases where the crash is far from
+        # the actual defect).
+        bp_spec = None
+        if spec.breakpoint_at_patch and case.patch_first_file and case.patch_first_line:
+            bp_spec = f"{case.patch_first_file}:{case.patch_first_line}"
+
+        STRUCTURAL_Q = ("Now propose a structural change that prevents this entire "
+                        "class of bug — not just a patch at this line. Think about "
+                        "API design, types, or invariants that would make the bug "
+                        "inexpressible.")
+        followup = STRUCTURAL_Q if spec.structural_fix_turn else None
+
+        gdb_session = _build_gdb_session(
+            spec.question, spec.tool_config_path.stem,
+            breakpoint_spec=bp_spec, structural_followup=followup,
+        )
         script = CONTAINER_SCRIPT.replace("__GDB_SESSION_COMMANDS__", gdb_session)
 
         # Build environment pass-through

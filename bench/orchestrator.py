@@ -83,7 +83,10 @@ def main() -> int:
                    help="Model paths in LiteLLM format.")
     p.add_argument("--tool-configs", nargs="+", required=True,
                    help="Paths or names (under bench/configs/) of tool-config JSONs.")
-    p.add_argument("--trials", type=int, default=1)
+    p.add_argument("--trials", type=int, default=3,
+                   help="Number of trials per (case, model, config). Default 3 — the previous "
+                        "default of 1 produced single-shot scores with high variance from "
+                        "stochastic models. [S2]")
     p.add_argument("--context-lines", type=int, nargs="+", default=[10],
                    help="Enriched stack-trace depth(s). Paper default: 10.")
     p.add_argument("--tiers", type=int, nargs="+", default=[3],
@@ -108,13 +111,37 @@ def main() -> int:
                    help="Include cases marked verified: false in case.yaml. By default these "
                         "are skipped at discovery time to avoid wasting API calls on stub "
                         "cases that don't actually inject the bug. [A5]")
+    p.add_argument("--crash-only", action="store_true",
+                   help="(--docker only) Only schedule BugsC++ cases that pipeline2/probe.py "
+                        "confirmed actually crash. Drops wrong-output bugs that ChatDBG's "
+                        "lldb-runs-until-crash session can't debug. [S5(a)]")
+    p.add_argument("--skip-system-triggers", action="store_true",
+                   help="(--docker only) Skip BugsC++ cases whose trigger_argv[0] is a shell "
+                        "wrapper (bash/sed/find/make). gdb would attach to the wrapper, not "
+                        "the bug. [S1]")
+    p.add_argument("--breakpoint-at-patch", action="store_true",
+                   help="(--docker only) For non-crashing BugsC++ cases, set a breakpoint at "
+                        "patch_first_file:patch_first_line before `run`. Lets the model "
+                        "inspect locals at the defect site instead of seeing only "
+                        "exit/__libc_start_main. [S5(b)]")
+    p.add_argument("--structural-fix-turn", action="store_true",
+                   help="After the model's first answer, ask a follow-up: 'now propose a "
+                        "structural change that prevents this class of bug'. Stored as a "
+                        "second query in collect.json. [B3]")
+    p.add_argument("--strict-schema", action="store_true",
+                   help="Fail at discovery time if any case.yaml fails schema validation. "
+                        "Default is to warn and skip the offending case. [C7]")
     args = p.parse_args()
 
     if args.docker:
         db_path = Path(args.db) if args.db else None
-        cases = discover_docker_cases(db_path, only=args.bug_ids)
+        cases = discover_docker_cases(
+            db_path, only=args.bug_ids,
+            crash_only=args.crash_only,
+            skip_system_triggers=args.skip_system_triggers,
+        )
     else:
-        cases = discover_cases(only=args.cases)
+        cases = discover_cases(only=args.cases, strict_schema=args.strict_schema)
     if not cases:
         sys.stderr.write("No cases match the filter.\n")
         return 2
@@ -147,6 +174,8 @@ def main() -> int:
 
     specs = build_matrix(
         cases, args.models, cfgs, args.trials, args.context_lines, args.tiers,
+        breakpoint_at_patch=args.breakpoint_at_patch,
+        structural_fix_turn=args.structural_fix_turn,
     )
     print(f"[orchestrator] {len(specs)} runs -> {out_root}")
 

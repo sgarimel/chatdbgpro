@@ -26,7 +26,16 @@ from bench.common import (
 )
 
 
-def build_lldb_script(binary: Path, case: Case, question: str) -> str:
+STRUCTURAL_FIX_QUESTION = (
+    "Now propose a structural change that prevents this entire class of "
+    "bug — not just a patch at this line. Think about API design, types, "
+    "or invariants that would make the bug inexpressible."
+)
+
+
+def build_lldb_script(binary: Path, case: Case, question: str,
+                      *, breakpoint_spec: str | None = None,
+                      structural_followup: bool = False) -> str:
     args = case.meta.get("run", {}).get("args", [])
     lines = ["command script import chatdbg.chatdbg_lldb"]
     if args:
@@ -35,22 +44,33 @@ def build_lldb_script(binary: Path, case: Case, question: str) -> str:
     stdin_path = case.meta.get("run", {}).get("stdin_file")
     if stdin_path:
         lines.append(f"settings set target.input-path {stdin_path}")
+    if breakpoint_spec:
+        lines.append(f"breakpoint set --file {breakpoint_spec.split(':')[0]} "
+                     f"--line {breakpoint_spec.split(':')[1]}")
     lines.append("run")
     lines.append(f"why {question}")
+    if structural_followup:
+        lines.append(f"why {STRUCTURAL_FIX_QUESTION}")
     # Intentionally omit `quit`: the follow-up input() in DBGDialog.dialog
     # sees EOF and breaks; lldb then sees EOF on its command stream and
     # exits cleanly.
     return "\n".join(lines) + "\n"
 
 
-def build_gdb_script(binary: Path, case: Case, question: str) -> str:
+def build_gdb_script(binary: Path, case: Case, question: str,
+                     *, breakpoint_spec: str | None = None,
+                     structural_followup: bool = False) -> str:
     args = case.meta.get("run", {}).get("args", [])
     lines = ["source -s chatdbg.chatdbg_gdb"]
     if args:
         quoted = " ".join(shlex.quote(str(a)) for a in args)
         lines.append(f"set args {quoted}")
+    if breakpoint_spec:
+        lines.append(f"break {breakpoint_spec}")
     lines.append("run")
     lines.append(f"why {question}")
+    if structural_followup:
+        lines.append(f"why {STRUCTURAL_FIX_QUESTION}")
     return "\n".join(lines) + "\n"
 
 
@@ -265,7 +285,19 @@ class Tier3Driver:
                     env.pop(k, None)
 
         if self.debugger == "lldb":
-            script = build_lldb_script(binary, spec.case, spec.question)
+            # S5(b)/B3: synthetic cases can opt into a breakpoint at
+            # bug.root_cause_lines[0] (uses source_file as the file)
+            # and/or a structural-fix follow-up turn.
+            bp_spec = None
+            if spec.breakpoint_at_patch:
+                rcl = spec.case.meta.get("bug", {}).get("root_cause_lines") or []
+                if rcl:
+                    bp_spec = f"{spec.case.meta.get('source_file')}:{rcl[0]}"
+            script = build_lldb_script(
+                binary, spec.case, spec.question,
+                breakpoint_spec=bp_spec,
+                structural_followup=spec.structural_fix_turn,
+            )
             # We must pass the script via `-s session.cmds`, NOT via stdin.
             # If lldb's command stream comes from stdin then the launched
             # target inherits the same stdin, which (a) lets it consume
@@ -282,7 +314,16 @@ class Tier3Driver:
             ]
             stdin_for_proc = subprocess.DEVNULL
         elif self.debugger == "gdb":
-            script = build_gdb_script(binary, spec.case, spec.question)
+            bp_spec = None
+            if spec.breakpoint_at_patch:
+                rcl = spec.case.meta.get("bug", {}).get("root_cause_lines") or []
+                if rcl:
+                    bp_spec = f"{spec.case.meta.get('source_file')}:{rcl[0]}"
+            script = build_gdb_script(
+                binary, spec.case, spec.question,
+                breakpoint_spec=bp_spec,
+                structural_followup=spec.structural_fix_turn,
+            )
             (run_dir / "session.cmds").write_text(script)
             argv = ["gdb", "-nx", "-batch-silent"]
             argv += ["-ex", "source /dev/stdin", str(binary)]

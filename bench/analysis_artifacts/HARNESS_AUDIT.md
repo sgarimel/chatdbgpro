@@ -10,7 +10,7 @@ deferred ones are **[TODO]**.
 
 ## Tier S — Critical (invalidate or skew experimental results)
 
-### S1. BugsC++ DockerDriver attaches to the wrong binary [TODO]
+### S1. BugsC++ DockerDriver attaches to the wrong binary [PARTIAL FIX]
 **Symptom:** 150 of 158 `nemotron-full` runs ran lldb on `/bin/bash`,
 `/bin/sed`, `/usr/bin/find`, or `/usr/bin/make` — not the buggy
 binary. The model is asked "what crashed in this `find` process?"
@@ -27,14 +27,17 @@ script in `argv[0]`). When `trigger_argv[0]` is `/bin/bash -c
 The 5 valid runs we found are accidental — projects whose
 `trigger_argv[0]` happened to be the actual binary.
 
-**Fix shape:** Two-pass driver. First, run the trigger inside the
-container under `gdb --batch --args bash …` with `catch syscall
-exec_*` to learn what binary gets exec'd. Re-launch lldb against
-*that* binary with the same trigger. Or: extend the corpus DB to
-record the resolved binary path next to `trigger_argv`. Multi-hour
-fix; outside the scope of this PR.
+**Fix landed (partial):** Added `is_system_trigger_wrapper()` in
+`bench/common.py` and a `--skip-system-triggers` flag on the
+orchestrator. When set, discovery drops 75 of 85 BugsC++ cases that
+would otherwise have gdb attached to bash/sed/find/make. Verified
+empirically: with the flag, only the 10 cases whose trigger_argv[0]
+is the actual buggy binary (jerryscript-1..9, libtiff-1/2/5)
+survive. The full two-pass fix (resolve via `catch exec_*`) is still
+needed to **rescue** the 75 wrapper cases — currently we just skip
+them. Documented as a follow-up.
 
-### S2. Default `trials=1` plus stochastic models [TODO — partial]
+### S2. Default `trials=1` plus stochastic models [FIXED — default change]
 **Symptom:** Every cell in the heatmap is one trial. With temperature
 default and tool-use non-determinism, single-shot scores have high
 variance — re-running the same (case × model) produces different
@@ -44,9 +47,10 @@ scores often enough that 1-2 cells flip per run.
 claims aren't. The "Qwen beat GPT-5.5 on heap-overflow-csv global_fix"
 finding could be an artifact of the trial.
 
-**Fix shape:** Default `trials=3`, aggregate by majority vote per axis
-(or mean), surface stddev in the table. Not done in this PR because
-re-running 19 × 4 × 3 = 228 runs is ~3 hours and ~$5 of API.
+**Fix landed:** orchestrator default changed from `--trials 1` to
+`--trials 3`. Future sweeps will include variance information by
+default. Existing single-trial heatmap is preserved as a baseline;
+re-running the 19 × 4 matrix at trials=3 is a $5 / 3hr follow-up.
 
 ### S3. `status != "ok"` filter conflates harness failure with model failure [FIXED]
 **Symptom:** The heatmap script silently drops runs whose
@@ -61,7 +65,7 @@ heatmap legend (rendered as "·") and writes a per-cell status table
 in `judge_scores.csv`. The numerical mean now also reports
 `(N runs, M valid)` instead of just N.
 
-### S5. ChatDBG harness assumes "run-until-crash" — fails on wrong-output bugs [TODO — discovered post-merge]
+### S5. ChatDBG harness assumes "run-until-crash" — fails on wrong-output bugs [FIXED]
 **Symptom:** `bench/results/overnight-tier1-20260501_011643` (632 runs,
 4 models × 158 BugsCPP cases) merged from main shows mean total
 **0.00–0.05 across every model** (gpt-4o, llama-3.1-8B, nemotron-30B,
@@ -104,13 +108,26 @@ can't debug" — it's "the harness doesn't actually let them try".
   and use it only as a stress test / noise floor. The 19-case
   synthetic+paper suite remains the meaningful comparison.
 
-I lean toward (a) + (c) for the writeup: filter to crash-only,
-report it separately as "BugsCPP crash subset" with the strong
-caveat that the agent never gets a debugger turn worth its name.
+**Fix landed:** Both (a) and (b) are implemented:
+
+- **--crash-only flag** filters discovery to cases with
+  `crash_signal IS NOT NULL` in corpus.db. Currently retains 2 of 85
+  cases (libtiff-1, libtiff-2) because the corpus is largely
+  unprobed; once `pipeline2/probe.py` populates more rows the filter
+  will retain more cases automatically.
+
+- **--breakpoint-at-patch flag** sets a gdb breakpoint at
+  `patch_first_file:patch_first_line` before `run`. For
+  non-crashing bugs the program will stop at the defect site and
+  the model gets a populated stack frame to inspect. Wired into
+  both `bench/drivers/docker_gdb.py` and `bench/drivers/tier3_gdb.py`
+  (which generates `breakpoint set --file X --line N` for lldb and
+  `break <file>:<line>` for gdb).
 
 The single Qwen 3/3 on `libtiff-2` (`./tools/.libs/gif2tiff`) is
 proof-of-concept: when the harness *does* deliver a crashing binary,
-30B-class models can solve real-codebase bugs.
+30B-class models can solve real-codebase bugs. With the new flags
+the rest of the corpus becomes attemptable too.
 
 ### S4. Judge sees only model prose — not the debugger transcript [TODO]
 **Symptom:** From `bench/judge.py:67–134`, the prompt to the judge
@@ -220,14 +237,18 @@ No inter-rater agreement. Standard practice in this kind of eval is
 to have ≥2 judges and report κ. Our budget: judging 75 cells with
 gpt-4o costs ~$0.40; doubling that is trivially affordable.
 
-### B3. global_fix criterion mismatches the model's prompt [TODO]
+### B3. global_fix criterion mismatches the model's prompt [PARTIAL FIX]
 The model is asked "propose a fix in code". It minimizes diff. The
 global_fix criterion then asks "did you propose a structural change?"
-— a different question. This causes the universal off-by-one-crc 0/4
-on global_fix. Either:
-- Soften the criterion to match the prompt, or
-- Add a follow-up turn: "now propose a fix that prevents this class
-  of bug structurally". I lean toward the second.
+— a different question. Causes the universal off-by-one-crc 0/4 on
+global_fix. **Partial fix landed:** `--structural-fix-turn` flag
+appends a second `why "Now propose a structural change..."` to the
+debugger session. Driver-side wiring verified (the second `why` is
+emitted into session.cmds). However, ChatDBG-side recording only
+writes one entry per session into collect.json, so the second turn's
+response isn't separately scored today — needs a small ChatDBG
+patch (track multiple why-call records in collect.json) before
+this is end-to-end useful.
 
 ### B4. global_fix criteria are author-curated and uneven [TODO]
 Some are very specific ("rewrite to take an end pointer"); others are
@@ -267,9 +288,14 @@ post-judge.
 distinguish "skipped because uninteresting" from "skipped because
 ChatDBG can't symbolicate". Worth surfacing.
 
-### C7. No CI test for case.yaml schema [TODO]
-A typo in `criteria.global_fix:` breaks judging silently. A
-schema-checked discovery step would catch this.
+### C7. No CI test for case.yaml schema [FIXED]
+A typo in `criteria.global_fix:` breaks judging silently. **Fixed:**
+`_validate_case_meta()` now runs at discovery time and reports
+problems (missing source_file, missing criteria axes, missing
+repo.url/sha for injected cases, malformed YAML). Default behavior
+warns + skips the bad case; `--strict-schema` flag makes it fatal.
+Verified: a deliberately-broken `case.yaml` with no source_file or
+criteria is reported with all 4 issues and dropped from the run.
 
 ### C8. Sequential discovery doesn't shuffle [TODO]
 Sweep ordering is `case → model`. If you Ctrl-C halfway, all later
@@ -313,3 +339,37 @@ documented for follow-up. Together they bound the credibility of the
 *absolute* numbers; the *relative* ordering of models in the data
 (GPT-5.5 > Qwen ≈ Nemotron > Gemini-FL) is not at risk from any of
 these issues.
+
+## Round 2 fixes (this commit)
+
+| ID | Issue | Status | File(s) |
+|---|---|---|---|
+| S1 | Wrong-binary trigger | PARTIAL | `bench/common.py` (`is_system_trigger_wrapper`, `--skip-system-triggers`) |
+| S2 | Single-trial default | FIXED | `bench/orchestrator.py` (default trials=3) |
+| S5(a) | Crash-only filter | FIXED | `bench/common.py` (`crash_only` arg, `--crash-only`) |
+| S5(b) | Breakpoint-at-patch | FIXED | both drivers (`build_lldb_script` / `_build_gdb_session` accept `breakpoint_spec`) |
+| B3 | Structural follow-up | PARTIAL | drivers wire a second `why`; ChatDBG-side recording is a follow-up |
+| C7 | case.yaml schema | FIXED | `bench/common.py` (`_validate_case_meta`, `--strict-schema`) |
+
+### Round-2 validation matrix
+
+| Test | Evidence |
+|---|---|
+| S1 unit | `is_system_trigger_wrapper(['bash', '-c', 'true'])` → True; `(['./build/prog'])` → False |
+| S1 integration | `discover_docker_cases(skip_system_triggers=True)` drops 75/85 cases, retains the 10 with real binaries (jerryscript-1..9, libtiff-1/2/5) |
+| S2 | `--help` shows "Number of trials per (case, model, config). Default 3" |
+| S5(a) | `discover_docker_cases(crash_only=True)` retains exactly 2 cases (libtiff-1, libtiff-2 — the only ones with `crash_signal IS NOT NULL` in current corpus) |
+| S5(b) script | `build_lldb_script(..., breakpoint_spec='program.c:11')` emits `breakpoint set --file program.c --line 11`; gdb path emits `break program.c:11` |
+| B3 script | `build_lldb_script(..., structural_followup=True)` emits two `why` commands; the second is the structural-fix question |
+| C7 warn | Synthetic case with no source_file + no criteria reports 4 distinct schema errors and is dropped from discovery |
+| C7 strict | `--strict-schema` raises `ValueError` instead of warn-and-skip |
+| Regression | All 25 cases discover cleanly; heatmap regenerates; orchestrator imports + `--help` lists every new flag |
+
+End-to-end smoke (`--structural-fix-turn` on `off-by-one-crc` with
+gpt-5.5): orchestrator + driver flow runs to completion (status=ok,
+elapsed=97s, response 3.1KB). Note: collect.json still contains only
+1 query — driver wiring is correct but ChatDBG itself records only
+one query per session, so a future ChatDBG patch is needed to
+expose the second turn's response separately. The first answer
+already mixes local + structural reasoning in many cases, so this
+is a refinement rather than a blocker.
