@@ -69,6 +69,12 @@ def _driver_for_tier(
         debugger = pick_debugger(debugger_flag)
         print(f"[orchestrator] tier3 using debugger: {debugger}")
         driver = get_driver(3, debugger=debugger, dry_run=dry_run)
+    elif tier == 1:
+        # Tier 1 = mini-swe-agent (bash-only). Driver shells out to
+        # .venv-bench (Py 3.14, where mini is installed) — the
+        # orchestrator's own .venv-bench-39 is too old for mini v2.
+        driver = get_driver(1, dry_run=dry_run)
+        print("[orchestrator] tier1 using mini-swe-agent (bash-only)")
     else:
         driver = get_driver(tier)
     cache[cache_key] = driver

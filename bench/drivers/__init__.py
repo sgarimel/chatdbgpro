@@ -15,10 +15,19 @@ def get_driver(tier: int, *, docker: bool = False, **kwargs) -> Driver:
     if tier == 3:
         from bench.drivers.tier3_gdb import Tier3Driver
         return Tier3Driver(**kwargs)
-    if tier in (1, 2):
+    if tier == 1:
+        from bench.drivers.tier1_minisweagent import Tier1Driver
+        # Tier1Driver has no debugger; orchestrator dispatch passes
+        # `debugger=...` uniformly for tier 3, so swallow it here
+        # rather than special-case the call site.
+        kwargs.pop("debugger", None)
+        return Tier1Driver(**kwargs)
+    if tier == 2:
         raise NotImplementedError(
-            f"Tier {tier} driver is not implemented yet. "
-            f"See the implementation plan — tier 1 = mini-swe-agent, tier 2 = ChatDBG + bash."
+            "Tier 2 (ChatDBG + bash) is not implemented as a separate "
+            "driver. Closest approximation: "
+            "`--tiers 3 --tool-configs tier2_bash_plus_gdb` (ChatDBG "
+            "with bash AND gdb tools both enabled)."
         )
     raise ValueError(f"Unknown tier: {tier}")
 
