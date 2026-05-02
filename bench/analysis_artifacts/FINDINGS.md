@@ -235,6 +235,39 @@ Final headline numbers (19 cases × 4 models, judge=gpt-4o):
 | Nemotron-30B-A3B | 2.42 |
 | Gemini-3.1-Flash-Lite | 1.05 |
 
+### + tier-1 BugsC++ noise floor (merged from main)
+
+After rebasing onto main I picked up `overnight-tier1-20260501_011643` —
+**632 runs across 4 models × 158 BugsCPP cases**, fully judged. The
+scoreboard is essentially zero for everyone:
+
+| Model | N (judged) | Mean total | 3/3 | 0/3 |
+|---|---|---|---|---|
+| gpt-4o | 152 | **0.00** | 0 | 152 |
+| llama-3.1-8b-instruct | 151 | **0.00** | 0 | 151 |
+| qwen3-30b-a3b-instruct | 152 | **0.02** | 1 | 151 |
+| nemotron-3-nano-30b-a3b | 98 | **0.02** | 0 | 97 |
+
+This is **not** a model-capability claim — it's a harness diagnosis.
+Splitting by debugged-binary class:
+
+| Class | N | Mean total |
+|---|---|---|
+| Wrong binary (gdb on /bin/bash, /bin/sed, /usr/bin/find) | 315 | 0.00 |
+| Right binary, but **non-crashing bug** (program `exit(0)`) | 238 | 0.02 |
+
+The right-binary runs all show the same trivial stack trace:
+`0: exit()  1: __libc_start_main()  2: _start()` because BugsC++
+includes "wrong-output" bugs where the program runs to completion
+with incorrect results. ChatDBG's lldb-runs-until-crash session has
+no breakpoint contract for those cases.
+
+The single 3/3 in 553 runs (Qwen on `libtiff-2`,
+`./tools/.libs/gif2tiff`) is the proof-of-concept that, when the
+harness *does* deliver a crashing binary, real-codebase debugging
+is tractable for 30B-class models. Fixing this is the highest-value
+remaining harness work — see HARNESS_AUDIT.md S5.
+
 Key takeaways:
 1. **GPT-5.5 is the only model that reliably solves uninit-stack-accumulator**
    — even with MSan deterministically catching it, the others can't compose

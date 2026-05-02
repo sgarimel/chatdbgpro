@@ -61,6 +61,57 @@ heatmap legend (rendered as "·") and writes a per-cell status table
 in `judge_scores.csv`. The numerical mean now also reports
 `(N runs, M valid)` instead of just N.
 
+### S5. ChatDBG harness assumes "run-until-crash" — fails on wrong-output bugs [TODO — discovered post-merge]
+**Symptom:** `bench/results/overnight-tier1-20260501_011643` (632 runs,
+4 models × 158 BugsCPP cases) merged from main shows mean total
+**0.00–0.05 across every model** (gpt-4o, llama-3.1-8B, nemotron-30B,
+qwen-30B). Out of 553 valid scored runs, **only one** scored 3/3
+(Qwen on libtiff-2). Reading the prompts surfaces two harness
+problems, not just S1:
+
+1. **S1 (still): wrong binary**, 315/553 = 57% of runs (bash/sed/find
+   triggers, gdb attached to the wrapper).
+2. **S5 (new): non-crashing bugs**, the remaining 238/553 = 43%
+   "valid-binary" runs *also* score ~0 because the prompt header reads:
+
+   > "The bugscpp test for this bug failed: the program exited with
+   > code 0 but the test oracle expected a passing run. **The program
+   > does not crash** — the defect causes incorrect behavior that the
+   > test catches."
+
+   ChatDBG's lldb session runs the binary, sees a clean `exit(0)`,
+   and shows `0: exit()  1: __libc_start_main()  2: _start()` as the
+   "stack trace". There is no defect frame to localize. The model has
+   nothing to work with except the source code listed in the prompt,
+   no hint where to look.
+
+**Impact:** The `nemotron-full` and `overnight-tier1-*` BugsCPP
+suites are essentially noise floors. Mean score ≈ 0.00 isn't "models
+can't debug" — it's "the harness doesn't actually let them try".
+
+**Fix shape:** Three options, in priority order:
+- (a) **Filter to crash-only cases.** BugsCPP's `corpus.db` has a
+  `crash_signal` field. Schedule only cases where `crash_signal IS
+  NOT NULL`, which restricts to actual SEGV / abort / sanitizer
+  bugs. Cuts the corpus by ~40% but every remaining case is at
+  least *attemptable*.
+- (b) **Different debugger contract for wrong-output bugs.** For
+  non-crashing cases, set a breakpoint at the function the patch
+  modifies (we already have `patch_first_function` in `corpus.db`),
+  let the binary run to that breakpoint, dump locals, then ask the
+  model. This requires a second driver path.
+- (c) **Drop the BugsCPP suite from the report's headline numbers**
+  and use it only as a stress test / noise floor. The 19-case
+  synthetic+paper suite remains the meaningful comparison.
+
+I lean toward (a) + (c) for the writeup: filter to crash-only,
+report it separately as "BugsCPP crash subset" with the strong
+caveat that the agent never gets a debugger turn worth its name.
+
+The single Qwen 3/3 on `libtiff-2` (`./tools/.libs/gif2tiff`) is
+proof-of-concept: when the harness *does* deliver a crashing binary,
+30B-class models can solve real-codebase bugs.
+
 ### S4. Judge sees only model prose — not the debugger transcript [TODO]
 **Symptom:** From `bench/judge.py:67–134`, the prompt to the judge
 contains the model's `response` (and optional `thinking`), the source,
