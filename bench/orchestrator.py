@@ -58,6 +58,7 @@ def _driver_for_tier(
     dry_run: bool,
     docker: bool = False,
     mini_model_class: str | None = None,
+    tier2_linux: str | None = None,
 ) -> Driver:
     cache_key = (tier, docker)
     if cache_key in cache:
@@ -85,13 +86,19 @@ def _driver_for_tier(
     elif tier == 2:
         # Tier 2 = mini-swe-agent + persistent gdb session. Same
         # subprocess plumbing as Tier 1 (.venv-bench shell-out), with
-        # an extra gdb child process the runner manages.
+        # an extra gdb child process the runner manages. On macOS
+        # arm64 (where gdb can't run native binaries) the driver
+        # transparently routes through a linux/amd64 Docker container.
         kwargs = {"dry_run": dry_run}
         if mini_model_class:
             kwargs["mini_model_class"] = mini_model_class
+        if tier2_linux:
+            kwargs["prefer_linux"] = tier2_linux
         driver = get_driver(2, **kwargs)
         klass_label = mini_model_class or "auto"
-        print(f"[orchestrator] tier2 using mini-swe-agent (bash + gdb, model_class={klass_label})")
+        linux_label = tier2_linux or "auto"
+        print(f"[orchestrator] tier2 using mini-swe-agent (bash + gdb, "
+              f"model_class={klass_label}, linux={linux_label})")
     else:
         driver = get_driver(tier)
     cache[cache_key] = driver
@@ -162,6 +169,15 @@ def main() -> int:
                         "'openrouter_textbased', 'openrouter_response', 'portkey', "
                         "'portkey_response', 'requesty'. Default = auto-select via "
                         "mini's get_model_class(model_name).")
+    p.add_argument("--tier2-linux", default="auto",
+                   choices=["auto", "always", "never"],
+                   help="(--tiers 2 only) Whether to run Tier 2 inside a Linux/amd64 "
+                        "Docker container. 'auto' (default) = Docker on macOS, native "
+                        "elsewhere; 'always' = Docker even on Linux (reproducibility); "
+                        "'never' = native gdb regardless of platform. Required on "
+                        "macOS because gdb cannot run native arm64 binaries — see "
+                        "bench/analysis_artifacts/HARNESS_AUDIT.md Round 5 for "
+                        "validation evidence.")
     args = p.parse_args()
 
     if args.docker:
@@ -238,6 +254,7 @@ def main() -> int:
                 dry_run=args.dry_run,
                 docker=args.docker,
                 mini_model_class=args.mini_model_class,
+                tier2_linux=args.tier2_linux,
             )
             result = driver.run(spec, run_dir, timeout=args.timeout)
         except Exception as e:

@@ -709,6 +709,119 @@ follow-up work.
 | GdbSession sentinel-based read survives multi-line output from `bt` / `print` / `info locals` | ✓ |
 | Process-group SIGKILL on outer timeout (Round 1 invariant via `_run_debugger`) | ✓ |
 
+## Round 5 — Tier 2 Linux container (this PR)
+
+### The bug Round-4's validation surfaced
+
+PR #8's validation sweep on macOS arm64 hit a fundamental gdb limitation:
+
+> Across 39 gdb tool calls in the validation sweep, **zero** actually
+> executed the program. Every `run` returned
+> `(gdb) Don't know how to run. Try "help target".`
+
+Cause: Homebrew gdb 17.x on macOS arm64 has no native target for
+`darwin-aarch64`. It can load symbols (`info files`, `disassemble`,
+`list`), but `run` / `step` / `continue` / `bt` / `print` of a live
+inferior all fail. Apple's lldb has the proper entitlements; gdb
+does not.
+
+Effect: on macOS, Tier 2 was effectively "bash + dead gdb" — models
+made gdb tool calls but the tool returned errors, and they
+compensated by running the program via bash. The ablation between
+T1 and T2 confounded "does gdb add value?" with "does the agent
+gracefully tolerate a broken tool?", which made macOS Tier-2 numbers
+unfit for experimental claims.
+
+### The fix
+
+Auto-route Tier 2 sweeps through a Linux/arm64 Docker container on
+macOS hosts. New CLI flag `--tier2-linux {auto, always, never}`
+(default `auto` = "Docker on Darwin, native elsewhere") controls the
+behavior.
+
+### Architecture
+
+```
+Orchestrator (.venv-bench-39, Py 3.9, host=macOS)
+ └── Tier2Driver.run()
+      └── _run_in_linux_container()
+           └── docker run --rm \
+                 --cap-add=SYS_PTRACE \
+                 --security-opt seccomp=unconfined \
+                 --user $(id -u):$(id -g) \
+                 -v $REPO:/work \
+                 -e HOME=/tmp \
+                 -e OPENROUTER_API_KEY \
+                 chatdbg-tier2-runner \
+                 bash -c "
+                   clang <flags> source.cpp -o build/prog
+                   python3 tier2_runner.py --gdb-binary build/prog ...
+                 "
+                  └── (inside) DefaultAgent + GdbSession + LocalGdbBashEnvironment
+                       ├── trajectory.json   (bind-mount surfaces to host)
+                       └── collect.json      (judge-ready schema, identical to native T2)
+```
+
+Key design decisions:
+
+- **No `--platform` pin.** linux/arm64 native (Apple Silicon
+  → Hypervisor.framework). linux/amd64 under Rosetta breaks gdb
+  ptrace probes ("linux_ptrace_test_ret_to_nx: Cannot PTRACE_GETREGS:
+  Input/output error"). Verified empirically before changing.
+
+- **`--cap-add=SYS_PTRACE` + `--security-opt seccomp=unconfined`.**
+  gdb's `run` requires ptrace; Docker's default capability set
+  doesn't include it, and the default seccomp profile blocks some
+  ASan-required syscalls.
+
+- **Compile inside the container.** macOS clang produces mach-o
+  binaries the Linux container can't execute. Source is
+  bind-mounted in via `-v $REPO:/work`; container's clang produces
+  ELF/aarch64.
+
+- **`-e HOME=/tmp`.** mini-swe-agent's `__init__` creates
+  `~/.config/mini-swe-agent` on first import; without `HOME` set,
+  the `--user $(id -u)` mode (no /etc/passwd entry) defaults `HOME`
+  to `/`, which is read-only.
+
+- **Bind-mount layout: `$REPO:/work`.** host path
+  `<repo>/bench/results/X` ↔ container path `/work/bench/results/X`.
+  Same paths inside and outside the container, so `collect.json`
+  references work without rewriting.
+
+- **Image build cached** by tag. First sweep builds; subsequent
+  sweeps reuse.
+
+### Validation: gdb actually executes the inferior now
+
+Smoke run on `uaf-linked-list × gpt-5.5` after the fix:
+
+```
+(gdb) Starting program: /work/bench/results/.../build/prog
+[Thread debugging using libthread_db enabled]
+=================================================================
+==25==ERROR: AddressSanitizer: heap-use-after-free on address 0x502000000058
+READ of size 8 at 0x502000000058 thread T0
+    #0 0xaaaaaabb2f44  ...
+    #1 0xaaaaaabb2eb0  ...
+```
+
+Compare to PR #8's macOS-native equivalent which returned `(gdb)
+Don't know how to run. Try "help target".` The container path
+delivers a working debugger.
+
+### Out of scope for this PR
+
+- **Injected-repo cases on Darwin.** `prepare_injected_workspace`
+  runs `git clone` + the case's build commands on the host (macOS).
+  The resulting binary is mach-o-arm64 and the container can't
+  execute it. The driver returns `unsupported_combo` cleanly so
+  sweeps don't crash, with an error.log explaining the limitation.
+  Future fix: move the workspace-prep step inside the container too.
+
+- **Linux hosts.** Native Tier 2 path (PR #8) was already correct
+  on Linux; `--tier2-linux never` keeps that behavior.
+
 ## Round 2 fixes (prior commit)
 
 | ID | Issue | Status | File(s) |
