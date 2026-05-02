@@ -340,7 +340,93 @@ documented for follow-up. Together they bound the credibility of the
 (GPT-5.5 > Qwen ≈ Nemotron > Gemini-FL) is not at risk from any of
 these issues.
 
-## Round 2 fixes (this commit)
+## Round 3 — Tier 1 driver (this commit)
+
+Until this commit, the orchestrator's `--tiers 1` flag raised
+`NotImplementedError`. Tier 1 is now wired via mini-swe-agent v2.
+
+### Architecture
+
+```
+Orchestrator (.venv-bench-39, Py 3.9, Apple lldb pinned)
+ └── Tier1Driver.run(spec, run_dir, ...)
+      ├── compile_case() / prepare_injected_workspace()  (same as Tier3)
+      ├── write task.md, session.cmds (runner argv for hand-rerun)
+      └── subprocess: .venv-bench/bin/python3 tier1_runner.py ...
+                       (Py 3.14, mini-swe-agent installed)
+                        └── DefaultAgent(LitellmModel, LocalEnvironment).run(task)
+                             ├── trajectory.json   (mini's native serialize format)
+                             └── collect.json      (our standardized schema —
+                                                    judge consumes without
+                                                    per-tier branching)
+```
+
+### Why two venvs
+
+mini-swe-agent v2 requires Python ≥3.10. The orchestrator can't drop
+its 3.9 pin (Apple's lldb embeds Python 3.9 for Tier 3's debugger
+integration). The Tier1Driver runs in the orchestrator's venv but
+shells out to `.venv-bench` for the agent itself. This isolates the
+Python version constraint to a single subprocess boundary.
+
+### Files
+
+| File | Purpose |
+|---|---|
+| `bench/drivers/tier1_minisweagent.py` | Driver (orchestrator-side). Reuses `compile_case`, `prepare_injected_workspace`, `_run_debugger` (proper SIGKILL-pgid handling) so Tier 1 inherits all Round-1 reliability fixes. |
+| `bench/drivers/tier1_runner.py` | Subprocess entry point in the mini venv. Standalone — does NOT import `bench.*` so it's independent of harness Python version. Synthesizes both `trajectory.json` (mini's native format) and `collect.json` (our schema). |
+| `bench/configs/tier1_bash_only.json` | Informational config — mini doesn't read tool flags, but we keep the file so `run_id_for()` / `heatmap_real.py` pivot on tool_config without special-casing tier 1. |
+| `bench/drivers/__init__.py` | `get_driver(1)` returns `Tier1Driver` instead of raising. |
+| `bench/orchestrator.py` | New dispatch branch logging `[orchestrator] tier1 using mini-swe-agent (bash-only)`. |
+
+### Logging fidelity vs Tier 3
+
+| Artifact | Tier 3 | Tier 1 |
+|---|---|---|
+| `case.yaml` (judge input) | ✓ | ✓ |
+| `program.c` / source | ✓ | ✓ |
+| `build/prog` | ✓ | ✓ |
+| `compile.log` | ✓ | ✓ |
+| `session.cmds` (replay command) | ✓ (lldb script) | ✓ (runner argv) |
+| Trajectory record | `chatdbg.log.yaml` | `trajectory.json` (mini native) + `task.md` |
+| `collect.json` (our schema) | ✓ | ✓ |
+| `stdout.log` / `stderr.log` | ✓ | ✓ |
+| `result.json` (status taxonomy) | ok / timeout / compile_failed / no_collect / skipped_platform | same set + `missing_dep` (mini venv absent) |
+
+### Judge compatibility
+
+`bench/judge.py` consumes Tier-1 `collect.json` byte-identically with
+Tier-3 — the judge prompt was already model-and-tool-agnostic. Verified
+on `off-by-one-crc × gpt-5.5`: judge produced
+`rc=1 lf=1 gf=0`, matching the same case's Tier-3 pattern (universal
+local-fix / no-global-fix gap from `HARD_BUGS.md`).
+
+### Operational notes
+
+- `step_limit` default = 15. mini's text-mode parser rejects responses
+  without a fenced bash block; some models (gpt-5.5 in particular)
+  occasionally emit prose-only responses, triggering an interrupt
+  loop. step_limit caps the loop.
+- `cost_limit` default = $0.50. Independent of step_limit.
+- LiteLLM cost tracking is set to `ignore_errors` because mini's price
+  database doesn't include every OpenRouter model (e.g. `gpt-5.5`,
+  `gemini-3.1-flash-lite-preview`). Token counts are still tallied
+  via `message['extra']['response']['usage']`.
+- Setup: `python3.10+ -m venv .venv-bench && .venv-bench/bin/pip install mini-swe-agent`.
+  Driver checks for the venv and writes `error.log` with a setup hint
+  if it's missing.
+
+### Round-3 validation matrix
+
+| Test | Result |
+|---|---|
+| Imports clean from orchestrator's venv | ✓ |
+| `--tiers 1 --dry-run` produces correct run_id with `tier1_bash_only` config | ✓ |
+| End-to-end on `off-by-one-crc × gpt-5.5`: status=ok, exit_status=Submitted, 4 tool calls (nl, prog, gdb, echo), all three diagnosis labels in response | ✓ (smoke 8) |
+| `bench/judge.py` scores the resulting `collect.json` without per-tier branching | ✓ (smoke 9, rc=1 lf=1 gf=0) |
+| Process-group SIGKILL on timeout (reuses `_run_debugger`) | ✓ (Round 1 invariant) |
+
+## Round 2 fixes (prior commit)
 
 | ID | Issue | Status | File(s) |
 |---|---|---|---|
