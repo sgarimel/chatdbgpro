@@ -905,6 +905,118 @@ executes the patched cJSON binary with ASan flagging the OOB read.
   false`). Not a harness issue — fixing those is per-case work
   documented in HARD_BUGS.md.
 
+## Round 7 — Tier 4 driver: Claude Code CLI (this PR)
+
+The tier system now spans four ablations on the same uniform output
+schema (case.yaml + collect.json + result.json):
+
+| Tier | Agent | Tool surface | Why |
+|---|---|---|---|
+| 1 | mini-swe-agent v2 | bash only | The "what does a generic shell agent do?" floor |
+| 2 | mini-swe-agent v2 | bash + persistent gdb (custom dual-tool environment) | "Does adding a real debugger help mini?" |
+| 3 | ChatDBG | curated lldb/gdb wrappers + source nav + LSP | The original ChatDBG paper's setup |
+| 4 | Claude Code (CLI) | Bash, Read, Edit (built into `claude`) | "What does a frontier integrated agent product do?" |
+
+### Why a fourth tier matters
+
+Tier 4 isolates the "frontier-product" axis: same task, same judge,
+but the agent is the entire `claude` CLI binary — Anthropic's
+end-to-end product including its own system prompt, tool registry,
+agent loop, and conversation management. Comparing T4 to T1/T2 tells
+us whether Anthropic's integrated work matters above and beyond
+"give the model bash and let it think". Comparing T4 to T3 tells us
+whether ChatDBG's debugger-first scaffold beats a general-purpose
+agent on debugging tasks specifically.
+
+### Architecture
+
+```
+Orchestrator (.venv-bench-39, host=macOS)
+ └── Tier4Driver.run()
+      ├── compile_case() / prepare_injected_workspace()  (same as Tier 3)
+      └── subprocess: claude -p <task>                   (Claude Code CLI)
+             --output-format stream-json
+             --bare                          (strict ANTHROPIC_API_KEY auth,
+                                              no plugins, no auto-CLAUDE.md,
+                                              no hooks — clean baseline)
+             --no-session-persistence        (don't pollute ~/.claude state)
+             --dangerously-skip-permissions  (sandbox is the run_dir)
+             --max-budget-usd <cost_limit>
+             --model <alias>
+             --add-dir <run_dir>             (allow tool access here)
+          └── stdout: line-delimited JSON events (system/assistant/user/result)
+              Driver parses → claude_events.jsonl + collect.json (judge schema)
+```
+
+### Why `--bare`
+
+Without `--bare`, Claude Code reads any CLAUDE.md it finds while
+walking up from cwd, plus user/project settings, hooks, MCP
+servers, auto-loaded skills, plugin caches. For benchmark
+reproducibility we strip all of that — every Tier-4 run sees the
+same agent configuration regardless of which workstation issues it.
+`--bare` also forces strict `ANTHROPIC_API_KEY` auth (no keychain /
+OAuth fallback), which makes the harness self-documenting about
+credentials.
+
+### Output schema
+
+Identical to T1/T2/T3 — judge consumes Tier-4 collect.json without
+per-tier branching. New per-run artifacts in addition to the common
+ones (case.yaml, program.c, build/, compile.log, task.md,
+session.cmds, stdout.log, stderr.log, result.json):
+
+  claude_events.jsonl   raw stream-json events from Claude Code
+                        (kept for trajectory inspection — same role
+                        as Tier 1/2's `trajectory.json` and Tier 3's
+                        `chatdbg.log.yaml`)
+
+`collect.json`'s `tool_calls` use Claude Code's native tool names
+(`Bash`, `Read`, `Edit`, ...) so the existing analysis scripts'
+`tool_frequency_by_tool` field cleanly distinguishes Tier 4 from
+the bash-only and bash+gdb tiers.
+
+### Auth
+
+Tier 4 requires `ANTHROPIC_API_KEY` set in the environment. If
+missing, the driver returns `status="missing_dep"` with an
+explanatory `error.log` rather than silently failing inside Claude
+Code with "Not logged in · Please run /login".
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...
+.venv-bench-39/bin/python3 -m bench.orchestrator \
+  --tiers 4 \
+  --cases off-by-one-crc \
+  --models sonnet \
+  --tool-configs tier4_claude_code \
+  --name t4-validation
+```
+
+### Model spec
+
+Orchestrator's `--models` accepts:
+- a Claude alias (`sonnet`, `opus`, `haiku`)
+- a full Claude model name (`claude-sonnet-4-6`)
+- a namespaced spec (`claude/sonnet`, `anthropic/claude-sonnet-4-6`) — the prefix is stripped
+
+These map to Claude Code's `--model` flag.
+
+### Round-7 validation
+
+| Test | Result |
+|---|---|
+| `Tier4Driver` imports cleanly from orchestrator's venv | ✓ |
+| `--tiers 4 --dry-run` produces correct run_id with `tier4_claude_code` config | ✓ |
+| Driver detects missing `ANTHROPIC_API_KEY` and returns `missing_dep` (not a cryptic claude error) | ✓ |
+| Driver detects missing `claude` binary and returns `missing_dep` | ✓ |
+| Driver passes `--bare`, `--no-session-persistence`, `--dangerously-skip-permissions`, and budget cap | ✓ (verified in `session.cmds`) |
+| Live smoke (requires `ANTHROPIC_API_KEY`) | _Pending — run by user; harness ready_ |
+
+The driver is wired and dry-run validated. A live smoke needs an
+`ANTHROPIC_API_KEY` from the user; the harness path is otherwise
+identical in shape to Tier 1's PR #6 → PR #7 validation flow.
+
 ## Round 2 fixes (prior commit)
 
 | ID | Issue | Status | File(s) |

@@ -99,6 +99,12 @@ def _driver_for_tier(
         linux_label = tier2_linux or "auto"
         print(f"[orchestrator] tier2 using mini-swe-agent (bash + gdb, "
               f"model_class={klass_label}, linux={linux_label})")
+    elif tier == 4:
+        # Tier 4 = Claude Code (the CLI) as the agent. No debugger
+        # kwarg, no mini config; just budget-capped invocation of the
+        # `claude` binary in --bare mode.
+        driver = get_driver(4, dry_run=dry_run)
+        print("[orchestrator] tier4 using Claude Code (CLI, --bare)")
     else:
         driver = get_driver(tier)
     cache[cache_key] = driver

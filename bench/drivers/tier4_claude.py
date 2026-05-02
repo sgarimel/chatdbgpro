@@ -1,0 +1,567 @@
+"""Tier-4 driver: Claude Code (the CLI) as the agent.
+
+The agent under test is the production `claude` CLI itself —
+Anthropic's Claude Code product, which packages a tool registry
+(Bash, Read, Edit, etc.), agent loop, and conversation management
+into a single binary. Tier 4 lets us answer:
+
+  "How does a frontier integrated agent product compare to
+  mini-swe-agent (Tier 1, bash-only) and mini + persistent gdb
+  (Tier 2) on this debugging benchmark?"
+
+Architecture
+------------
+    Orchestrator (.venv-bench-39, host=macOS)
+     └── Tier4Driver.run()
+          ├── compile_case() / prepare_injected_workspace()  (same as Tier 3)
+          └── subprocess: claude -p <task>                   (Claude Code CLI)
+                 --output-format stream-json
+                 --bare                          (strict ANTHROPIC_API_KEY auth,
+                                                  no plugins, no auto-CLAUDE.md,
+                                                  no hooks — clean baseline)
+                 --no-session-persistence        (don't pollute ~/.claude state)
+                 --dangerously-skip-permissions  (sandbox is the run_dir)
+                 --max-budget-usd <cost_limit>
+                 --model <alias-or-full-name>
+                 --add-dir <run_dir>             (allow tool access here)
+              └── stdout: line-delimited JSON events (system/assistant/user/result)
+                  Driver parses → trajectory.jsonl + collect.json (judge schema)
+
+Why `--bare`
+------------
+Without `--bare`, Claude Code reads any CLAUDE.md it finds while
+walking up from cwd, plus user/project settings, hooks, MCP servers,
+auto-loaded skills, plugin caches, etc. For benchmark reproducibility
+we strip all of that — every Tier-4 run sees the same agent
+configuration regardless of which workstation issues it. `--bare`
+also forces strict `ANTHROPIC_API_KEY` auth (no keychain / OAuth
+fallback), which makes the harness self-documenting about credentials.
+
+Auth
+----
+Tier 4 requires `ANTHROPIC_API_KEY` in the environment. If missing,
+the driver returns `status="missing_dep"` with an explanatory
+error.log rather than failing inside Claude with a cryptic auth
+message.
+
+Output schema
+-------------
+Mirrors Tier 1 / Tier 2 / Tier 3 — judge consumes Tier-4
+collect.json without per-tier branching:
+
+    case.yaml         pinned (judge input)
+    program.c         source (synthetic only)
+    build/            compiled binary
+    compile.log       compiler output
+    task.md           prompt sent to Claude
+    session.cmds      claude argv for hand-rerun
+    claude_events.jsonl  raw stream-json events from Claude Code
+    collect.json      our standardized schema
+    stdout.log        full Claude Code stdout
+    stderr.log        full Claude Code stderr
+    result.json       run-level metadata
+"""
+from __future__ import annotations
+
+import json
+import os
+import shlex
+import shutil
+import subprocess
+import time
+from datetime import datetime
+from pathlib import Path
+
+from bench.common import (
+    Case,
+    REPO_DIR,
+    RunSpec,
+    compile_case,
+    finalize_result,
+    prepare_injected_workspace,
+)
+from bench.drivers.tier3_gdb import _run_debugger
+
+
+# Default Claude Code CLI on PATH. If a researcher has multiple
+# installs they can override via $CLAUDE_BIN.
+CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
+
+
+# Task prompt — same shape as the Tier-1 / Tier-2 prompts. Claude
+# Code's own system prompt handles the "use bash to investigate"
+# framing, so we just describe the bug-hunt task and require the
+# structured ROOT CAUSE / LOCAL FIX / GLOBAL FIX final answer.
+SYNTHETIC_TASK_TEMPLATE = """\
+You're debugging a C/C++ bug. The buggy binary is at `./build/prog` \
+and the source file is `{source_file}` in the current directory.
+
+Run command: `{cmd}`
+
+Expected behavior: {behavior}.
+
+Use your bash tool to investigate (run the binary, run gdb / lldb in \
+batch mode, read source). Identify the root cause and propose both a \
+local fix and a structural global fix.
+
+When done, your final response MUST include three labelled paragraphs:
+
+  ROOT CAUSE: <file:line and what is wrong, in your own words>
+  LOCAL FIX:  <minimal code change that resolves the symptom>
+  GLOBAL FIX: <structural change preventing this CLASS of bug>
+
+Do NOT modify the source file. Just investigate and produce the \
+diagnosis as your final assistant message.
+"""
+
+
+INJECTED_TASK_TEMPLATE = """\
+You're debugging a real-codebase bug in `{case_id}` (an open-source \
+C/C++ project). You're at the project root with the source tree \
+cloned and patched.
+
+The buggy binary is at `./{binary_rel}`.{stdin_note}
+
+{description}
+
+Use your bash tool to investigate. Identify the root cause and \
+propose both a local fix and a structural global fix.
+
+When done, your final response MUST include three labelled paragraphs:
+
+  ROOT CAUSE: <file:line and what is wrong>
+  LOCAL FIX:  <minimal code change>
+  GLOBAL FIX: <structural change preventing this CLASS of bug>
+
+Do NOT modify the source file. Just investigate and produce the \
+diagnosis as your final assistant message.
+"""
+
+
+def _resolve_model(model_str: str) -> str:
+    """Map an orchestrator-style model spec to a Claude Code `--model`
+    argument. We accept three shapes:
+
+      claude-sonnet-4-6    — full Claude model name → pass through
+      sonnet|opus|haiku    — Claude alias → pass through
+      claude/sonnet        — namespaced spec (clarifies tier intent
+                             when the orchestrator sweeps mixed
+                             tiers) → strip the prefix
+      anthropic/claude-..  — LiteLLM/OpenRouter style → strip prefix
+
+    Anything else is passed through as-is and Claude Code will reject
+    it with a clear error if invalid."""
+    if "/" in model_str:
+        return model_str.split("/")[-1]
+    return model_str
+
+
+def _extract_response_and_tools(events: list[dict]) -> tuple[str, list[dict], dict]:
+    """Walk stream-json events to build:
+      response  — the model's final-answer text (last `result` event's
+                  `result` field; falls back to concatenated assistant
+                  text if no result event)
+      tool_calls — list shaped like Tier 1/2/3's collect.json schema
+      stats     — dict with prompt/completion tokens, cost, num_turns,
+                  exit status
+
+    Claude Code's stream-json events fall into 4 types:
+      system    initial config dump
+      assistant model turn (may contain text + tool_use blocks)
+      user      tool_result blocks (response back to the model)
+      result    one final summary event
+    """
+    final_text_parts: list[str] = []
+    tool_calls: list[dict] = []
+    stats = {
+        "completed": False,
+        "model": None,
+        "cost": 0.0,
+        "tokens": 0,
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "num_turns": 0,
+        "exit_status": "unknown",
+    }
+    # tool_use_id → action shape, so we can pair tool_use with the
+    # following tool_result and capture the result_length.
+    pending_tool_uses: dict[str, dict] = {}
+
+    for ev in events:
+        et = ev.get("type")
+        if et == "system" and ev.get("subtype") == "init":
+            stats["model"] = ev.get("model")
+        elif et == "assistant":
+            msg = ev.get("message") or {}
+            for block in (msg.get("content") or []):
+                btype = block.get("type")
+                if btype == "text":
+                    txt = block.get("text") or ""
+                    if txt.strip():
+                        final_text_parts.append(txt)
+                elif btype == "tool_use":
+                    name = block.get("name") or "?"
+                    inp = block.get("input") or {}
+                    # Try a few common keys to find the command/text
+                    call = (inp.get("command") or inp.get("file_path")
+                            or inp.get("path") or json.dumps(inp))
+                    verb = (call.strip().split() or [name])[0].split("/")[-1] or name
+                    tu_id = block.get("id") or ""
+                    rec = {
+                        "tool_name": name,
+                        "verb": verb,
+                        "call": call,
+                        "result_length": 0,
+                    }
+                    pending_tool_uses[tu_id] = rec
+                    tool_calls.append(rec)
+            usage = msg.get("usage") or {}
+            stats["prompt_tokens"] += int(usage.get("input_tokens", 0) or 0)
+            stats["completion_tokens"] += int(usage.get("output_tokens", 0) or 0)
+        elif et == "user":
+            msg = ev.get("message") or {}
+            for block in (msg.get("content") or []):
+                if block.get("type") == "tool_result":
+                    tu_id = block.get("tool_use_id") or ""
+                    if tu_id in pending_tool_uses:
+                        # The tool_result block's content is either a
+                        # string or a list of {type:text,text:str}.
+                        c = block.get("content")
+                        if isinstance(c, str):
+                            length = len(c)
+                        elif isinstance(c, list):
+                            length = sum(len(p.get("text") or "")
+                                         for p in c if isinstance(p, dict))
+                        else:
+                            length = 0
+                        pending_tool_uses[tu_id]["result_length"] = length
+        elif et == "result":
+            stats["num_turns"] = ev.get("num_turns", 0) or 0
+            stats["cost"] = float(ev.get("total_cost_usd", 0.0) or 0.0)
+            stats["completed"] = ev.get("subtype") == "success" and not ev.get("is_error")
+            stats["exit_status"] = ("Submitted" if stats["completed"]
+                                    else (ev.get("subtype") or "failed"))
+            # Use the final result text as our response when present —
+            # it's typically the model's last assistant turn.
+            r = ev.get("result")
+            if isinstance(r, str) and r.strip():
+                final_text_parts = [r]  # prefer the result-event text
+            usage = ev.get("usage") or {}
+            # Result-event usage is the cumulative total; prefer it
+            # over the per-message sums above when available.
+            cum_in = int(usage.get("input_tokens", 0) or 0)
+            cum_out = int(usage.get("output_tokens", 0) or 0)
+            if cum_in or cum_out:
+                stats["prompt_tokens"] = cum_in
+                stats["completion_tokens"] = cum_out
+
+    stats["tokens"] = stats["prompt_tokens"] + stats["completion_tokens"]
+    response = "\n\n---\n\n".join(final_text_parts)
+    return response, tool_calls, stats
+
+
+def _build_synthetic_task(case: Case) -> str:
+    args = case.meta.get("run", {}).get("args", []) or []
+    args_str = " ".join(str(a) for a in args)
+    expected_crash = case.meta.get("run", {}).get("expected_crash", True)
+    behavior = (
+        "crashes when run (likely a sanitizer report or signal)"
+        if expected_crash else
+        "runs to completion but the test oracle considers the output incorrect"
+    )
+    cmd = f"./build/prog {args_str}".rstrip()
+    return SYNTHETIC_TASK_TEMPLATE.format(
+        source_file=case.meta.get("source_file", "(none)"),
+        cmd=cmd, behavior=behavior,
+    )
+
+
+def _build_injected_task(case: Case, workdir: Path, binary: Path,
+                         *, stdin_file: Path | None = None) -> str:
+    rel = binary.relative_to(workdir)
+    stdin_note = ""
+    if stdin_file is not None:
+        stdin_note = (
+            f"\n\nThe failing-input bytes are at `{stdin_file}`. "
+            f"To reproduce: `cat {stdin_file} | ./{rel}`."
+        )
+    return INJECTED_TASK_TEMPLATE.format(
+        case_id=case.case_id,
+        binary_rel=rel,
+        stdin_note=stdin_note,
+        description=case.meta.get("description", "").strip(),
+    )
+
+
+class Tier4Driver:
+    """Same interface as Tier1Driver / Tier2Driver / Tier3Driver."""
+
+    tier: int = 4
+
+    def __init__(
+        self,
+        *,
+        dry_run: bool = False,
+        cost_limit: float = 0.5,
+    ):
+        self.dry_run = dry_run
+        self.cost_limit = cost_limit
+
+    # ---- main entry ----------------------------------------------------
+
+    def run(self, spec: RunSpec, run_dir: Path, *, timeout: float) -> dict:
+        run_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy(spec.case.case_dir / "case.yaml", run_dir / "case.yaml")
+
+        if not spec.case.platform_supported():
+            (run_dir / "skip.log").write_text(
+                f"platform={spec.case.platforms}; host skipped\n"
+            )
+            return finalize_result(
+                run_dir, spec,
+                status="skipped_platform", exit_code=0, elapsed_s=0.0,
+            )
+
+        # Dry-run path skips the auth + CLI checks so researchers can
+        # verify the dispatch / matrix without setting up credentials.
+        if not self.dry_run:
+            # Auth must be present before we burn API quota.
+            if not os.environ.get("ANTHROPIC_API_KEY"):
+                (run_dir / "error.log").write_text(
+                    "Tier 4 requires ANTHROPIC_API_KEY in the environment. "
+                    "Tier 4 calls the Claude Code CLI in --bare mode which "
+                    "strictly uses ANTHROPIC_API_KEY (no OAuth or keychain "
+                    "fallback). Set it from your shell:\n\n"
+                    "  export ANTHROPIC_API_KEY=sk-ant-...\n"
+                )
+                return finalize_result(
+                    run_dir, spec,
+                    status="missing_dep", exit_code=-1, elapsed_s=0.0,
+                )
+            # Verify claude CLI is installed before running.
+            try:
+                ver = subprocess.run(
+                    [CLAUDE_BIN, "--version"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                if ver.returncode != 0:
+                    raise RuntimeError(ver.stderr or "claude --version failed")
+            except (FileNotFoundError, subprocess.TimeoutExpired, RuntimeError) as e:
+                (run_dir / "error.log").write_text(
+                    f"Claude Code CLI not found or not working: {e}\n\n"
+                    f"Install:\n  npm install -g @anthropic-ai/claude-code\n"
+                    f"Or set CLAUDE_BIN to the binary path."
+                )
+                return finalize_result(
+                    run_dir, spec,
+                    status="missing_dep", exit_code=-1, elapsed_s=0.0,
+                )
+
+        if spec.case.kind == "injected_repo":
+            return self._run_injected(spec, run_dir, timeout=timeout)
+        return self._run_synthetic(spec, run_dir, timeout=timeout)
+
+    # ---- synthetic -----------------------------------------------------
+
+    def _run_synthetic(self, spec: RunSpec, run_dir: Path, *, timeout: float) -> dict:
+        shutil.copy(spec.case.source_path, run_dir / spec.case.source_path.name)
+        build_dir = run_dir / "build"
+        compile_result, binary = compile_case(spec.case, build_dir)
+        (run_dir / "compile.log").write_text(
+            "$ " + " ".join(compile_result.args) + "\n\n"
+            + (compile_result.stdout or "") + "\n"
+            + (compile_result.stderr or "")
+        )
+        if compile_result.returncode != 0:
+            return finalize_result(
+                run_dir, spec,
+                status="compile_failed",
+                exit_code=compile_result.returncode,
+                elapsed_s=0.0,
+            )
+        if self.dry_run:
+            return finalize_result(
+                run_dir, spec, status="dry_run", exit_code=0, elapsed_s=0.0,
+            )
+        task = _build_synthetic_task(spec.case)
+        (run_dir / "task.md").write_text(task)
+        return self._invoke_claude(spec, run_dir, agent_cwd=run_dir,
+                                    task=task, timeout=timeout)
+
+    # ---- injected_repo --------------------------------------------------
+
+    def _run_injected(self, spec: RunSpec, run_dir: Path, *, timeout: float) -> dict:
+        prep = prepare_injected_workspace(spec.case)
+        (run_dir / "compile.log").write_text(prep.log)
+        if prep.status != "ok" or prep.binary is None:
+            return finalize_result(
+                run_dir, spec,
+                status=prep.status if prep.status != "ok" else "build_failed",
+                exit_code=-1, elapsed_s=0.0,
+            )
+        if self.dry_run:
+            return finalize_result(
+                run_dir, spec, status="dry_run", exit_code=0, elapsed_s=0.0,
+            )
+
+        # debug.stdin_data → file the agent can `cat | ./prog`
+        debug_cfg = spec.case.meta.get("debug", {}) or {}
+        stdin_data = debug_cfg.get("stdin_data")
+        stdin_file = None
+        if stdin_data is not None:
+            stdin_file = run_dir / "stdin.bin"
+            stdin_file.write_bytes(
+                stdin_data.encode() if isinstance(stdin_data, str) else stdin_data
+            )
+
+        task = _build_injected_task(spec.case, prep.workdir, prep.binary,
+                                    stdin_file=stdin_file)
+        (run_dir / "task.md").write_text(task)
+        return self._invoke_claude(spec, run_dir, agent_cwd=prep.workdir,
+                                    task=task, timeout=timeout,
+                                    extra_dirs=[run_dir])
+
+    # ---- shared Claude Code invocation --------------------------------
+
+    def _invoke_claude(self, spec: RunSpec, run_dir: Path, *,
+                       agent_cwd: Path, task: str, timeout: float,
+                       extra_dirs: list[Path] | None = None) -> dict:
+        model_arg = _resolve_model(spec.model)
+        argv = [
+            CLAUDE_BIN, "-p", task,
+            "--output-format", "stream-json",
+            "--bare",
+            "--no-session-persistence",
+            "--dangerously-skip-permissions",
+            "--verbose",
+            "--max-budget-usd", str(self.cost_limit),
+            "--model", model_arg,
+            "--add-dir", str(agent_cwd.resolve()),
+        ]
+        for d in (extra_dirs or []):
+            argv += ["--add-dir", str(d.resolve())]
+
+        # session.cmds for hand-rerun
+        (run_dir / "session.cmds").write_text(
+            "# Tier-4 (Claude Code) invocation. Set ANTHROPIC_API_KEY before running.\n"
+            + " ".join(shlex.quote(a) for a in argv) + "\n"
+        )
+
+        env = os.environ.copy()
+        # Strip our PYTHONPATH so it can't shadow Node-side environment
+        # if Claude Code shells out to anything Python.
+        env.pop("PYTHONPATH", None)
+
+        t0 = time.time()
+        stdout, stderr, exit_code, timed_out = _run_debugger(
+            argv,
+            stdin_for_proc=None,
+            env=env,
+            run_dir=agent_cwd,
+            timeout=timeout,
+        )
+        elapsed = time.time() - t0
+        (run_dir / "stdout.log").write_text(stdout)
+        (run_dir / "stderr.log").write_text(stderr)
+
+        # Parse stream-json line-by-line. Even if claude crashed
+        # mid-stream, partial events are useful for diagnosis.
+        events: list[dict] = []
+        for line in (stdout or "").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                events.append(json.loads(line))
+            except json.JSONDecodeError:
+                # claude occasionally prints non-JSON status text on
+                # the same stream (e.g. "Shell cwd was reset to..."
+                # at the tail). Skip these silently.
+                continue
+        (run_dir / "claude_events.jsonl").write_text(
+            "\n".join(json.dumps(e) for e in events) + ("\n" if events else "")
+        )
+
+        if timed_out:
+            return finalize_result(
+                run_dir, spec,
+                status="timeout", exit_code=-1, elapsed_s=elapsed,
+            )
+
+        response, tool_calls, stats = _extract_response_and_tools(events)
+
+        # Build collect.json (judge-ready, schema-identical to T1/2/3).
+        freq: dict[str, int] = {}
+        by_tool: dict[str, dict[str, int]] = {}
+        for tc in tool_calls:
+            tname = tc.get("tool_name", "?")
+            verb = tc.get("verb", tname)
+            freq[verb] = freq.get(verb, 0) + 1
+            by_tool.setdefault(tname, {})
+            by_tool[tname][verb] = by_tool[tname].get(verb, 0) + 1
+        tool_name_counts = {k: sum(v.values()) for k, v in by_tool.items()}
+
+        collect = {
+            "meta": {
+                "uid": run_dir.name,
+                "time": datetime.now().isoformat(timespec="seconds"),
+                "model": spec.model,
+                "tool_config": "tier4_claude_code.json",
+                "enabled_tools": sorted(by_tool.keys()) if by_tool else ["Bash", "Read", "Edit"],
+                "agent": "claude-code",
+                "agent_version": _claude_version(),
+                "tier": 4,
+                "claude_resolved_model": stats.get("model"),
+                "claude_cost_limit_usd": self.cost_limit,
+            },
+            "instructions": "(Claude Code's built-in system prompt; see --bare mode docs)",
+            "queries": [
+                {
+                    "user_text": task,
+                    "prompt": task,
+                    "thinking": None,
+                    "response": response,
+                    "code_blocks": [],
+                    "total_code_length": 0,
+                    "num_tool_calls": len(tool_calls),
+                    "tool_calls": tool_calls,
+                    "tool_frequency": freq,
+                    "tool_name_counts": tool_name_counts,
+                    "tool_frequency_by_tool": by_tool,
+                    "stats": {
+                        "completed": stats["completed"],
+                        "model": stats.get("model"),
+                        "cost": stats["cost"],
+                        "time": elapsed,
+                        "tokens": stats["tokens"],
+                        "prompt_tokens": stats["prompt_tokens"],
+                        "completion_tokens": stats["completion_tokens"],
+                        "exit_status": stats["exit_status"],
+                        "submission": "",
+                        "num_turns": stats["num_turns"],
+                    },
+                }
+            ],
+        }
+        (run_dir / "collect.json").write_text(json.dumps(collect, indent=2))
+
+        # status taxonomy aligned with the other tiers
+        if not events or not response.strip():
+            status = "no_collect"
+        elif exit_code != 0 and not stats["completed"]:
+            status = "no_collect"
+        else:
+            status = "ok"
+        return finalize_result(
+            run_dir, spec,
+            status=status, exit_code=exit_code, elapsed_s=elapsed,
+        )
+
+
+def _claude_version() -> str:
+    try:
+        out = subprocess.run([CLAUDE_BIN, "--version"],
+                             capture_output=True, text=True, timeout=5)
+        return (out.stdout or "").strip().split()[0] if out.returncode == 0 else "unknown"
+    except Exception:
+        return "unknown"
