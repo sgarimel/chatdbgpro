@@ -425,6 +425,45 @@ local-fix / no-global-fix gap from `HARD_BUGS.md`).
 | End-to-end on `off-by-one-crc × gpt-5.5`: status=ok, exit_status=Submitted, 4 tool calls (nl, prog, gdb, echo), all three diagnosis labels in response | ✓ (smoke 8) |
 | `bench/judge.py` scores the resulting `collect.json` without per-tier branching | ✓ (smoke 9, rc=1 lf=1 gf=0) |
 | Process-group SIGKILL on timeout (reuses `_run_debugger`) | ✓ (Round 1 invariant) |
+| Demo sweep: 4 cases × 2 models, 8/8 status=ok, 7/8 judge=ok + 1 no_prose_synthesis | ✓ |
+
+### Round-3 demo sweep — first Tier-1 numbers
+
+Single-trial 4×2 sweep (heap-overflow-csv, null-deref-env, off-by-one-crc,
+signed-unsigned-loop × gpt-5.5, qwen-30B), Tier 1 vs prior Tier 3:
+
+| Case | gpt-5.5 (T1) | qwen-30B (T1) | gpt-5.5 (T3) | qwen-30B (T3) |
+|---|---|---|---|---|
+| heap-overflow-csv | 0 | 2 | 2 | 3 |
+| null-deref-env | 0 | 2 | 2 | 2 |
+| off-by-one-crc | 0 | 2 | 2 | 2 |
+| signed-unsigned-loop | (no_prose) | 1 | 3 | 3 |
+| **mean** | **0** | **1.75** | **2.25** | **2.50** |
+
+Two surprising findings worth flagging:
+
+1. **GPT-5.5 collapses on Tier 1** (mean 0 vs 2.25 on Tier 3).
+   Inspection of the trajectories shows it consistently emits its
+   final answer *without* the required bash-block submit command,
+   gets caught in mini's "no tool calls found" interrupt loop, and
+   exits without a structured diagnosis recorded. mini's text-mode
+   parser is rigid; gpt-5.5 prefers the OpenAI tool-calling protocol
+   and doesn't reliably fall back to fenced bash blocks.
+
+2. **Qwen-30B partially survives** (mean 1.75 vs 2.50 on Tier 3) —
+   loses ~0.75 of its score going to bash-only. Qwen follows mini's
+   text format more reliably and produces structured diagnoses, so
+   the score drop reflects genuine "removing the gdb tool hurts"
+   rather than format mismatch.
+
+This is an honest answer to the project's headline question — *agent
+scaffold genuinely matters* — but it also exposes a coupling between
+"model formatting habits" and "ablation outcome" that the current
+Tier-1 setup can't disentangle. A useful follow-up: re-run Tier 1
+with mini configured to use OpenAI tool-calling mode for gpt-5.5 (mini
+supports both) and see whether GPT-5.5's score recovers. If it does,
+the format mismatch is the dominant effect; if it doesn't, the
+debugger-tool deficit is.
 
 ## Round 2 fixes (prior commit)
 
