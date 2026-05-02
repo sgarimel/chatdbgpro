@@ -42,6 +42,10 @@ class _FrameSummaryEntry:
 
     def __str__(self):
         a = ", ".join([str(a) for a in self._arguments])
+        # Omit the "at file:line" suffix when source info is missing — common
+        # for stripped/system frames surfaced by the fallback path.
+        if not self._file_path and not self._lineno:
+            return f"{self._index}: {self._name}({a})"
         return f"{self._index}: {self._name}({a}) at {self._file_path}:{self._lineno}"
 
     def __repr__(self):
@@ -85,6 +89,11 @@ def build_enriched_stacktrace(summaries):
     for summary in summaries:
         if isinstance(summary, _FrameSummaryEntry):
             file_path, lineno = summary.file_path(), summary.lineno()
+            # Source extraction requires both a path and a line number. Frames
+            # in the fallback path (libc, stripped) may have neither — skip
+            # them rather than crashing on `None - 10`.
+            if not file_path or not lineno:
+                continue
             lines, first = llm_utils.read_lines(file_path, lineno - 10, lineno + 9)
             block = llm_utils.number_group_of_lines(lines, first)
             block = textwrap.indent(block, "  ")

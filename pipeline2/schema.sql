@@ -48,6 +48,18 @@ CREATE TABLE IF NOT EXISTS bugs (
     --   "crash:SIGSEGV" | "exit_code:N" | "no_observation"
     bug_observed        TEXT,
 
+    -- Workspace-relative path of the deepest /work/* binary that exec()'d
+    -- during the probe (e.g., "src/berry"). NULL if probe couldn't infer it
+    -- (e.g., trigger never reached a /work/ binary, or probe disabled). The
+    -- DockerDriver uses this to point the LLM at the right binary instead
+    -- of bash/make/ctest.
+    buggy_binary_path        TEXT,
+    -- Full argv (JSON list) the buggy binary was exec'd with — argv[0]
+    -- is the program-as-named (e.g., "./berry"), then test arguments.
+    -- Required so the DockerDriver can reproduce the failing test under
+    -- gdb instead of running the binary stand-alone.
+    buggy_binary_argv_json   TEXT,
+
     -- Gate: 1 iff build_ok=1 AND patch_first_file IS NOT NULL AND patch_path IS NOT NULL.
     -- Crash is NOT required — non-crash logical-error bugs are still debuggable via state inspection.
     included_in_corpus  INTEGER DEFAULT 0,

@@ -99,19 +99,58 @@ No CLI; invoked from `seed.py` and `reconcile.py`.
 
 ### `docker/gdb-base.Dockerfile`
 
+Two-stage build.
+
+* **Stage 1 (`gdb-builder`)** — project-agnostic. Compiles Python 3.11
+  from source, gdb 14.2 linked against that Python, and a venv holding
+  ChatDBG's runtime deps (litellm, openai, llm-utils, rich, PyYAML,
+  ipdb, IPython, numpy, traitlets, ansicolors, pygments, ipyflow). All
+  under `/opt`, RPATH-linked, relocatable.
+* **Stage 2 (`final`)** — per-project. Starts from
+  `hschoe/defects4cpp-ubuntu:<PROJECT>`, installs `libtool-bin`, `patch`,
+  `libsource-highlight4v5`, and COPYs `/opt/python3.11` + `/opt/gdb` +
+  `/opt/chatdbg-venv` from stage 1. The bugscpp C/C++ build toolchain is
+  untouched, so existing `data/workspaces/` remain valid.
+
 **Run (manually, normally invoked by `ensure_image.py`):**
 ```bash
-docker build -t chatdbgpro/gdb-libtiff:latest \
+docker build --platform linux/amd64 \
+    -t chatdbgpro/gdb-libtiff:latest \
     --build-arg PROJECT=libtiff \
     -f pipeline2/docker/gdb-base.Dockerfile .
 ```
 
 **Expected output:** Docker build log ending with
-`Successfully tagged chatdbgpro/gdb-<project>:latest`. Adds `gdb`,
-`libtool-bin`, `patch` on top of `hschoe/defects4cpp-ubuntu:<project>`.
+`naming to docker.io/chatdbgpro/gdb-<project>:latest done`. The final
+RUN asserts gdb's embedded Python is 3.11 and every ChatDBG runtime dep
+imports inside gdb — if that fails the image doesn't get tagged.
 
-**Runtime:** 30–90 s per project on first build; ~2 s if base is cached.
-Disk: ~1.5 GB per image.
+**Why a custom gdb + Python:** ChatDBG uses PEP 585 generics
+(`list[str]`, `dict[...]`) without `from __future__ import annotations`,
+requiring Python ≥ 3.9. gdb's embedded interpreter is locked to whatever
+libpython gdb was linked against; Ubuntu 20.04's stock gdb links against
+libpython3.8, so `source chatdbg_gdb.py` hits SyntaxError before any
+logic runs. We can't use deadsnakes on focal either — that PPA's
+Packages index was emptied on 2025-10-01 — so we build 3.11 from source.
+
+**Runtime:**
+* First build of stage 1 (any project): Python 3.11 compile ~22 min +
+  gdb 14.2 compile ~8 min + pip install ~2 min = **~35 min wall clock**.
+  Disk: ~1.5 GB in `/opt`.
+* First build of stage 2 for each additional project: ~2 min
+  (apt + COPYs of pre-built `/opt` dirs + verification).
+* Full corpus (23 projects) after the first: ~45 min total.
+
+**Rebuild all 23 project images after a Dockerfile change:**
+```bash
+python pipeline2/ensure_image.py --all     # when implemented, or:
+for p in libtiff cppcheck exiv2 jerryscript libxml2 yaml_cpp \
+         berry coreutils cpp_peglib cppitertools grep libssh openssh \
+         openssl proj rappel re2 wget2 wireshark xbps yara zsh \
+         libtiff_sanitizer ; do
+  python pipeline2/ensure_image.py --force "$p"
+done
+```
 
 ---
 

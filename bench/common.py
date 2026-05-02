@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import platform as _platform
+import shlex
 import shutil
 import sqlite3
 import subprocess
@@ -423,6 +424,9 @@ class DockerCase:
     patch_first_line: int | None = None
     bug_type: str | None = None
     db_language: str | None = None
+    bug_observed: str | None = None
+    buggy_binary_path: str | None = None
+    buggy_binary_argv: list[str] | None = None
 
     # Duck-type compatibility with Case so run_id_for / finalize_result work.
     @property
@@ -504,7 +508,8 @@ def discover_docker_cases(
                crash_signal, user_frame_function, user_frame_file,
                user_frame_line, patch_path,
                patch_diff, patch_first_file, patch_first_line,
-               bug_type, language
+               bug_type, language,
+               bug_observed, buggy_binary_path, buggy_binary_argv_json
         FROM bugs
         WHERE trigger_argv_json IS NOT NULL
           AND included_in_corpus = 1
@@ -552,6 +557,12 @@ def discover_docker_cases(
             patch_first_line=r["patch_first_line"],
             bug_type=r["bug_type"],
             db_language=r["language"],
+            bug_observed=r["bug_observed"],
+            buggy_binary_path=r["buggy_binary_path"],
+            buggy_binary_argv=(
+                json.loads(r["buggy_binary_argv_json"])
+                if r["buggy_binary_argv_json"] else None
+            ),
         ))
     if skipped_wrong_binary:
         sys.stderr.write(
@@ -561,6 +572,74 @@ def discover_docker_cases(
             f"to include them. Sample: {skipped_wrong_binary[:5]}\n"
         )
     return cases
+
+
+def build_oracle_strings(case: DockerCase) -> dict[str, str]:
+    """Build the CHATDBG_PROMPT_* env-var values for a BugsCPP case.
+
+    Returns a dict with up to three keys (CHATDBG_PROMPT_BINARY,
+    CHATDBG_PROMPT_ERROR, CHATDBG_PROMPT_EXTRA). Missing keys mean the
+    harness shouldn't override that aspect of ChatDBG's default prompt.
+
+    Policy (per the harness restructure plan):
+      - BINARY: real buggy-binary path if known, else absent (let ChatDBG's
+        default `progspace.filename` show through).
+      - ERROR : behavioral oracle for non-crash bugs ("test exited with
+        code N, expected: pass"); descriptive crash label for crash bugs.
+        Never leaks file/line/function — those stay in the judge's rubric.
+      - EXTRA : project + language + workspace, so the model knows what
+        kind of codebase it's looking at.
+    """
+    out: dict[str, str] = {}
+
+    if case.buggy_binary_path:
+        # If we captured the full argv from strace, surface it so the LLM
+        # sees the exact failing-test invocation (e.g. "./berry tests/x.be")
+        # — without it the model is just told "the binary is /work/berry"
+        # and has no idea how the test exercised it. argv[0] is preserved
+        # as-typed (often "./berry"); we prefix the resolved path for
+        # clarity. Args after argv[0] are shell-quoted.
+        if case.buggy_binary_argv:
+            argv = case.buggy_binary_argv
+            args_part = " ".join(shlex.quote(a) for a in argv[1:])
+            out["CHATDBG_PROMPT_BINARY"] = (
+                f"/work/{case.buggy_binary_path} {args_part}".rstrip()
+            )
+        else:
+            out["CHATDBG_PROMPT_BINARY"] = f"/work/{case.buggy_binary_path}"
+
+    obs = case.bug_observed or ""
+    if obs.startswith("crash:"):
+        sig = obs.split(":", 1)[1] or "unknown signal"
+        out["CHATDBG_PROMPT_ERROR"] = f"Program crashed with {sig}"
+    elif obs.startswith("exit_code:"):
+        rc = obs.split(":", 1)[1]
+        out["CHATDBG_PROMPT_ERROR"] = (
+            f"The bugscpp test for this bug failed: the program exited with "
+            f"code {rc} but the test oracle expected a passing run. The "
+            f"program does not crash — the defect causes incorrect behavior "
+            f"that the test catches."
+        )
+    elif obs == "timeout":
+        out["CHATDBG_PROMPT_ERROR"] = (
+            "The bugscpp test for this bug failed: the program timed out. "
+            "The defect may be causing an infinite loop or deadlock."
+        )
+    # 'no_observation' / unknown → leave unset, fall through to ChatDBG's
+    # signal-based default.
+
+    extras = []
+    if case.project:
+        extras.append(f"project={case.project}")
+    if case.db_language:
+        extras.append(f"language={case.db_language}")
+    extras.append("workspace=/work")
+    if case.bug_type:
+        extras.append(f"bug_type={case.bug_type}")
+    if extras:
+        out["CHATDBG_PROMPT_EXTRA"] = ", ".join(extras)
+
+    return out
 
 
 def write_docker_case_yaml(case: DockerCase, run_dir: Path) -> bool:

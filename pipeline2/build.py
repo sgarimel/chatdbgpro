@@ -106,6 +106,68 @@ GDB_FLAGS = [
 ]
 
 
+def trigger_binary_path(workspace: Path, trigger_argv: list[str]) -> Path | None:
+    """Best-effort host path of the trigger executable, or None if we can't
+    statically determine one.
+
+    Returns a Path only when we're confident the binary should physically
+    exist in the workspace tree:
+      - direct argv[0] with a `/` in it (e.g. `tools/tiffcrop`)
+      - `./X` style relative paths
+      - `bash -c "<inner>"` (or nested) when the first real token is one of
+        the above
+
+    Returns None (skip the existence check) for:
+      - absolute paths (resolve inside container, not host)
+      - bare names (`make`, `python`, `bash`) — system tools on $PATH
+      - shell expansions (`$(find ...)`, redirects, pipes)
+      - empty / unparseable triggers
+
+    The caller treats None as "don't enforce" so the binary check only
+    fires when we have a positive path expectation.
+    """
+    if not trigger_argv:
+        return None
+
+    candidate: str | None = None
+    if trigger_argv[:2] == ["bash", "-c"] and len(trigger_argv) >= 3:
+        import shlex
+        try:
+            inner = shlex.split(trigger_argv[2])
+        except ValueError:
+            return None
+        if inner[:2] == ["bash", "-c"] and len(inner) >= 3:
+            try:
+                inner = shlex.split(inner[2])
+            except ValueError:
+                return None
+        for tok in inner:
+            if tok in ("bash", "sh", "exec", "env", "cd"):
+                continue
+            # KEY=VAL env-prefix tokens (only if the key looks like an identifier)
+            if "=" in tok and tok.split("=", 1)[0].replace("_", "").isalnum():
+                continue
+            candidate = tok
+            break
+    else:
+        candidate = trigger_argv[0]
+
+    if not candidate:
+        return None
+    # Shell metacharacters → dynamically-resolved binary, don't enforce.
+    if any(c in candidate for c in "$();<>|&`*?"):
+        return None
+    # Absolute paths resolve inside the container, can't be checked from host.
+    if candidate.startswith("/"):
+        return None
+    # Bare name with no path component → system tool on the container's $PATH.
+    if "/" not in candidate and not candidate.startswith("./"):
+        return None
+
+    candidate = candidate.lstrip("./")
+    return workspace / candidate
+
+
 def resolve_libtool_argv(workspace: Path, argv: list[str]) -> list[str]:
     """Swap a libtool wrapper shell-script for its real .libs/ ELF."""
     if not argv:
@@ -166,6 +228,151 @@ def build_gdb_command(
     return docker_shell, docker_argv, argv
 
 
+def get_bugscpp_test_recipe(project: str, bug_index: int) -> tuple[list[str], int] | None:
+    """Read the canonical bugscpp test recipe from upstream meta.json.
+
+    Returns (raw_lines, case_index) where:
+      - raw_lines: the un-substituted `common.test.commands[].lines` list
+        (e.g. ['bash -c "./berry $(find ... | awk \"NR==$(cat DPP_TEST_INDEX)\")"']).
+        These are the same lines bugscpp's own framework runs.
+      - case_index: the test-case number for this bug, taken from
+        `defects[bug_index-1].case[0]`. Bugscpp writes this number into a
+        file named `DPP_TEST_INDEX` before running the lines, and the lines
+        substitute `$(cat DPP_TEST_INDEX)` to pick the failing test.
+
+    Returns None if the upstream taxonomy isn't available locally or the
+    bug_index doesn't resolve.
+
+    Why this matters: our seed.py pre-substituted DPP_TEST_INDEX into the
+    stored trigger, but the substitution went through nested `bash -c`
+    quoting and got mangled for projects with complex shell pipelines (e.g.
+    berry's `find ... -name \"*.be\"` ends up with literal quote chars in
+    find's argv). Reading the upstream raw lines and using bugscpp's own
+    DPP_TEST_INDEX-file protocol bypasses that.
+    """
+    bugscpp_root = bugscpp_repo()
+    meta_path = bugscpp_root / "bugscpp" / "taxonomy" / project / "meta.json"
+    if not meta_path.exists():
+        return None
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    defects = meta.get("defects") or []
+    if not (1 <= bug_index <= len(defects)):
+        return None
+    cases = defects[bug_index - 1].get("case") or []
+    if not cases:
+        return None
+    try:
+        case_index = int(cases[0])
+    except (TypeError, ValueError):
+        return None
+    test = (meta.get("common") or {}).get("test") or {}
+    commands = test.get("commands") or []
+    raw_lines: list[str] = []
+    for cmd in commands:
+        for line in (cmd.get("lines") or []):
+            if line and line.strip():
+                raw_lines.append(line)
+    if not raw_lines:
+        return None
+    return raw_lines, case_index
+
+
+def build_strace_docker_argv(
+    workspace: Path,
+    gdb_image: str,
+    trigger_argv: list[str],
+    *,
+    project: str | None = None,
+    bug_index: int | None = None,
+) -> list[str] | None:
+    """Build a `docker run` argv that traces the test under strace.
+
+    Two regimes:
+
+    1. **Bugscpp protocol (preferred).** When `project` and `bug_index` are
+       supplied AND we can read the upstream meta.json, run the test exactly
+       as bugscpp does: write the case index into `/work/DPP_TEST_INDEX`,
+       then exec each `common.test.commands.lines` line under `bash -c`,
+       chained with `&&`. This gets the canonical, un-mangled test
+       invocation and is the only way to get clean argv for projects with
+       complex shell pipelines (berry, libtiff, libxml2, ...).
+
+    2. **Trigger fallback.** Otherwise (no project/index, or meta.json
+       unavailable), run the pre-rendered trigger_argv from corpus.db.
+       This works for projects with simple triggers but produces empty
+       argv for shell-pipeline-heavy projects.
+
+    strace -f -e trace=execve emits one line per execve() call regardless
+    of fork topology, so we capture argv from every process in the chain.
+    The base image doesn't ship strace; we apt-install it inline (one-time
+    ~5-10s cost per probe).
+    """
+    recipe = None
+    if project is not None and bug_index is not None:
+        recipe = get_bugscpp_test_recipe(project, bug_index)
+
+    if recipe is not None:
+        raw_lines, case_index = recipe
+        # Bugscpp runs each line via `docker exec_run(<line>)`, which
+        # shlex-splits the line into argv. For a line like
+        # `bash -c "./berry $(find ... -name \"*.be\" ...)"`, shlex.split
+        # consumes one level of quoting, producing
+        # `['bash', '-c', './berry $(find ... -name "*.be" ...)']`. Bash
+        # then runs the third token as a fresh shell command, where
+        # `"*.be"` is an ordinary double-quoted glob pattern and find gets
+        # `*.be`.
+        #
+        # If we instead just pasted the raw line into a shell script, bash
+        # would re-process `\"`-escapes inside double-quoted regions and
+        # find would end up with literal `"` characters in its argv. So we
+        # explicitly shlex-split every line, then re-shell-quote the parts
+        # for our outer `bash -c '...'` wrapper. For each line, we end up
+        # exec-ing the same argv bugscpp's framework would.
+        rebuilt: list[str] = []
+        for line in raw_lines:
+            try:
+                tokens = shlex.split(line)
+            except ValueError:
+                # Unparseable line — fall through with the raw form. Will
+                # likely fail downstream but at least won't crash the
+                # probe.
+                rebuilt.append(line)
+                continue
+            rebuilt.append(" ".join(shlex.quote(t) for t in tokens))
+        chained = "\n".join(rebuilt)
+        bugscpp_block = (
+            f'printf %s {case_index} > /work/DPP_TEST_INDEX\n'
+            f'{chained}'
+        )
+        cmd_to_strace = bugscpp_block
+    else:
+        if not trigger_argv:
+            return None
+        if trigger_argv[:2] == ["bash", "-c"]:
+            argv = trigger_argv
+        else:
+            argv = resolve_libtool_argv(workspace, trigger_argv)
+        cmd_to_strace = " ".join(shlex.quote(p) for p in argv)
+
+    # apt install + GDB_PREAMBLE setup, then strace the actual test.
+    inner = (
+        'apt-get update -qq >/dev/null 2>&1 && '
+        'apt-get install -y --no-install-recommends strace >/dev/null 2>&1; '
+        f'{GDB_PREAMBLE}; '
+        f'strace -f -s 4096 -e trace=execve -- bash -c {shlex.quote(cmd_to_strace)}'
+    )
+    return [
+        "docker", "run", "--rm",
+        "-v", f"{_bind_path(workspace)}:/work",
+        "-w", "//work",
+        gdb_image,
+        "bash", "-c", inner,
+    ]
+
+
 def build_trigger_docker_argv(
     workspace: Path,
     gdb_image: str,
@@ -201,11 +408,132 @@ FRAME_RE = re.compile(
     r"(?:\s+at\s+([^:]+):(\d+))?"
 )
 SIGNAL_RE = re.compile(r"Program received signal (SIG[A-Z]+)")
+# strace -f -e trace=execve emits lines like:
+#   12345 execve("/work/berry", ["./berry", "test.be"], 0x7ffd...) = 0
+# The leading PID and "[pid 12345]" variants both appear. Capture both the
+# program path AND the argv array; the latter is what we need to reproduce
+# the failing test invocation under gdb. Skip failed calls (= -1 ENOENT).
+# `<unfinished ...>` continuations don't appear in this regex (they have no
+# trailing `= 0`); the `<... execve resumed>` form sometimes does — those
+# don't carry the argv on the resumed line, so we'll naturally skip them.
+EXEC_CALL_RE = re.compile(
+    r'execve\("([^"]+)",\s*\[(.*?)\][^)]*\)\s*=\s*0\b',
+)
+# Wrappers we never want to surface as "the buggy binary" even if they're
+# the only /work/* exec we saw — explicit list keeps the heuristic honest.
+LAUNCHER_BASENAMES = {
+    "bash", "sh", "dash", "make", "cmake", "ctest", "find", "xargs", "env",
+    "python", "python3", "python3.11", "perl", "ruby", "node",
+    "awk", "gawk", "sed", "tr", "cat", "ls", "grep", "head", "tail",
+    "sort", "cut", "tee", "wc", "test", "true", "false",
+    "gcc", "g++", "clang", "ld", "as", "ar", "ranlib",
+    "libtool", "pkg-config",
+}
 
 
 def parse_signal(output: str) -> str | None:
     m = SIGNAL_RE.search(output)
     return m.group(1) if m else None
+
+
+# Splits an strace argv list element by element. Tolerates:
+#   - normal `"foo"` quoted strings
+#   - escaped quotes: `"foo\"bar"`
+#   - per-element truncation: `"long..."` (treated as opaque arg)
+#   - whole-array truncation marker: bare `...` (stop processing)
+def _parse_argv_list(raw: str) -> list[str]:
+    args: list[str] = []
+    i, n = 0, len(raw)
+    while i < n:
+        while i < n and raw[i] in " ,":
+            i += 1
+        if i >= n:
+            break
+        if raw[i] == '"':
+            i += 1
+            buf: list[str] = []
+            while i < n:
+                ch = raw[i]
+                if ch == '\\' and i + 1 < n:
+                    buf.append(raw[i + 1])
+                    i += 2
+                elif ch == '"':
+                    i += 1
+                    break
+                else:
+                    buf.append(ch)
+                    i += 1
+            args.append("".join(buf))
+        elif raw[i:i + 3] == '...':
+            break  # whole-list truncation
+        else:
+            j = raw.find(',', i)
+            if j < 0:
+                break
+            i = j
+    return args
+
+
+def parse_exec_calls(output: str) -> list[tuple[str, list[str]]]:
+    """Return [(path, argv), ...] from strace -f output."""
+    out = []
+    for m in EXEC_CALL_RE.finditer(output):
+        out.append((m.group(1), _parse_argv_list(m.group(2))))
+    return out
+
+
+def parse_exec_paths(output: str) -> list[str]:
+    """Backward-compat: return just the paths."""
+    return [p for p, _ in parse_exec_calls(output)]
+
+
+SYSTEM_PATH_PREFIXES = ("/usr/", "/bin/", "/sbin/", "/lib/", "/lib64/", "/opt/")
+
+
+def pick_buggy_binary(
+    workspace: Path,
+    exec_calls: "list[tuple[str, list[str]]] | list[str]",
+) -> "tuple[str, list[str]] | None":
+    """Pick the deepest user-binary exec from the trigger's exec chain.
+
+    Accepts either a list of (path, argv) tuples or, for backward
+    compatibility, a list of bare paths. Returns (rel_path, argv) where
+    rel_path is workspace-relative (e.g. "src/split") and argv is the full
+    argument list as exec'd (argv[0] = the program-as-named, then the test
+    arguments). Returns None if no user binary was seen.
+
+    The argv is what makes the difference between "tell the model what
+    binary is buggy" (current behavior) and "tell the model the exact
+    command the failing test ran" (what we need so the model can reproduce
+    the failing condition).
+    """
+    # Normalize: legacy callers pass list[str]; convert to list[(path, [])]
+    if exec_calls and isinstance(exec_calls[0], str):
+        exec_calls = [(p, []) for p in exec_calls]  # type: ignore[list-item]
+
+    for path, argv in reversed(exec_calls):
+        if any(path.startswith(p) for p in SYSTEM_PATH_PREFIXES):
+            continue
+        if path.startswith("/work/"):
+            rel = path[len("/work/"):].lstrip("/")
+        elif path.startswith("./"):
+            rel = path[2:]
+        elif "/" in path and not path.startswith("/"):
+            rel = path
+        elif "/" not in path:
+            rel = path
+        else:
+            continue
+
+        if not rel:
+            continue
+        base = rel.rsplit("/", 1)[-1]
+        if base in LAUNCHER_BASENAMES:
+            continue
+        if not (workspace / rel).exists():
+            continue
+        return rel, argv
+    return None
 
 
 def parse_frames(output: str) -> list[dict]:
@@ -286,6 +614,8 @@ def process_bug(con: sqlite3.Connection, bug: dict, log) -> None:
         "user_frame_line":     None,
         "backtrace_path":      None,
         "bug_observed":        "no_observation",
+        "buggy_binary_path":      None,
+        "buggy_binary_argv_json": None,
         "included_in_corpus":  0,
         "built_at":            now,
         "probed_at":           now,
@@ -296,7 +626,7 @@ def process_bug(con: sqlite3.Connection, bug: dict, log) -> None:
     force_rmtree(buggy_target)
     r = run_bugscpp(
         ["checkout", project, str(idx), "--buggy", "--target", str(buggy_target)],
-        timeout=300,
+        timeout=900,
     )
     buggy = buggy_workspace_path(bug_id, project, idx)
     if r.returncode != 0 or not buggy.exists():
@@ -308,7 +638,7 @@ def process_bug(con: sqlite3.Connection, bug: dict, log) -> None:
 
     # 2) Build
     cleanup_stale_dpp_container(project, log)
-    r = run_bugscpp(["build", str(buggy)], timeout=1800)
+    r = run_bugscpp(["build", str(buggy)], timeout=5400)
     if r.returncode != 0:
         update["build_error"] = stderr_tail(r)
         log(f"[{bug_id}] BUILD FAIL")
@@ -349,6 +679,19 @@ def process_bug(con: sqlite3.Connection, bug: dict, log) -> None:
             bt_path.write_text(output, encoding="utf-8", errors="replace")
             update["backtrace_path"] = f"backtraces/{bug_id}.txt"
 
+            # Identify the deepest /work/* binary + the argv it was exec'd
+            # with — needed so the harness can reproduce the failing test
+            # condition under gdb. Note: this gdb-output path doesn't carry
+            # `execve("...")` lines (it would need `catch exec` plus
+            # `commands` to log them, which fights with the existing
+            # backtrace probe). The strace-based reprobe in
+            # reprobe_buggy_binary.py is what actually populates these
+            # columns; this call gracefully no-ops on gdb output.
+            picked = pick_buggy_binary(buggy, parse_exec_calls(output))
+            if picked:
+                update["buggy_binary_path"] = picked[0]
+                update["buggy_binary_argv_json"] = json.dumps(picked[1])
+
             if signal_seen:
                 update["crash_signal"] = signal_seen
                 update["crash_reproducible"] = 1
@@ -377,7 +720,21 @@ def process_bug(con: sqlite3.Connection, bug: dict, log) -> None:
                     except subprocess.TimeoutExpired:
                         update["bug_observed"] = "timeout"
 
-    # 4) Inclusion gate
+    # 4) Verify trigger binary actually landed on disk. bugscpp build can
+    #    return 0 (so build_ok=1) while Windows ↔ Docker bind-mount quirks
+    #    silently drop the build outputs. Without this check the row was
+    #    being marked included_in_corpus=1 but DockerDriver later fails with
+    #    "No such file or directory" because the binary is missing.
+    if update["build_ok"] and trigger_argv:
+        bp = trigger_binary_path(buggy, trigger_argv)
+        if bp is not None and not bp.exists():
+            update["build_ok"] = 0
+            update["build_error"] = (
+                f"bugscpp build returned 0 but trigger binary missing on disk: "
+                f"expected {bp} (likely a Windows ↔ Docker bind-mount issue)"
+            )
+
+    # 5) Inclusion gate
     if update["build_ok"] and patch_first_file and patch_path:
         update["included_in_corpus"] = 1
 

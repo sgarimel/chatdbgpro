@@ -123,15 +123,23 @@ class GDBDialog(DBGDialog):
     def check_debugger_state(self):
         global last_error_type
         if not last_error_type:
-            # Assume we are running from a core dump,
-            # which _probably_ means a SEGV.
-            last_error_type = "SIGSEGV"
+            # No signal — could be a breakpoint stop (abort, exit, ...) or
+            # a clean exit reached via `break _exit`. The harness can supply
+            # a richer label (e.g., a behavioral test-oracle string) via the
+            # CHATDBG_PROMPT_ERROR env var; otherwise fall back to a generic
+            # tag so the LLM at least knows there's no signal.
+            last_error_type = os.environ.get("CHATDBG_PROMPT_ERROR") \
+                or "stopped (no-signal)"
         try:
             frame = gdb.selected_frame()
         except gdb.error:
-            self.fail(
-                "Must be attached to a program that fails to use `why` or `chat`."
-            )
+            # Inferior already exited and gdb has no live frame. Rather
+            # than bail, let ChatDBG run a degraded session — the prompt
+            # and any captured stdout/stderr the harness passes via the
+            # question still give the LLM something to reason about. This
+            # is what enables ablation on logical-error bugs that don't
+            # crash but still represent real defects.
+            return
 
         # Walk older frames until we find one with debug info and a source
         # mapping. The crash site often lands in stripped system code
@@ -152,9 +160,10 @@ class GDBDialog(DBGDialog):
             frame = frame.older()
 
         if user_frame is None:
-            self.fail(
-                "Your program must be compiled with debug information (`-g`) to use `why` or `chat`."
-            )
+            # No debug info available, but we still have a frame. Let the
+            # session proceed against the original (likely stripped) frame
+            # rather than blocking the ablation entirely.
+            return
 
         if user_frame is not original_frame:
             user_frame.select()
@@ -169,7 +178,12 @@ class GDBDialog(DBGDialog):
         skipped = 0
         summaries: List[Union[_FrameSummaryEntry, _SkippedFramesEntry]] = []
 
-        frame = gdb.selected_frame()
+        try:
+            frame = gdb.selected_frame()
+        except gdb.error:
+            # No live frame — inferior exited cleanly. Caller (ChatDBG
+            # session) handles the empty-summary case as "no stack".
+            return None
 
         index = -1
         # Walk the stack and build up the frames list.
@@ -236,6 +250,41 @@ class GDBDialog(DBGDialog):
         if skipped > 0:
             summaries.append(_SkippedFramesEntry(skipped))
 
+        # Fallback: if every frame got filtered (typical when gdb is parked
+        # on a non-user binary like /bin/bash or libc-only frames after a
+        # `break exit` stop), the LLM is left staring at "[N skipped frames...]"
+        # alone — no signal at all. Re-walk the stack and emit the frames as
+        # best-effort entries (no source, no args) so the LLM at least sees
+        # function names and addresses.
+        if summaries and all(isinstance(s, _SkippedFramesEntry) for s in summaries):
+            try:
+                frame = gdb.selected_frame()
+            except gdb.error:
+                return summaries
+            fallback: List[Union[_FrameSummaryEntry, _SkippedFramesEntry]] = []
+            fb_index = -1
+            while frame is not None and len(fallback) < max_entries:
+                fb_index += 1
+                name = frame.name() or "??"
+                sal = frame.find_sal()
+                file_path = None
+                lineno = None
+                if sal.symtab is not None:
+                    try:
+                        file_path = sal.symtab.fullname()
+                        if file_path and file_path.startswith(os.getcwd()):
+                            file_path = os.path.relpath(file_path)
+                    except Exception:
+                        file_path = None
+                    if sal.line:
+                        lineno = sal.line
+                fallback.append(
+                    _FrameSummaryEntry(fb_index, name, [], file_path, lineno)
+                )
+                frame = frame.older()
+            if fallback:
+                return fallback
+
         return summaries
 
     def _initial_prompt_error_message(self):
@@ -250,10 +299,24 @@ class GDBDialog(DBGDialog):
         return last_error_type
 
     def _initial_prompt_error_details(self):
-        """Anything more beyond the initial error message to include."""
-        return None
+        """Anything more beyond the initial error message to include.
+
+        The harness can supply free-form context (workspace summary, build
+        system, etc.) via CHATDBG_PROMPT_EXTRA — useful for telling the LLM
+        what kind of project it's looking at without leaking the bug site.
+        """
+        return os.environ.get("CHATDBG_PROMPT_EXTRA") or None
 
     def _initial_prompt_command_line(self):
+        # The harness can override the cmdline shown to the LLM via
+        # CHATDBG_PROMPT_BINARY. This matters when gdb was launched on a
+        # wrapper (bash/make/ctest) but the buggy binary is several execs
+        # deep — `progspace.filename` points at the wrapper, not the actual
+        # program under test.
+        override = os.environ.get("CHATDBG_PROMPT_BINARY")
+        if override:
+            return override
+
         executable_path = gdb.selected_inferior().progspace.filename
 
         if executable_path.startswith(os.getcwd()):
