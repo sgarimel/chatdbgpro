@@ -25,7 +25,71 @@ bench/
 └── results/                  # per-run artifacts (gitignored)
 ```
 
-## One-shot end-to-end
+## Quick start: cross-tier BugsCPP pilot
+
+`bench/run_pilot.sh` bootstraps everything (clone bugscpp, seed corpus,
+build per-project workspaces, build images, sweep T1–T4, judge, enrich
+costs, build PDF) in a single command:
+
+```bash
+export OPENROUTER_API_KEY=...     # T1, T2, T3
+# T4 (Claude Code) accepts any of:
+#   ANTHROPIC_API_KEY=...         # pay-per-use
+#   ANTHROPIC_AUTH_TOKEN=...
+#   CLAUDE_CODE_OAUTH_TOKEN=...   # subscription quota
+#   `claude /login`               # keychain (needs --tier4-bare={auto,never})
+
+bench/run_pilot.sh                              # yara × {haiku, sonnet} × T1-T4
+bench/run_pilot.sh --project libtiff            # different bugscpp project
+bench/run_pilot.sh --bug-ids yara-1 yara-3      # subset of bugs
+bench/run_pilot.sh --models claude --tiers 1 4  # subset of model/tier matrix
+bench/run_pilot.sh --skip-judge                 # sweep only (faster iteration)
+```
+
+Artifacts:
+- `bench/results/<sweep_name>/<run_id>/` — per-cell artifacts (collect.json, result.json, score.json, stdout.log, ...)
+- `bench/analysis_artifacts/figs/<sweep_name>.pdf` — 5-page cross-tier report
+- `bench/analysis_artifacts/figs/<sweep_name>.csv` — per-run summary for follow-up analysis
+
+### Where each tier runs
+
+The harness has four tiers. Some are platform-gated:
+
+| Tier | What it runs | Synthetic | BugsCPP (Linux/amd64) | BugsCPP (Apple Silicon) |
+|---|---|:---:|:---:|:---:|
+| T1 | mini-swe-agent v2 (bash only) | ✅ | ✅ | ✅ (mini's bash via `docker exec`) |
+| T2 | mini + persistent gdb | ✅ | ✅ | ⚠️ skipped — gdb's amd64 ptrace is broken under Rosetta and QEMU on Apple Silicon |
+| T3 | ChatDBG on gdb | ✅ (in `chatdbgpro/synthetic-runner` arm64-native) | ✅ | ⚠️ skipped — same reason |
+| T4 | Claude Code CLI | ✅ | ✅ | ✅ (claude on host, container as side-vehicle) |
+
+Skipped cells get `status=skipped_platform` so they don't pollute the
+matrix. To run the full T2/T3 BugsCPP matrix, use a Linux/amd64 host —
+the same `bench/run_pilot.sh` invocation works there with no changes.
+
+### Running on HPC clusters (adroit, della, ...) without Docker
+
+When `docker` isn't on PATH but `apptainer` (or `singularity`) is, the
+harness auto-uses the apptainer runtime. Force it explicitly with
+`--runtime apptainer`:
+
+```bash
+bench/run_pilot.sh --runtime apptainer --models haiku --tiers 1 2 3 4
+```
+
+Lifecycle differences (transparent to the model):
+
+  | Operation | docker | apptainer |
+  |---|---|---|
+  | start container | `docker run -d --rm sleep infinity` | `apptainer instance start` |
+  | run command | `docker exec -w /work N bash -c '...'` | `apptainer exec --pwd /work instance://N ...` |
+  | stop | `docker rm -f N` | `apptainer instance stop N` |
+
+Images are pulled from `ghcr.io/diodide/chatdbgpro-gdb-<project>:latest`
+on first use; apptainer caches the SIF in `~/.apptainer/cache/`. Override
+the registry namespace via `BENCH_APPTAINER_REGISTRY` if you've
+published your own.
+
+## Custom sweeps (legacy axis-only mode)
 
 ```bash
 export OPENROUTER_API_KEY=...

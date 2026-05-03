@@ -1,9 +1,23 @@
-"""Tier-3 driver: ChatDBG on lldb/gdb, no bash tool.
+"""Tier-3 driver: ChatDBG on gdb (containerized) or lldb/gdb (host, legacy).
 
 This is the original ablation path — compile the single-file case,
-launch it under the native debugger with ChatDBG's script module loaded,
-and drive one `why ...` query to EOF. The body is the verbatim behaviour
-previously implemented inline in bench/orchestrator.py::execute_run.
+launch it under the debugger with ChatDBG's script module loaded, and
+drive one `why ...` query to EOF.
+
+Two execution modes:
+
+  containerize=True (default after the GDB-everywhere migration):
+      Runs ChatDBG-on-gdb inside chatdbgpro/synthetic-runner:latest,
+      regardless of host platform. Same debugger interface as the
+      BugsCPP T3 path (chatdbgpro/gdb-<project>) — no
+      "T3 macOS lldb vs T3 Linux gdb" confounder in cross-tier
+      comparisons. The synthetic source is compiled inside the
+      container with clang.
+
+  containerize=False (legacy / opt-out via --tier3-host):
+      Runs the debugger natively on the host. lldb on macOS (Apple's
+      signed lldb), gdb where available. Preserved for users who
+      need the previous behaviour or cannot run Docker.
 """
 from __future__ import annotations
 
@@ -24,6 +38,23 @@ from bench.common import (
     finalize_result,
     prepare_injected_workspace,
 )
+from bench.drivers.container_session import ContainerSession, Mount
+
+
+SYNTHETIC_RUNNER_IMAGE = "chatdbgpro/synthetic-runner:latest"
+
+
+def _native_docker_platform() -> str:
+    """Return the linux/<arch> Docker platform string matching the host.
+    Used by the T3-synthetic-in-container path so gdb runs without
+    Rosetta/QEMU emulation (which has known ptrace bugs)."""
+    m = platform.machine().lower()
+    if m in ("arm64", "aarch64"):
+        return "linux/arm64"
+    if m in ("x86_64", "amd64"):
+        return "linux/amd64"
+    # Fallback: let docker pick. Newer arches (ppc64le etc.) propagate.
+    return ""
 
 
 STRUCTURAL_FIX_QUESTION = (
@@ -206,9 +237,20 @@ def _run_debugger(
 class Tier3Driver:
     tier: int = 3
 
-    def __init__(self, debugger: str, dry_run: bool = False):
+    def __init__(
+        self, debugger: str = "gdb", dry_run: bool = False,
+        containerize: bool = True,
+        synthetic_runner_image: str = SYNTHETIC_RUNNER_IMAGE,
+    ):
+        # `debugger` controls the host-mode legacy path. When
+        # containerize=True (default), we always run gdb inside the
+        # synthetic-runner container — `debugger` is ignored for
+        # synthetic cases. The argument is kept for backward
+        # compatibility and for the host-mode opt-out.
         self.debugger = debugger
         self.dry_run = dry_run
+        self.containerize = containerize
+        self.synthetic_runner_image = synthetic_runner_image
 
     def run(self, spec: RunSpec, run_dir: Path, *, timeout: float) -> dict:
         run_dir.mkdir(parents=True, exist_ok=True)
@@ -233,6 +275,9 @@ class Tier3Driver:
 
         if spec.case.kind == "injected_repo":
             return self._run_injected(spec, run_dir, timeout=timeout)
+
+        if self.containerize:
+            return self._run_synthetic_in_container(spec, run_dir, timeout=timeout)
 
         shutil.copy(spec.case.source_path, run_dir / spec.case.source_path.name)
 
@@ -369,6 +414,167 @@ class Tier3Driver:
             run_dir, spec,
             status=status, exit_code=exit_code, elapsed_s=elapsed,
         )
+
+    def _run_synthetic_in_container(
+        self, spec: RunSpec, run_dir: Path, *, timeout: float,
+    ) -> dict:
+        """GDB-everywhere synthetic path: compile + run-under-ChatDBG-gdb
+        inside chatdbgpro/synthetic-runner. Mirrors the BugsCPP T3 path
+        (DockerDriver) so the only axis varying between synthetic and
+        BugsCPP is case content, not debugger or platform."""
+        # Stage source + tool config in run_dir so the container sees them.
+        # The container has run_dir mounted at both /work (compile here)
+        # and /run (artifacts: collect.json, logs, session.cmds).
+        source_in_run = run_dir / spec.case.source_path.name
+        shutil.copy(spec.case.source_path, source_in_run)
+        shutil.copy(spec.tool_config_path, run_dir / "tool_config.json")
+
+        # Compile command — same flags the host-mode path used; clang in
+        # the synthetic-runner image accepts the same `-fsanitize=address`
+        # / `-std=...` flags. Macros that depend on macOS-only headers
+        # (e.g. `-isysroot`) won't work; case authors should avoid them.
+        build_cfg = spec.case.meta.get("build", {})
+        default_compiler = "clang++" if spec.case.language in ("cpp", "c++") else "clang"
+        compiler = build_cfg.get("compiler", default_compiler)
+        flags = list(build_cfg.get("flags", []))
+        src_in_container = f"/work/{spec.case.source_path.name}"
+        bin_in_container = "/work/prog"
+        compile_cmd = [compiler, *flags, src_in_container, "-o", bin_in_container]
+
+        # gdb session script. We can't reuse host-mode build_gdb_script's
+        # `source -s chatdbg.chatdbg_gdb` syntax — that's gdb's directory-
+        # search form, which doesn't do Python module resolution and so
+        # never finds the script. Use the absolute /chatdbg-src path
+        # instead (same pattern as DockerDriver's _build_gdb_session).
+        bp_spec = None
+        if spec.breakpoint_at_patch:
+            rcl = spec.case.meta.get("bug", {}).get("root_cause_lines") or []
+            if rcl:
+                bp_spec = f"{spec.case.meta.get('source_file')}:{rcl[0]}"
+        script_lines = [
+            "set pagination off",
+            "set confirm off",
+            "set breakpoint pending on",
+            "source /chatdbg-src/chatdbg/chatdbg_gdb.py",
+        ]
+        args = spec.case.meta.get("run", {}).get("args", [])
+        if args:
+            script_lines.append(
+                "set args " + " ".join(shlex.quote(str(a)) for a in args)
+            )
+        if bp_spec:
+            script_lines.append(f"break {bp_spec}")
+        script_lines.append("run")
+        script_lines.append(f"why {spec.question}")
+        if spec.structural_fix_turn:
+            script_lines.append(f"why {STRUCTURAL_FIX_QUESTION}")
+        script = "\n".join(script_lines) + "\n"
+        (run_dir / "session.cmds").write_text(script)
+
+        # Container env — CHATDBG_* paths in /run since that's the artifact
+        # mount; PYTHONPATH points at /chatdbg-src (REPO_DIR/src bind-mount)
+        # plus the chatdbg-venv site-packages baked into the image.
+        # PYTHONPATH covers both the bespoke 3.11 venv layout (gdb-base
+        # parent images) and the system-Python 3.12 venv layout (standalone
+        # synthetic-runner.Dockerfile). The non-existent path no-ops.
+        container_env: dict[str, str] = {
+            "CHATDBG_MODEL": spec.model,
+            "CHATDBG_TOOL_CONFIG": "/run/tool_config.json",
+            "CHATDBG_COLLECT_DATA": "/run/collect.json",
+            "CHATDBG_CONTEXT": str(spec.context_lines),
+            "CHATDBG_FORMAT": "text",
+            "CHATDBG_LOG": "/run/chatdbg.log.yaml",
+            "PYTHONPATH": ":".join([
+                "/chatdbg-src",
+                "/opt/chatdbg-venv/lib/python3.12/site-packages",
+                "/opt/chatdbg-venv/lib/python3.11/site-packages",
+            ]),
+        }
+        for key in ("OPENROUTER_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_BASE"):
+            v = os.environ.get(key)
+            if v:
+                container_env[key] = v
+        if spec.case.meta.get("run", {}).get("clean_env"):
+            for k in list(container_env.keys()):
+                if k.startswith("USER") or k in ("LOGNAME", "ADMIN_USER"):
+                    container_env.pop(k, None)
+
+        # /work mount = run_dir (compile lands binary here), /run mount =
+        # run_dir too (artifacts). Two binds of the same host path to
+        # different container paths — fine kernel-wise. hermetic=False
+        # because run_dir is already per-run; copying would just hide the
+        # compile output from the host.
+        #
+        # Platform: native (host arch). On Apple Silicon this is
+        # linux/arm64 where gdb's ptrace works natively. The BugsCPP T3
+        # path is forced to linux/amd64 by hschoe images and requires
+        # Docker Desktop's Rosetta-off setting on M-series Macs; this
+        # synthetic path sidesteps that by running native.
+        # Override via BENCH_T3_SYNTHETIC_PLATFORM=linux/amd64 if you
+        # want to compare arches deliberately.
+        session_platform = (
+            os.environ.get("BENCH_T3_SYNTHETIC_PLATFORM")
+            or _native_docker_platform()
+        )
+        session = ContainerSession(
+            image=self.synthetic_runner_image,
+            workspace_src=run_dir,
+            run_dir=run_dir,
+            extra_mounts=[Mount(host=REPO_DIR / "src", container="/chatdbg-src", readonly=True)],
+            platform=session_platform,
+            ptrace=True,
+            hermetic_workspace=False,
+            env=container_env,
+        )
+
+        if self.dry_run:
+            return finalize_result(
+                run_dir, spec, status="dry_run", exit_code=0, elapsed_s=0.0,
+            )
+
+        start = time.time()
+        try:
+            with session:
+                # Compile
+                cr = session.exec_argv(compile_cmd, timeout=60.0)
+                (run_dir / "compile.log").write_text(
+                    "$ " + " ".join(shlex.quote(c) for c in compile_cmd) + "\n\n"
+                    + (cr.stdout or "") + "\n" + (cr.stderr or "")
+                )
+                if cr.returncode != 0:
+                    return finalize_result(
+                        run_dir, spec,
+                        status="compile_failed", exit_code=cr.returncode,
+                        elapsed_s=time.time() - start,
+                    )
+                # Run gdb under ChatDBG. -batch quits on EOF after the
+                # session script's `why` queries.
+                gdb_argv = [
+                    "gdb", "-nx", "-batch",
+                    "-x", "/run/session.cmds",
+                    bin_in_container,
+                ]
+                r = session.exec_argv(gdb_argv, timeout=timeout)
+            (run_dir / "stdout.log").write_text(r.stdout)
+            (run_dir / "stderr.log").write_text(r.stderr)
+            elapsed = r.elapsed_s
+            if r.timed_out:
+                return finalize_result(
+                    run_dir, spec, status="timeout", exit_code=-1, elapsed_s=elapsed,
+                )
+            collect_path = run_dir / "collect.json"
+            status = "ok" if collect_path.exists() else "no_collect"
+            return finalize_result(
+                run_dir, spec,
+                status=status, exit_code=r.returncode, elapsed_s=elapsed,
+            )
+        except RuntimeError as e:
+            (run_dir / "docker_run.log").write_text(str(e))
+            return finalize_result(
+                run_dir, spec,
+                status="docker_run_failed", exit_code=-1,
+                elapsed_s=time.time() - start,
+            )
 
     def _run_injected(self, spec: RunSpec, run_dir: Path, *, timeout: float) -> dict:
         """Tier-3 path for `kind: injected_repo` cases.

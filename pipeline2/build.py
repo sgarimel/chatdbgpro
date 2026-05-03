@@ -55,15 +55,46 @@ def bugscpp_repo() -> Path:
     return Path(repo) if repo else REPO_ROOT.parent / "bugscpp"
 
 
+def _bugscpp_python() -> str:
+    """Resolve the python interpreter that has bugscpp's deps installed.
+
+    Priority:
+      1. $BUGSCPP_PYTHON if set (explicit override)
+      2. <BUGSCPP_REPO>/.venv/bin/python (created by `python -m venv .venv`
+         inside the bugscpp clone, our standard setup on Mac/Linux)
+      3. <BUGSCPP_REPO>/.venv/Scripts/python.exe (Windows venv layout)
+      4. bare `python` (legacy — assumes system python has docker, GitPython, etc.)
+    """
+    env = os.environ.get("BUGSCPP_PYTHON")
+    if env:
+        return env
+    repo = bugscpp_repo()
+    for cand in (repo / ".venv" / "bin" / "python", repo / ".venv" / "Scripts" / "python.exe"):
+        if cand.exists():
+            return str(cand)
+    return "python"
+
+
 def run_bugscpp(args: list[str], timeout: int = 600) -> subprocess.CompletedProcess:
-    cmd = ["python", str(bugscpp_repo() / "bugscpp" / "bugscpp.py"), *args]
-    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    cmd = [_bugscpp_python(), str(bugscpp_repo() / "bugscpp" / "bugscpp.py"), *args]
+    # Pass _docker_env() so DOCKER_DEFAULT_PLATFORM=linux/amd64 reaches
+    # bugscpp's internal `docker build` calls on Apple Silicon hosts.
+    return subprocess.run(
+        cmd, capture_output=True, text=True, timeout=timeout, env=_docker_env(),
+    )
 
 
 def _docker_env() -> dict:
     env = os.environ.copy()
     env["MSYS_NO_PATHCONV"] = "1"
     env.setdefault("MSYS2_ARG_CONV_EXCL", "*")
+    # Apple Silicon: bugscpp's `checkout` builds Dockerfiles whose
+    # base image (hschoe/defects4cpp-ubuntu:<project>) is amd64-only,
+    # and bugscpp itself doesn't pass --platform. DOCKER_DEFAULT_PLATFORM
+    # is Docker's standard env var for this; honored by every docker
+    # subprocess in the chain (build, run, exec) without modifying
+    # bugscpp's source.
+    env.setdefault("DOCKER_DEFAULT_PLATFORM", "linux/amd64")
     return env
 
 

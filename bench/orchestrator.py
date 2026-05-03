@@ -29,10 +29,38 @@ from bench.common import (  # noqa: E402
     build_matrix,
     discover_cases,
     discover_docker_cases,
+    finalize_result,
     run_id_for,
 )
 from bench.drivers import get_driver  # noqa: E402
 from bench.drivers.base import Driver  # noqa: E402
+from bench.drivers.container_session import (  # noqa: E402
+    prune_sweep, set_default_runtime, set_default_sweep_label,
+)
+
+
+def _hardware_can_run(spec) -> tuple[bool, str]:
+    """Return (runnable, reason). Used at dispatch time to skip cells the
+    host hardware cannot run, with a clear `status=skipped_platform`
+    instead of failing opaquely.
+
+    The single boundary today: BugsCPP T2/T3 cells need amd64 ptrace,
+    which doesn't work under Apple Silicon's amd64 emulation (Rosetta:
+    PTRACE_GETREGS broken; QEMU-user: ptrace not implemented at all).
+    Run those tiers on a Linux/amd64 host instead.
+    """
+    import platform as _pf
+    if (
+        _pf.machine().lower() in ("arm64", "aarch64")
+        and getattr(spec.case, "kind", None) == "docker_bugscpp"
+        and spec.tier in (2, 3)
+    ):
+        return False, (
+            "T2/T3 BugsCPP need amd64 ptrace; Apple Silicon Docker can't "
+            "do that (Rosetta + QEMU both lack working PTRACE_GETREGS). "
+            "Run on a linux/amd64 host."
+        )
+    return True, ""
 
 
 def _resolve_tool_configs(names: list[str]) -> list[Path]:
@@ -60,13 +88,25 @@ def _driver_for_tier(
     mini_model_class: str | None = None,
     tier2_linux: str | None = None,
     tier4_bare: str | None = None,
+    container_runtime: str | None = None,
 ) -> Driver:
     cache_key = (tier, docker)
     if cache_key in cache:
         return cache[cache_key]
     if docker:
-        driver = get_driver(tier, docker=True, dry_run=dry_run)
-        print(f"[orchestrator] tier{tier} using Docker driver")
+        kwargs = {"dry_run": dry_run}
+        if tier in (1, 2) and mini_model_class:
+            kwargs["mini_model_class"] = mini_model_class
+        if tier == 4 and tier4_bare:
+            kwargs["bare"] = tier4_bare
+        if container_runtime:
+            kwargs["runtime"] = container_runtime
+        driver = get_driver(tier, docker=True, **kwargs)
+        # Each tier now has its own docker driver (T1/T2/T4 wrap mini /
+        # claude with docker exec; T3 keeps the legacy ChatDBG-in-
+        # container DockerDriver). Surface the actual driver class so
+        # researchers can see the dispatch resolution at a glance.
+        print(f"[orchestrator] tier{tier} (docker) using {type(driver).__name__}")
     elif tier == 3:
         from bench.drivers.tier3_gdb import pick_debugger
         debugger = pick_debugger(debugger_flag)
@@ -197,6 +237,12 @@ def main() -> int:
                         "macOS because gdb cannot run native arm64 binaries — see "
                         "bench/analysis_artifacts/HARNESS_AUDIT.md Round 5 for "
                         "validation evidence.")
+    p.add_argument("--runtime", default=None,
+                   choices=["docker", "apptainer"],
+                   help="(--docker only) Container runtime. Default = "
+                        "auto-detect (docker > apptainer on PATH). Use "
+                        "'apptainer' on HPC clusters that lack Docker (e.g. "
+                        "adroit, della).")
     args = p.parse_args()
 
     if args.docker:
@@ -238,6 +284,15 @@ def main() -> int:
     out_root = RESULTS_DIR / run_name
     out_root.mkdir(parents=True, exist_ok=True)
 
+    # Tag every ContainerSession spawned during this sweep so prune_sweep
+    # can sweep up orphans at the end.
+    set_default_sweep_label(run_name)
+    # Pin the container runtime for the sweep so every implicit
+    # ContainerSession (and its prune_sweep) targets the same backend.
+    if args.runtime:
+        set_default_runtime(args.runtime)
+        print(f"[orchestrator] runtime: {args.runtime}")
+
     specs = build_matrix(
         cases, args.models, cfgs, args.trials, args.context_lines, args.tiers,
         breakpoint_at_patch=args.breakpoint_at_patch,
@@ -264,6 +319,20 @@ def main() -> int:
                     continue
             except Exception:
                 pass
+        # Hardware gate: skip cells the host architecture can't run
+        # (today: T2/T3 BugsCPP on Apple Silicon — see _hardware_can_run).
+        runnable, reason = _hardware_can_run(spec)
+        if not runnable:
+            run_dir.mkdir(parents=True, exist_ok=True)
+            (run_dir / "skip.log").write_text(reason + "\n")
+            print(f"[{i}/{len(specs)}] {rid}  [skipped_platform — {reason[:60]}...]")
+            result = finalize_result(
+                run_dir, spec,
+                status="skipped_platform", exit_code=0, elapsed_s=0.0,
+            )
+            index.append(result)
+            (out_root / "index.json").write_text(json.dumps(index, indent=2))
+            continue
         print(f"[{i}/{len(specs)}] {rid}")
         try:
             driver = _driver_for_tier(
@@ -275,6 +344,7 @@ def main() -> int:
                 mini_model_class=args.mini_model_class,
                 tier2_linux=args.tier2_linux,
                 tier4_bare=args.tier4_bare,
+                container_runtime=args.runtime,
             )
             result = driver.run(spec, run_dir, timeout=args.timeout)
         except Exception as e:
@@ -289,6 +359,13 @@ def main() -> int:
             }
         index.append(result)
         (out_root / "index.json").write_text(json.dumps(index, indent=2))
+
+    # Belt-and-suspenders cleanup: remove any orphaned bench-* containers
+    # whose ContainerSession.__exit__ didn't run (driver crash, kill -9,
+    # etc). Containers were tagged with a per-sweep label at start.
+    pruned = prune_sweep(run_name)
+    if pruned:
+        print(f"[orchestrator] pruned {pruned} orphan container(s)")
 
     print(f"[orchestrator] done. Index: {out_root / 'index.json'}")
     return 0

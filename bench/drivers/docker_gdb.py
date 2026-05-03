@@ -1,8 +1,12 @@
 """Docker driver: run ChatDBG inside a BugsCPP Docker container.
 
-Works for any tier — the tier determines the tool config, not the
-execution environment. The container provides gdb + the pre-built
+Used by Tier 3 BugsCPP. The container provides gdb + the pre-built
 buggy workspace; ChatDBG source is bind-mounted from the host.
+
+The execution surface is `ContainerSession` (see container_session.py)
+— a long-lived per-case container with a hermetic per-run workspace
+copy. T1/T2/T4 BugsCPP drivers use the same primitive; this module is
+just the T3-specific specialization (load ChatDBG into gdb, ask `why`).
 
 Requires:
   - Docker daemon running
@@ -14,7 +18,6 @@ from __future__ import annotations
 
 import os
 import shutil
-import subprocess
 import time
 from pathlib import Path
 
@@ -26,6 +29,7 @@ from bench.common import (
     finalize_result,
     write_docker_case_yaml,
 )
+from bench.drivers.container_session import ContainerSession, Mount
 
 
 # Bash snippet executed inside the container. It:
@@ -181,11 +185,18 @@ def _docker_env() -> dict:
 
 
 class DockerDriver:
-    """Run ChatDBG inside a BugsCPP Docker container at any tier."""
+    """Run ChatDBG inside a BugsCPP container at any tier.
 
-    def __init__(self, tier: int = 3, dry_run: bool = False):
+    `runtime` selects the container CLI: "docker" or "apptainer".
+    None falls through to ContainerSession's resolution logic
+    (set_default_runtime() then detect_runtime()).
+    """
+
+    def __init__(self, tier: int = 3, dry_run: bool = False,
+                 runtime: str | None = None):
         self.tier = tier
         self.dry_run = dry_run
+        self.runtime = runtime
 
     def run(self, spec: RunSpec, run_dir: Path, *, timeout: float) -> dict:
         run_dir.mkdir(parents=True, exist_ok=True)
@@ -201,10 +212,13 @@ class DockerDriver:
                 exit_code=-1, elapsed_s=0.0,
             )
 
-        # Ensure gdb-enabled Docker image exists.
+        # Ensure gdb-enabled image is available. For docker, that's a
+        # local build; for apptainer, a docker:// registry URL.
+        from bench.drivers.container_session import resolve_runtime
+        runtime = resolve_runtime(self.runtime)
         try:
             from pipeline2.ensure_image import ensure_gdb_image
-            image_tag = ensure_gdb_image(case.project)
+            image_tag = ensure_gdb_image(case.project, runtime=runtime)
         except Exception as e:
             (run_dir / "docker_build.log").write_text(str(e))
             return finalize_result(
@@ -212,7 +226,10 @@ class DockerDriver:
                 status="docker_build_failed",
                 exit_code=-1, elapsed_s=0.0,
             )
-        if image_tag != case.gdb_image:
+        # case.gdb_image is set by pipeline2/seed.py to the docker tag.
+        # In apptainer mode, ensure_gdb_image returns a docker:// URL —
+        # those legitimately differ; trust the runtime-aware return.
+        if runtime == "docker" and image_tag != case.gdb_image:
             (run_dir / "docker_build.log").write_text(
                 f"DB image {case.gdb_image!r} differs from local tag {image_tag!r}\n"
             )
@@ -294,91 +311,80 @@ class DockerDriver:
         # the host shell. Per-case values override host-shell defaults so a
         # researcher can still set CHATDBG_PROMPT_* by hand for debugging.
         oracle = build_oracle_strings(case)
-        env_flags: list[str] = []
-        for key in (
-            "OPENROUTER_API_KEY",
-            "OPENAI_API_KEY",
-            "OPENROUTER_API_BASE",
-        ):
-            val = os.environ.get(key)
-            if val:
-                env_flags += ["-e", f"{key}={val}"]
-        for key in ("CHATDBG_PROMPT_BINARY", "CHATDBG_PROMPT_ERROR", "CHATDBG_PROMPT_EXTRA"):
-            val = oracle.get(key) or os.environ.get(key)
-            if val:
-                env_flags += ["-e", f"{key}={val}"]
-
-        collect_path = run_dir / "collect.json"
-
-        cmd = [
-            "docker", "run", "--rm",
-            "--platform", "linux/amd64",
-            # Bind-mount workspace
-            "-v", f"{workdir.resolve()}:/work",
-            # Bind-mount ChatDBG source
-            "-v", f"{REPO_DIR / 'src'}:/chatdbg-src:ro",
-            # Bind-mount results dir for collect.json output
-            "-v", f"{run_dir.resolve()}:/results",
-            # Working directory
-            "-w", "/work",
-            # ChatDBG env vars
-            "-e", f"CHATDBG_MODEL={spec.model}",
-            "-e", "CHATDBG_TOOL_CONFIG=/results/tool_config.json",
-            "-e", f"CHATDBG_COLLECT_DATA=/results/collect.json",
-            "-e", f"CHATDBG_CONTEXT={spec.context_lines}",
-            "-e", "CHATDBG_FORMAT=text",
-            "-e", "CHATDBG_LOG=/results/chatdbg.log.yaml",
+        container_env: dict[str, str] = {
+            "CHATDBG_MODEL": spec.model,
+            "CHATDBG_TOOL_CONFIG": "/results/tool_config.json",
+            "CHATDBG_COLLECT_DATA": "/results/collect.json",
+            "CHATDBG_CONTEXT": str(spec.context_lines),
+            "CHATDBG_FORMAT": "text",
+            "CHATDBG_LOG": "/results/chatdbg.log.yaml",
             # PYTHONPATH must include both the bind-mounted ChatDBG source
             # and the venv where gdb-base.Dockerfile installed ChatDBG's
             # runtime deps (litellm, openai, llm_utils, ...). The venv path
             # is fixed by the Dockerfile.
-            "-e", "PYTHONPATH=/chatdbg-src:/opt/chatdbg-venv/lib/python3.11/site-packages",
-            *env_flags,
-            # Image
-            image_tag,
-            # Entrypoint: bash runs the script, remaining args are trigger argv
-            "bash", "-c", script, "bash",
-        ] + run_argv
+            "PYTHONPATH": "/chatdbg-src:/opt/chatdbg-venv/lib/python3.11/site-packages",
+        }
+        for key in ("OPENROUTER_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_BASE"):
+            v = os.environ.get(key)
+            if v:
+                container_env[key] = v
+        for key in ("CHATDBG_PROMPT_BINARY", "CHATDBG_PROMPT_ERROR", "CHATDBG_PROMPT_EXTRA"):
+            v = oracle.get(key) or os.environ.get(key)
+            if v:
+                container_env[key] = v
+
+        collect_path = run_dir / "collect.json"
+
+        # ContainerSession owns the per-case container — single entry
+        # point for all run/exec, hermetic workspace copy, signal-safe
+        # cleanup. T1/T2/T4 BugsCPP drivers reuse the same primitive.
+        session = ContainerSession(
+            image=image_tag,
+            workspace_src=workdir,
+            run_dir=run_dir,
+            run_dir_in_container="/results",  # legacy ChatDBG env-var contract
+            extra_mounts=[Mount(host=REPO_DIR / "src", container="/chatdbg-src", readonly=True)],
+            runtime=runtime,
+            platform="linux/amd64",
+            ptrace=True,  # gdb needs ptrace
+            env=container_env,
+        )
 
         start = time.time()
         try:
-            # encoding='utf-8' errors='replace' is required: on Windows the
-            # default decoder is cp1252, and bugscpp triggers occasionally
-            # emit non-ASCII bytes (TIFF dumps, test fixtures). cp1252 hits
-            # UnicodeDecodeError in the reader thread → subprocess.communicate
-            # hangs → the whole orchestrator stalls.
-            proc = subprocess.run(
-                cmd,
-                capture_output=True,
-                timeout=timeout,
-                env=_docker_env(),
-                encoding="utf-8",
-                errors="replace",
-            )
+            with session:
+                # The trigger argv carries the binary + test args; we feed
+                # them as positional args to bash so $1, $2... in the
+                # CONTAINER_SCRIPT pick them up. argv[0] of bash is the
+                # program-name slot ("bash") and ignored by the script.
+                argv = ["bash", "-c", script, "bash", *run_argv]
+                result = session.exec_argv(argv, timeout=timeout)
+            (run_dir / "stdout.log").write_text(result.stdout, encoding="utf-8")
+            (run_dir / "stderr.log").write_text(result.stderr, encoding="utf-8")
+            elapsed = result.elapsed_s
+            if result.timed_out:
+                # Always emit case.yaml + sliced source — judge needs them
+                # even on timeout, so partial collect.json (if ChatDBG flushed
+                # any progress) can still be scored.
+                write_docker_case_yaml(case, run_dir)
+                return finalize_result(
+                    run_dir, spec,
+                    status="timeout", exit_code=-1, elapsed_s=elapsed,
+                )
             status = "ok" if collect_path.exists() else "no_collect"
-            exit_code = proc.returncode
-        except subprocess.TimeoutExpired as e:
-            (run_dir / "stdout.log").write_text(e.stdout or "", encoding="utf-8")
-            (run_dir / "stderr.log").write_text(e.stderr or "", encoding="utf-8")
+            exit_code = result.returncode
+        except RuntimeError as e:
+            # ContainerSession failed to start the container (image pull,
+            # daemon error, ...). Surface that as docker_run_failed.
+            (run_dir / "docker_run.log").write_text(str(e))
             elapsed = time.time() - start
-            # Always emit case.yaml + sliced source — the judge needs them
-            # even when the run timed out, so partial responses (collect.json
-            # already on disk if ChatDBG flushed any progress) can still be
-            # scored. Without this, timeouts get silently dropped from
-            # judging, hiding "model was working but didn't converge" cases.
             write_docker_case_yaml(case, run_dir)
             return finalize_result(
                 run_dir, spec,
-                status="timeout", exit_code=-1, elapsed_s=elapsed,
+                status="docker_run_failed", exit_code=-1, elapsed_s=elapsed,
             )
 
-        elapsed = time.time() - start
-        (run_dir / "stdout.log").write_text(proc.stdout or "", encoding="utf-8")
-        (run_dir / "stderr.log").write_text(proc.stderr or "", encoding="utf-8")
-
-        # Write case.yaml + sliced source for the judge pipeline
         write_docker_case_yaml(case, run_dir)
-
         return finalize_result(
             run_dir, spec,
             status=status, exit_code=exit_code, elapsed_s=elapsed,

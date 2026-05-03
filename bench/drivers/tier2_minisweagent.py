@@ -42,12 +42,15 @@ from pathlib import Path
 
 from bench.common import (
     Case,
+    DockerCase,
     REPO_DIR,
     RunSpec,
     compile_case,
     finalize_result,
     prepare_injected_workspace,
+    write_docker_case_yaml,
 )
+from bench.drivers.container_session import ContainerSession, resolve_runtime
 from bench.drivers.tier3_gdb import _run_debugger
 
 
@@ -180,6 +183,35 @@ def _build_injected_task_for_container(
     )
 
 
+def _build_bugscpp_task(case: "DockerCase", binary_in_container: str,
+                        gdb_args: list[str]) -> str:
+    """Per-case task description for BugsCPP T2 runs. Mini sees a stateful
+    gdb session pre-loaded with the buggy binary AND a bash tool that
+    runs commands inside the same per-case container at /work."""
+    argv_str = binary_in_container + (
+        (" " + " ".join(gdb_args)) if gdb_args else ""
+    )
+    obs = case.bug_observed or "(unknown)"
+    return (
+        f"You're debugging a real-codebase bug in `{case.bug_id}` (project "
+        f"`{case.project}`, an open-source C/C++ project from the BugsC++ "
+        f"corpus).\n\n"
+        f"You have TWO tools available — `bash` and `gdb` — both pointed at "
+        f"the same Linux/amd64 container with the project's source tree at "
+        f"/work.\n\n"
+        f"  bash : runs commands inside the container "
+        f"(cwd /work). Use it for cd, ls, grep, cat, find, etc.\n"
+        f"  gdb  : a stateful gdb session pre-loaded with the buggy binary "
+        f"(`{argv_str}`). Use it for set breakpoints, run, step, print, "
+        f"backtrace.\n\n"
+        f"Buggy binary: `{binary_in_container}`\n"
+        f"Test invocation: `{argv_str}`\n"
+        f"Observed: `{obs}`\n\n"
+        f"Investigate the failure, localize the defect in the source, and "
+        f"propose both a local fix and a structural global fix.\n"
+    )
+
+
 def _check_mini_venv(run_dir: Path) -> bool:
     if not MINI_VENV_PYTHON.exists():
         (run_dir / "error.log").write_text(
@@ -207,6 +239,8 @@ class Tier2Driver:
         cost_limit: float = 0.5,
         mini_model_class: str | None = None,
         prefer_linux: str | None = None,
+        docker: bool = False,
+        runtime: str | None = None,
     ):
         self.dry_run = dry_run
         self.step_limit = step_limit
@@ -216,10 +250,18 @@ class Tier2Driver:
         # Cache the "should I use Docker?" decision so we only print
         # the platform-detection message once per sweep.
         self._use_linux_container = _need_linux_container(prefer_linux)
+        # docker=True: BugsCPP path. Driver opens a per-case
+        # ContainerSession (chatdbgpro/gdb-<project>) and points both
+        # mini's bash AND the persistent gdb at it via <runtime> exec.
+        # Distinct from `_use_linux_container` which is the macOS-host
+        # workaround for synthetic + injected_repo cases.
+        self.docker = docker
+        self.runtime = runtime
 
     def run(self, spec: RunSpec, run_dir: Path, *, timeout: float) -> dict:
         run_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copy(spec.case.case_dir / "case.yaml", run_dir / "case.yaml")
+        if spec.case.kind != "docker_bugscpp":
+            shutil.copy(spec.case.case_dir / "case.yaml", run_dir / "case.yaml")
 
         if not spec.case.platform_supported():
             (run_dir / "skip.log").write_text(
@@ -229,6 +271,11 @@ class Tier2Driver:
                 run_dir, spec,
                 status="skipped_platform", exit_code=0, elapsed_s=0.0,
             )
+
+        # BugsCPP path: runs in the per-project chatdbgpro/gdb-<project>
+        # container. Distinct from the macOS-host workaround below.
+        if spec.case.kind == "docker_bugscpp":
+            return self._run_bugscpp(spec, run_dir, timeout=timeout)
 
         # Linux-container path (Darwin host by default, or
         # `--tier2-linux always`). gdb on macOS arm64 cannot run
@@ -289,6 +336,125 @@ class Tier2Driver:
                 exit_code=-1, elapsed_s=0.0,
             )
         return self._spawn_runner(spec, run_dir, argv, timeout=timeout)
+
+    # ---- BugsCPP path --------------------------------------------------
+
+    def _run_bugscpp(self, spec: RunSpec, run_dir: Path, *, timeout: float) -> dict:
+        """T2 BugsCPP: open a per-case ContainerSession against the
+        per-project gdb image, then spawn tier2_runner.py on the host
+        with --docker-container so BOTH the bash tool AND the persistent
+        gdb session route through `docker exec` into the same container.
+
+        The buggy binary is identified by case.buggy_binary_path (set by
+        pipeline2's strace probe). gdb is invoked inside the container
+        via `docker exec -i -w /work <name> gdb -q -nx --args /work/<bin>
+        <argv...>`; mini's GdbSession's stdin/stdout sentinel protocol
+        works unchanged because docker exec faithfully proxies stdio.
+        """
+        case: DockerCase = spec.case  # type: ignore[assignment]
+        if not case.workspace_path.exists():
+            return finalize_result(
+                run_dir, spec,
+                status="workspace_missing", exit_code=-1, elapsed_s=0.0,
+            )
+        runtime = resolve_runtime(self.runtime)
+        try:
+            from pipeline2.ensure_image import ensure_gdb_image
+            image_tag = ensure_gdb_image(case.project, runtime=runtime)
+        except Exception as e:
+            (run_dir / "docker_build.log").write_text(str(e))
+            return finalize_result(
+                run_dir, spec,
+                status="docker_build_failed", exit_code=-1, elapsed_s=0.0,
+            )
+
+        if self.dry_run:
+            return finalize_result(
+                run_dir, spec,
+                status="dry_run", exit_code=0, elapsed_s=0.0,
+            )
+
+        # Pick the binary + argv gdb will load. Same priority as
+        # DockerDriver: prefer the strace-resolved buggy_binary_argv
+        # (so we run the actual failing test), fall back to trigger_argv.
+        if case.buggy_binary_argv and case.buggy_binary_path:
+            binary_in_container = f"/work/{case.buggy_binary_path}"
+            gdb_args = list(case.buggy_binary_argv[1:])
+        elif case.trigger_argv:
+            binary_in_container = case.trigger_argv[0]
+            gdb_args = list(case.trigger_argv[1:])
+        else:
+            (run_dir / "error.log").write_text(
+                f"Empty trigger argv for {case.bug_id}\n"
+            )
+            return finalize_result(
+                run_dir, spec,
+                status="no_trigger", exit_code=-1, elapsed_s=0.0,
+            )
+
+        task = _build_bugscpp_task(case, binary_in_container, gdb_args)
+        (run_dir / "task.md").write_text(task)
+
+        # `runtime` already resolved above (before ensure_gdb_image).
+        import uuid as _uuid
+        container_name = f"bench-t2-{_uuid.uuid4().hex[:20]}"
+
+        runner_argv = [
+            str(MINI_VENV_PYTHON), str(TIER2_RUNNER),
+            "--run-dir", str(run_dir.resolve()),
+            "--model", spec.model,
+            "--task-file", str((run_dir / "task.md").resolve()),
+            "--cwd", str(run_dir.resolve()),
+            "--gdb-binary", binary_in_container,
+            "--gdb-args", json.dumps([str(a) for a in gdb_args]),
+            "--step-limit", str(self.step_limit),
+            "--cost-limit", str(self.cost_limit),
+            "--docker-container", container_name,
+            "--container-cwd", "/work",
+            "--container-runtime", runtime,
+        ]
+        if self.mini_model_class:
+            runner_argv += ["--mini-model-class", self.mini_model_class]
+
+        (run_dir / "session.cmds").write_text(
+            "# Tier-2 runner invocation (mini-swe-agent v2 + bash + gdb, BugsCPP)\n"
+            f"# Docker container: {container_name} (image {image_tag})\n"
+            + " ".join(repr(a) if " " in a else a for a in runner_argv)
+            + "\n"
+        )
+
+        if not _check_mini_venv(run_dir):
+            return finalize_result(
+                run_dir, spec,
+                status="missing_dep", exit_code=-1, elapsed_s=0.0,
+            )
+
+        session = ContainerSession(
+            image=image_tag,
+            workspace_src=case.workspace_path,
+            run_dir=run_dir,
+            runtime=runtime,
+            platform="linux/amd64",
+            ptrace=True,
+            hermetic_workspace=True,
+            name=container_name,
+            env={
+                **{k: os.environ[k] for k in (
+                    "OPENROUTER_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_BASE",
+                ) if k in os.environ},
+            },
+        )
+
+        try:
+            with session:
+                write_docker_case_yaml(case, run_dir)
+                return self._spawn_runner(spec, run_dir, runner_argv, timeout=timeout)
+        except RuntimeError as e:
+            (run_dir / "docker_run.log").write_text(str(e))
+            return finalize_result(
+                run_dir, spec,
+                status="docker_run_failed", exit_code=-1, elapsed_s=0.0,
+            )
 
     # ---- injected_repo path --------------------------------------------
 

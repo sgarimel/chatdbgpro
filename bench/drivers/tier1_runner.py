@@ -405,6 +405,101 @@ def _tally_tokens(messages: list[dict]) -> tuple[int, int]:
     return p, c
 
 
+def _build_docker_environment(*, container_name: str, cwd_in_container: str,
+                              runtime: str = "docker"):
+    """Construct a mini Environment whose `.execute()` shells out to
+    `<runtime> exec` against an already-running container.
+
+    Mini's LocalEnvironment runs `subprocess.run(['bash','-c', cmd], ...)`.
+    For BugsCPP cases the agent must operate inside the per-project
+    container (where the buggy binary, its libs, and gdb live);
+    we override execute() to wrap each command in
+    `docker exec -w <cwd> <name> bash -c <cmd>` (runtime=docker)
+    or `apptainer exec --pwd <cwd> instance://<name> bash -c <cmd>`
+    (runtime=apptainer).
+
+    Mini's expected return shape includes `output`, `returncode`, AND
+    `exception_info` (StrictUndefined renders fail without it).
+    Timeouts are enforced via `subprocess.run(timeout=...)` on the
+    outer exec call.
+    """
+    import subprocess as _sp
+
+    from minisweagent.environments.local import LocalEnvironment
+
+    # Same exec-prefix table that container_session.container_exec_argv()
+    # produces, duplicated here because this runner runs in mini's venv
+    # and shouldn't import from bench.drivers (different Python).
+    PASSTHRU_ENV = {
+        "PAGER": "cat", "MANPAGER": "cat", "LESS": "-R",
+        "PIP_PROGRESS_BAR": "off", "TQDM_DISABLE": "1",
+    }
+
+    def _exec_argv(workdir: str, cmd_text: str) -> list[str]:
+        if runtime == "docker":
+            argv = ["docker", "exec", "-w", workdir]
+            for k, v in PASSTHRU_ENV.items():
+                argv += ["-e", f"{k}={v}"]
+            argv += [container_name, "bash", "-c", cmd_text]
+            return argv
+        if runtime == "apptainer":
+            cli = "apptainer"  # `singularity` would also work; CLI on adroit ships apptainer
+            argv = [cli, "exec", "--pwd", workdir]
+            for k, v in PASSTHRU_ENV.items():
+                argv += ["--env", f"{k}={v}"]
+            argv += [f"instance://{container_name}", "bash", "-c", cmd_text]
+            return argv
+        raise ValueError(f"Unknown runtime {runtime!r}")
+
+    class DockerExecEnvironment(LocalEnvironment):
+        def __init__(self):
+            super().__init__(cwd=cwd_in_container, env=dict(PASSTHRU_ENV), timeout=30)
+            self._container = container_name
+            self._cwd_in_container = cwd_in_container
+            self._runtime = runtime
+
+        def execute(self, command, cwd: str = "", *, timeout: int | None = None):
+            if isinstance(command, dict):
+                cmd_text = command.get("command") or command.get("commands") or ""
+            else:
+                cmd_text = str(command)
+            workdir = cwd or self._cwd_in_container
+            argv = _exec_argv(workdir, cmd_text)
+            t = timeout if timeout is not None else self.config.timeout
+            try:
+                cp = _sp.run(
+                    argv, capture_output=True, text=True, timeout=t,
+                    encoding="utf-8", errors="replace",
+                )
+                # Mini concatenates stdout+stderr per its LocalEnvironment
+                # convention; preserve that so the model sees diagnostics.
+                output = (cp.stdout or "") + (cp.stderr or "")
+                result = {
+                    "output": output,
+                    "returncode": cp.returncode,
+                    # Mini's jinja observation template references
+                    # `exception_info`; missing the key under
+                    # StrictUndefined raises UndefinedError and aborts
+                    # the agent loop.
+                    "exception_info": "",
+                }
+            except _sp.TimeoutExpired as e:
+                output = ""
+                if isinstance(e.stdout, (bytes, str)):
+                    output += e.stdout if isinstance(e.stdout, str) else e.stdout.decode("utf-8", "replace")
+                if isinstance(e.stderr, (bytes, str)):
+                    output += e.stderr if isinstance(e.stderr, str) else e.stderr.decode("utf-8", "replace")
+                output += f"\n[bench] command exceeded {t}s timeout — killed."
+                result = {
+                    "output": output, "returncode": -1,
+                    "exception_info": "TimeoutExpired",
+                }
+            self._check_finished(result)
+            return result
+
+    return DockerExecEnvironment()
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--run-dir", required=True, type=Path)
@@ -425,6 +520,19 @@ def main() -> int:
                         "openrouter, openrouter_textbased, openrouter_response, "
                         "portkey, portkey_response, requesty. "
                         "Empty string means auto.")
+    p.add_argument("--docker-container", default=None,
+                   help="(BugsCPP path) Run mini's bash inside this "
+                        "container (docker name or apptainer instance "
+                        "name; --container-runtime selects the CLI). "
+                        "Container is started/stopped by Tier1Driver.")
+    p.add_argument("--container-cwd", default="/work",
+                   help="(--docker-container only) Working directory inside "
+                        "the container for each exec call.")
+    p.add_argument("--container-runtime", default="docker",
+                   choices=("docker", "apptainer"),
+                   help="(--docker-container only) Runtime for the exec "
+                        "wrapper. 'docker' uses `docker exec ...`; "
+                        "'apptainer' uses `apptainer exec instance://...`.")
     args = p.parse_args()
 
     run_dir = args.run_dir.resolve()
@@ -483,18 +591,25 @@ def main() -> int:
     # logic to mini rather than reimplementing it.
     model = get_model(args.model, model_config)
 
-    env = LocalEnvironment(
-        cwd=agent_cwd,
-        env={
-            # Tame interactive helpers — same set as swebench.yaml.
-            "PAGER": "cat",
-            "MANPAGER": "cat",
-            "LESS": "-R",
-            "PIP_PROGRESS_BAR": "off",
-            "TQDM_DISABLE": "1",
-        },
-        timeout=30,
-    )
+    if args.docker_container:
+        env = _build_docker_environment(
+            container_name=args.docker_container,
+            cwd_in_container=args.container_cwd,
+            runtime=args.container_runtime,
+        )
+    else:
+        env = LocalEnvironment(
+            cwd=agent_cwd,
+            env={
+                # Tame interactive helpers — same set as swebench.yaml.
+                "PAGER": "cat",
+                "MANPAGER": "cat",
+                "LESS": "-R",
+                "PIP_PROGRESS_BAR": "off",
+                "TQDM_DISABLE": "1",
+            },
+            timeout=30,
+        )
 
     agent = DefaultAgent(
         model, env,
