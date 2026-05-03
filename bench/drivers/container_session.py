@@ -241,6 +241,12 @@ class ContainerSession:
     memory_limit: str = "4g"
     # Pids cap — same reason. Same caveat for apptainer.
     pids_limit: int = 512
+    # Apptainer-only: enable --writable-tmpfs so the container rootfs
+    # gets a tmpfs overlay (allows `apt-get install` etc. inside an
+    # otherwise read-only squashfs image). Tmpfs is wiped on instance
+    # stop. Default True since the cost is small and it makes the harness
+    # work with stock images that need on-the-fly tool installs.
+    writable_tmpfs: bool = True
 
     # --- Workspace hermeticity --------------------------------------------
     # If True, copy workspace_src to a per-run scratch dir and mount that
@@ -379,6 +385,8 @@ class ContainerSession:
         """
         cli = _apptainer_cli()
         argv: list[str] = [cli, "instance", "start"]
+        if self.writable_tmpfs:
+            argv += ["--writable-tmpfs"]
         # Bind mounts. Apptainer auto-binds $HOME, /tmp, /sys, /proc; our
         # explicit binds are layered on top.
         argv += [

@@ -37,16 +37,18 @@ def _have_apptainer() -> bool:
     return bool(shutil.which("apptainer") or shutil.which("singularity"))
 
 
-# Small lifecycle image — alpine is ~5MB, pulls fast.
+# Small lifecycle image. The official `bash:latest` is alpine-based (~12MB)
+# AND ships /bin/bash, which is what ContainerSession.exec wraps every
+# command in. Vanilla alpine has only /bin/sh and would fail every
+# `bash -c` exec.
 SMALL_IMAGE = os.environ.get(
     "BENCH_APPTAINER_SMOKE_IMAGE",
-    "docker://docker.io/library/alpine:latest",
+    "docker://docker.io/library/bash:latest",
 )
-# gdb-capable image — `docker://gcc:latest` ships gcc + gdb pre-installed
-# (Debian-based, ~1GB). Rootless apptainer can't apt-get/dnf-install
-# packages on the fly (no root inside the user-namespace container), so
-# the image must be self-sufficient. Override via env var with a custom
-# .sif path or alternative ref.
+# gdb-capable image. `docker://gcc:latest` ships gcc but NOT gdb; we
+# install gdb on the fly using --writable-tmpfs (set in
+# ContainerSession). The actual pilot uses chatdbgpro/gdb-* images
+# which already have gdb baked in.
 GDB_IMAGE = os.environ.get(
     "BENCH_APPTAINER_GDB_IMAGE",
     "docker://docker.io/library/gcc:latest",
@@ -123,11 +125,22 @@ class ApptainerSmokeTests(unittest.TestCase):
             image=GDB_IMAGE, workspace_src=ws, run_dir=run_dir,
             runtime="apptainer", ptrace=True,
         ) as s:
-            # `gcc:latest` ships gcc + gdb pre-installed.
-            check = s.exec("command -v gcc && command -v gdb", timeout=10.0)
-            if not check.ok:
+            # `gcc:latest` ships gcc but not gdb. With --writable-tmpfs
+            # (set by ContainerSession.writable_tmpfs=True), apt-get can
+            # write to the rootfs overlay and install gdb. Cost: ~10s
+            # per case for the install, but only the smoke test pays
+            # this — production runs use chatdbgpro/gdb-* with gdb baked
+            # in.
+            install = s.exec(
+                "command -v gdb || (apt-get update -qq >/dev/null 2>&1 && "
+                "apt-get install -y -qq gdb >/dev/null 2>&1 && command -v gdb)",
+                timeout=120.0,
+            )
+            if not install.ok or "gdb" not in install.stdout:
                 self.skipTest(
-                    f"image lacks gcc/gdb: {check.stdout} {check.stderr}"
+                    f"can't get gdb available in this image: "
+                    f"rc={install.returncode} stdout={install.stdout!r} "
+                    f"stderr={install.stderr!r}"
                 )
             # Compile a SEGV program. /tmp inside apptainer is bind-mounted
             # from host /tmp, so the binary is host-visible too.
