@@ -102,7 +102,7 @@ from bench.common import (
     prepare_injected_workspace,
     write_docker_case_yaml,
 )
-from bench.drivers.container_session import ContainerSession
+from bench.drivers.container_session import ContainerSession, resolve_runtime
 from bench.drivers.tier3_gdb import _run_debugger
 
 
@@ -158,11 +158,11 @@ tree is at `{workspace_host}` (it's been added via `--add-dir`).
 * To RUN the binary, run gdb, or execute anything else inside the build \
 environment, use Bash with this template:
 
-      docker exec -w /work {container_name} bash -c '<your-command-here>'
+      {exec_template}
 
   e.g.
-      docker exec -w /work {container_name} bash -c 'ls -la'
-      docker exec -w /work {container_name} bash -c 'gdb -batch -ex run -ex bt --args {trigger_argv}'
+      {exec_example_ls}
+      {exec_example_gdb}
 
   The container is dedicated to this case; it'll be torn down when this \
 session ends, so don't worry about cleanup.
@@ -415,6 +415,7 @@ class Tier4Driver:
         cost_limit: float = 0.5,
         bare: str = "auto",
         docker: bool = False,
+        runtime: str | None = None,
     ):
         self.dry_run = dry_run
         self.cost_limit = cost_limit
@@ -424,8 +425,10 @@ class Tier4Driver:
         # host (it's a Node CLI, not packaged for our amd64 Linux
         # containers); the driver opens a per-case ContainerSession and
         # bakes the container name into the task prompt so Claude's
-        # Bash tool can `docker exec` for any in-container execution.
+        # Bash tool can `<runtime> exec` for any in-container execution.
         self.docker = docker
+        # Container runtime: docker | apptainer | None=auto-resolve.
+        self.runtime = runtime
 
     # ---- main entry ----------------------------------------------------
 
@@ -572,9 +575,11 @@ class Tier4Driver:
             )
 
         # Deterministic container name; baked into the task prompt so
-        # Claude's `docker exec` calls land here.
+        # Claude's `<runtime> exec` calls land here.
         import uuid as _uuid
         container_name = f"bench-t4-{_uuid.uuid4().hex[:20]}"
+
+        runtime = resolve_runtime(self.runtime)
 
         trigger_str = (
             " ".join(case.buggy_binary_argv) if case.buggy_binary_argv
@@ -593,6 +598,7 @@ class Tier4Driver:
             image=image_tag,
             workspace_src=case.workspace_path,
             run_dir=run_dir,
+            runtime=runtime,
             platform="linux/amd64",
             ptrace=True,
             hermetic_workspace=True,
@@ -606,6 +612,30 @@ class Tier4Driver:
 
         try:
             with session:
+                # Build runtime-aware exec template so Claude's prompt
+                # shows the right CLI for the host (docker on dev Macs,
+                # apptainer on adroit/HPC). docker_exec_template gives
+                # the abstract template; we also produce two concrete
+                # examples so the model has a working pattern to copy.
+                exec_template = session.docker_exec_template(cwd="/work")
+                if runtime == "apptainer":
+                    exec_example_ls = (
+                        f"apptainer exec --pwd /work instance://{container_name} "
+                        f"bash -c 'ls -la'"
+                    )
+                    exec_example_gdb = (
+                        f"apptainer exec --pwd /work instance://{container_name} "
+                        f"bash -c 'gdb -batch -ex run -ex bt --args {trigger_str}'"
+                    )
+                else:
+                    exec_example_ls = (
+                        f"docker exec -w /work {container_name} "
+                        f"bash -c 'ls -la'"
+                    )
+                    exec_example_gdb = (
+                        f"docker exec -w /work {container_name} "
+                        f"bash -c 'gdb -batch -ex run -ex bt --args {trigger_str}'"
+                    )
                 task = BUGSCPP_TASK_TEMPLATE.format(
                     case_id=case.bug_id,
                     project=case.project,
@@ -614,6 +644,9 @@ class Tier4Driver:
                     buggy_binary=case.buggy_binary_path or "(see /work for binary)",
                     trigger_argv=trigger_str,
                     bug_observed=case.bug_observed or "(unknown)",
+                    exec_template=exec_template,
+                    exec_example_ls=exec_example_ls,
+                    exec_example_gdb=exec_example_gdb,
                 )
                 (run_dir / "task.md").write_text(task)
                 write_docker_case_yaml(case, run_dir)

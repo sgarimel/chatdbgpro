@@ -185,11 +185,18 @@ def _docker_env() -> dict:
 
 
 class DockerDriver:
-    """Run ChatDBG inside a BugsCPP Docker container at any tier."""
+    """Run ChatDBG inside a BugsCPP container at any tier.
 
-    def __init__(self, tier: int = 3, dry_run: bool = False):
+    `runtime` selects the container CLI: "docker" or "apptainer".
+    None falls through to ContainerSession's resolution logic
+    (set_default_runtime() then detect_runtime()).
+    """
+
+    def __init__(self, tier: int = 3, dry_run: bool = False,
+                 runtime: str | None = None):
         self.tier = tier
         self.dry_run = dry_run
+        self.runtime = runtime
 
     def run(self, spec: RunSpec, run_dir: Path, *, timeout: float) -> dict:
         run_dir.mkdir(parents=True, exist_ok=True)
@@ -322,7 +329,7 @@ class DockerDriver:
 
         collect_path = run_dir / "collect.json"
 
-        # ContainerSession owns the per-case Docker container — single entry
+        # ContainerSession owns the per-case container — single entry
         # point for all run/exec, hermetic workspace copy, signal-safe
         # cleanup. T1/T2/T4 BugsCPP drivers reuse the same primitive.
         session = ContainerSession(
@@ -331,6 +338,7 @@ class DockerDriver:
             run_dir=run_dir,
             run_dir_in_container="/results",  # legacy ChatDBG env-var contract
             extra_mounts=[Mount(host=REPO_DIR / "src", container="/chatdbg-src", readonly=True)],
+            runtime=self.runtime or "",
             platform="linux/amd64",
             ptrace=True,  # gdb needs ptrace
             env=container_env,

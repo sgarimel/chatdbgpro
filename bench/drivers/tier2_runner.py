@@ -545,29 +545,37 @@ def _make_dual_environment(cwd: Path, env: dict[str, str], gdb_binary: Path,
                             gdb_args: list[str], bash_timeout: int = 30,
                             gdb_command_timeout: float = 30.0,
                             docker_container: str | None = None,
-                            container_cwd: str = "/work"):
+                            container_cwd: str = "/work",
+                            runtime: str = "docker"):
     """Construct a LocalEnvironment subclass that dispatches on
     action['tool']. bash actions go through the parent class (stateless
     subprocess.run). gdb actions go through a persistent GdbSession
     held as instance state.
 
     docker_container: if set, the bash tool wraps each command in
-    `docker exec` and the gdb session itself runs `docker exec -i ...
-    gdb ...` so both tools target the same per-case container. This is
-    the BugsCPP path (T2 docker mode).
+    `<runtime> exec` and the gdb session itself runs
+    `<runtime> exec -i ... gdb ...` so both tools target the same
+    per-case container. This is the BugsCPP path (T2 docker/apptainer mode).
+    runtime: "docker" or "apptainer" — selects exec CLI conventions.
     """
     from minisweagent.environments.local import LocalEnvironment
 
     if docker_container:
-        # Docker mode: gdb runs inside the container via `docker exec`.
-        # GdbSessionConfig.command_prefix supplies the docker-exec wrap;
-        # GdbSession's existing stdin/stdout pipe protocol works
-        # unchanged because docker exec faithfully proxies the gdb
-        # subprocess's stdio.
-        gdb_command_prefix = [
-            "docker", "exec", "-i", "-w", container_cwd,
-            docker_container,
-        ]
+        # gdb subprocess prefix: `<runtime> exec -i -w/--pwd <cwd> <name>`.
+        # GdbSession's stdin/stdout pipe protocol works unchanged because
+        # both docker and apptainer exec faithfully proxy stdio.
+        if runtime == "docker":
+            gdb_command_prefix = [
+                "docker", "exec", "-i", "-w", container_cwd,
+                docker_container,
+            ]
+        elif runtime == "apptainer":
+            gdb_command_prefix = [
+                "apptainer", "exec", "--pwd", container_cwd,
+                f"instance://{docker_container}",
+            ]
+        else:
+            raise ValueError(f"Unknown runtime {runtime!r}")
     else:
         gdb_command_prefix = []
 
@@ -597,7 +605,7 @@ def _make_dual_environment(cwd: Path, env: dict[str, str], gdb_binary: Path,
             return super().execute(action, cwd=cwd_override, timeout=timeout)
 
         def _exec_in_container(self, action, cwd_override="", *, timeout=None):
-            """Bash via `docker exec` — same protocol as
+            """Bash via `<runtime> exec` — same protocol as
             tier1_runner.py:_build_docker_environment, kept inline here
             so tier2_runner stays standalone-importable in mini's venv."""
             import subprocess as _sp
@@ -606,15 +614,21 @@ def _make_dual_environment(cwd: Path, env: dict[str, str], gdb_binary: Path,
             else:
                 cmd_text = str(action)
             workdir = cwd_override or self._container_cwd
-            argv = [
-                "docker", "exec",
-                "-w", workdir,
-                "-e", "PAGER=cat",
-                "-e", "MANPAGER=cat",
-                "-e", "LESS=-R",
-                self._docker_container,
-                "bash", "-c", cmd_text,
-            ]
+            if runtime == "docker":
+                argv = ["docker", "exec", "-w", workdir]
+                for k, v in (("PAGER", "cat"), ("MANPAGER", "cat"),
+                             ("LESS", "-R")):
+                    argv += ["-e", f"{k}={v}"]
+                argv += [self._docker_container, "bash", "-c", cmd_text]
+            elif runtime == "apptainer":
+                argv = ["apptainer", "exec", "--pwd", workdir]
+                for k, v in (("PAGER", "cat"), ("MANPAGER", "cat"),
+                             ("LESS", "-R")):
+                    argv += ["--env", f"{k}={v}"]
+                argv += [f"instance://{self._docker_container}",
+                         "bash", "-c", cmd_text]
+            else:
+                raise ValueError(f"Unknown runtime {runtime!r}")
             t = timeout if timeout is not None else self.config.timeout
             try:
                 cp = _sp.run(
@@ -789,14 +803,18 @@ def main() -> int:
                         "trample mach-o builds.")
     p.add_argument("--docker-container", default=None,
                    help="(BugsCPP path) Run mini's bash AND gdb inside this "
-                        "docker container via `docker exec`. The container "
-                        "is started/stopped by Tier2Driver, NOT this runner. "
+                        "container via `<runtime> exec`. The container is "
+                        "started/stopped by Tier2Driver, NOT this runner. "
                         "--gdb-binary then names the in-container binary "
                         "path (typically /work/<rel>); --cwd should be the "
                         "host run_dir (containerized exec ignores it).")
     p.add_argument("--container-cwd", default="/work",
                    help="(--docker-container only) Working directory inside "
                         "the container for bash exec and gdb session.")
+    p.add_argument("--container-runtime", default="docker",
+                   choices=("docker", "apptainer"),
+                   help="(--docker-container only) Runtime for the exec "
+                        "wrapper. 'docker' or 'apptainer'.")
     args = p.parse_args()
 
     run_dir = args.run_dir.resolve()
@@ -861,6 +879,7 @@ def main() -> int:
         gdb_args=[str(a) for a in gdb_args],
         docker_container=args.docker_container,
         container_cwd=args.container_cwd,
+        runtime=args.container_runtime,
     )
 
     agent = DefaultAgent(

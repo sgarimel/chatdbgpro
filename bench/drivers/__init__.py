@@ -27,6 +27,10 @@ def get_driver(tier: int, *, docker: bool = False, **kwargs) -> Driver:
     or, for T3, the synthetic-runner container if containerize=True).
     """
     if docker:
+        # `runtime` propagates to every docker-mode driver so a single
+        # orchestrator-level `--runtime` setting reaches all tiers.
+        # Drivers can override per-instance via their own `runtime` arg.
+        runtime = kwargs.pop("runtime", None)
         if tier == 3:
             from bench.drivers.docker_gdb import DockerDriver
             # DockerDriver pre-dates the per-tier dispatch; it doesn't
@@ -36,25 +40,25 @@ def get_driver(tier: int, *, docker: bool = False, **kwargs) -> Driver:
             kwargs.pop("prefer_linux", None)
             kwargs.pop("step_limit", None)
             kwargs.pop("bare", None)
-            return DockerDriver(tier=tier, **kwargs)
+            return DockerDriver(tier=tier, runtime=runtime, **kwargs)
         if tier == 1:
             from bench.drivers.tier1_minisweagent import Tier1Driver
             kwargs.pop("debugger", None)
             kwargs.pop("prefer_linux", None)
             kwargs.pop("bare", None)
-            return Tier1Driver(docker=True, **kwargs)
+            return Tier1Driver(docker=True, runtime=runtime, **kwargs)
         if tier == 2:
             from bench.drivers.tier2_minisweagent import Tier2Driver
             kwargs.pop("debugger", None)
             kwargs.pop("bare", None)
-            return Tier2Driver(docker=True, **kwargs)
+            return Tier2Driver(docker=True, runtime=runtime, **kwargs)
         if tier == 4:
             from bench.drivers.tier4_claude import Tier4Driver
             kwargs.pop("debugger", None)
             kwargs.pop("mini_model_class", None)
             kwargs.pop("prefer_linux", None)
             kwargs.pop("step_limit", None)
-            return Tier4Driver(docker=True, **kwargs)
+            return Tier4Driver(docker=True, runtime=runtime, **kwargs)
         raise ValueError(f"Unknown docker tier: {tier}")
 
     if tier == 3:

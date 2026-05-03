@@ -37,7 +37,7 @@ from bench.common import (
     prepare_injected_workspace,
     write_docker_case_yaml,
 )
-from bench.drivers.container_session import ContainerSession
+from bench.drivers.container_session import ContainerSession, resolve_runtime
 from bench.drivers.tier3_gdb import _run_debugger
 
 
@@ -157,6 +157,7 @@ class Tier1Driver:
         cost_limit: float = 0.5,
         mini_model_class: str | None = None,
         docker: bool = False,
+        runtime: str | None = None,
     ):
         self.dry_run = dry_run
         self.step_limit = step_limit
@@ -171,6 +172,10 @@ class Tier1Driver:
         # which spins up a per-case ContainerSession and points mini's
         # bash sandbox at it via tier1_runner.py --docker-container.
         self.docker = docker
+        # Container runtime ("docker" / "apptainer" / None=auto). Pinned
+        # at sweep level via set_default_runtime() typically; per-driver
+        # override available here.
+        self.runtime = runtime
 
     def run(self, spec: RunSpec, run_dir: Path, *, timeout: float) -> dict:
         run_dir.mkdir(parents=True, exist_ok=True)
@@ -319,6 +324,12 @@ class Tier1Driver:
         task = _build_bugscpp_task(case)
         (run_dir / "task.md").write_text(task)
 
+        # Resolve runtime once: explicit driver setting > orchestrator
+        # default > host PATH detection. Same value goes to ContainerSession
+        # and to the mini-runner subprocess (which can't share the
+        # process-local _DEFAULT_RUNTIME).
+        runtime = resolve_runtime(self.runtime)
+
         # Mini-runner argv. Same as synthetic except the bash environment
         # is now a DockerExecEnvironment pointing at our container.
         # We pass --container-cwd=/work since the workspace lives there.
@@ -337,6 +348,7 @@ class Tier1Driver:
             "--cost-limit", str(self.cost_limit),
             "--docker-container", container_name,
             "--container-cwd", "/work",
+            "--container-runtime", runtime,
         ]
         if self.mini_model_class:
             argv += ["--mini-model-class", self.mini_model_class]
@@ -357,7 +369,8 @@ class Tier1Driver:
             image=image_tag,
             workspace_src=case.workspace_path,
             run_dir=run_dir,
-            platform="linux/amd64",
+            runtime=runtime,
+            platform="linux/amd64",  # honored by docker; ignored by apptainer
             ptrace=True,  # T1 has bash only but ptrace=True lets the
                           # model run gdb itself if it chooses to.
             hermetic_workspace=True,

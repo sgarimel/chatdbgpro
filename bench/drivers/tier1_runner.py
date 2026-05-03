@@ -405,59 +405,66 @@ def _tally_tokens(messages: list[dict]) -> tuple[int, int]:
     return p, c
 
 
-def _build_docker_environment(*, container_name: str, cwd_in_container: str):
+def _build_docker_environment(*, container_name: str, cwd_in_container: str,
+                              runtime: str = "docker"):
     """Construct a mini Environment whose `.execute()` shells out to
-    `docker exec` against an already-running container.
+    `<runtime> exec` against an already-running container.
 
     Mini's LocalEnvironment runs `subprocess.run(['bash','-c', cmd], ...)`.
     For BugsCPP cases the agent must operate inside the per-project
-    Docker container (where the buggy binary, its libs, and gdb live);
+    container (where the buggy binary, its libs, and gdb live);
     we override execute() to wrap each command in
-    `docker exec -w <cwd> <name> bash -c <cmd>`.
+    `docker exec -w <cwd> <name> bash -c <cmd>` (runtime=docker)
+    or `apptainer exec --pwd <cwd> instance://<name> bash -c <cmd>`
+    (runtime=apptainer).
 
-    Mini's expected return shape: `{"output": str, "returncode": int}`.
-    Bash command timeouts are enforced via `subprocess.run(timeout=...)`
-    on the OUTER docker exec call — when it fires we kill the docker
-    exec; the in-container process may linger briefly but the container
-    is per-case and gets nuked by the driver afterwards.
+    Mini's expected return shape includes `output`, `returncode`, AND
+    `exception_info` (StrictUndefined renders fail without it).
+    Timeouts are enforced via `subprocess.run(timeout=...)` on the
+    outer exec call.
     """
     import subprocess as _sp
 
     from minisweagent.environments.local import LocalEnvironment
 
+    # Same exec-prefix table that container_session.container_exec_argv()
+    # produces, duplicated here because this runner runs in mini's venv
+    # and shouldn't import from bench.drivers (different Python).
+    PASSTHRU_ENV = {
+        "PAGER": "cat", "MANPAGER": "cat", "LESS": "-R",
+        "PIP_PROGRESS_BAR": "off", "TQDM_DISABLE": "1",
+    }
+
+    def _exec_argv(workdir: str, cmd_text: str) -> list[str]:
+        if runtime == "docker":
+            argv = ["docker", "exec", "-w", workdir]
+            for k, v in PASSTHRU_ENV.items():
+                argv += ["-e", f"{k}={v}"]
+            argv += [container_name, "bash", "-c", cmd_text]
+            return argv
+        if runtime == "apptainer":
+            cli = "apptainer"  # `singularity` would also work; CLI on adroit ships apptainer
+            argv = [cli, "exec", "--pwd", workdir]
+            for k, v in PASSTHRU_ENV.items():
+                argv += ["--env", f"{k}={v}"]
+            argv += [f"instance://{container_name}", "bash", "-c", cmd_text]
+            return argv
+        raise ValueError(f"Unknown runtime {runtime!r}")
+
     class DockerExecEnvironment(LocalEnvironment):
         def __init__(self):
-            super().__init__(cwd=cwd_in_container, env={
-                "PAGER": "cat",
-                "MANPAGER": "cat",
-                "LESS": "-R",
-                "PIP_PROGRESS_BAR": "off",
-                "TQDM_DISABLE": "1",
-            }, timeout=30)
+            super().__init__(cwd=cwd_in_container, env=dict(PASSTHRU_ENV), timeout=30)
             self._container = container_name
             self._cwd_in_container = cwd_in_container
+            self._runtime = runtime
 
         def execute(self, command, cwd: str = "", *, timeout: int | None = None):
-            # mini calls execute(cmd_str). cmd_str is the bash one-liner
-            # the model emitted. Honor an optional cwd= override (mini
-            # uses it for per-command cd) by translating to docker
-            # exec's -w flag.
             if isinstance(command, dict):
                 cmd_text = command.get("command") or command.get("commands") or ""
             else:
                 cmd_text = str(command)
             workdir = cwd or self._cwd_in_container
-            argv = [
-                "docker", "exec",
-                "-w", workdir,
-                "-e", "PAGER=cat",
-                "-e", "MANPAGER=cat",
-                "-e", "LESS=-R",
-                "-e", "PIP_PROGRESS_BAR=off",
-                "-e", "TQDM_DISABLE=1",
-                self._container,
-                "bash", "-c", cmd_text,
-            ]
+            argv = _exec_argv(workdir, cmd_text)
             t = timeout if timeout is not None else self.config.timeout
             try:
                 cp = _sp.run(
@@ -514,14 +521,18 @@ def main() -> int:
                         "portkey, portkey_response, requesty. "
                         "Empty string means auto.")
     p.add_argument("--docker-container", default=None,
-                   help="(BugsCPP path) Run mini's bash inside this docker "
-                        "container via `docker exec`. cwd inside the "
-                        "container should match --container-cwd. The "
-                        "container is started/stopped by Tier1Driver, NOT "
-                        "by this runner.")
+                   help="(BugsCPP path) Run mini's bash inside this "
+                        "container (docker name or apptainer instance "
+                        "name; --container-runtime selects the CLI). "
+                        "Container is started/stopped by Tier1Driver.")
     p.add_argument("--container-cwd", default="/work",
                    help="(--docker-container only) Working directory inside "
-                        "the container for each docker exec call.")
+                        "the container for each exec call.")
+    p.add_argument("--container-runtime", default="docker",
+                   choices=("docker", "apptainer"),
+                   help="(--docker-container only) Runtime for the exec "
+                        "wrapper. 'docker' uses `docker exec ...`; "
+                        "'apptainer' uses `apptainer exec instance://...`.")
     args = p.parse_args()
 
     run_dir = args.run_dir.resolve()
@@ -584,6 +595,7 @@ def main() -> int:
         env = _build_docker_environment(
             container_name=args.docker_container,
             cwd_in_container=args.container_cwd,
+            runtime=args.container_runtime,
         )
     else:
         env = LocalEnvironment(

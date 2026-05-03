@@ -108,6 +108,55 @@ def _apptainer_cli() -> str:
     return shutil.which("apptainer") or shutil.which("singularity") or "apptainer"
 
 
+def resolve_runtime(explicit: str | None = None) -> str:
+    """Public helper: resolve the runtime a driver should use.
+
+    Resolution order:
+      1. `explicit` arg (caller pinned)
+      2. _DEFAULT_RUNTIME (orchestrator-set via set_default_runtime())
+      3. detect_runtime() (PATH-based auto-pick)
+
+    Driver code that spawns a subprocess needing to know the runtime
+    (mini-swe-agent runners exec'ing into the per-case container) can
+    use this to decide what --container-runtime to pass to the child.
+    """
+    return explicit or _DEFAULT_RUNTIME or detect_runtime()
+
+
+def container_exec_argv(
+    runtime: str, container_name: str, *,
+    cwd: str | None = None,
+    env: dict[str, str] | None = None,
+    interactive: bool = False,
+) -> list[str]:
+    """Build the bare-metal argv prefix for `<runtime> exec <container> ...`.
+
+    Mirrors ContainerSession._exec_prefix but works WITHOUT a live
+    session — useful for subprocess runners (tier1/tier2_runner.py) that
+    only know the container name and a runtime string. Caller appends
+    the actual command (e.g. `["bash", "-c", cmd]`).
+    """
+    if runtime == "docker":
+        prefix = ["docker", "exec"]
+        if interactive:
+            prefix.append("-i")
+        if cwd is not None:
+            prefix += ["-w", cwd]
+        for k, v in (env or {}).items():
+            prefix += ["-e", f"{k}={v}"]
+        prefix.append(container_name)
+        return prefix
+    if runtime == "apptainer":
+        prefix = [_apptainer_cli(), "exec"]
+        if cwd is not None:
+            prefix += ["--pwd", cwd]
+        for k, v in (env or {}).items():
+            prefix += ["--env", f"{k}={v}"]
+        prefix.append(f"instance://{container_name}")
+        return prefix
+    raise ValueError(f"Unknown runtime: {runtime!r}")
+
+
 def _docker_env() -> dict:
     """subprocess env for docker calls — disables Git Bash / MSYS path
     munging so bind-mount paths aren't rewritten on Windows."""

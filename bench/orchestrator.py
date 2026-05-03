@@ -34,7 +34,9 @@ from bench.common import (  # noqa: E402
 )
 from bench.drivers import get_driver  # noqa: E402
 from bench.drivers.base import Driver  # noqa: E402
-from bench.drivers.container_session import prune_sweep, set_default_sweep_label  # noqa: E402
+from bench.drivers.container_session import (  # noqa: E402
+    prune_sweep, set_default_runtime, set_default_sweep_label,
+)
 
 
 def _hardware_can_run(spec) -> tuple[bool, str]:
@@ -86,6 +88,7 @@ def _driver_for_tier(
     mini_model_class: str | None = None,
     tier2_linux: str | None = None,
     tier4_bare: str | None = None,
+    container_runtime: str | None = None,
 ) -> Driver:
     cache_key = (tier, docker)
     if cache_key in cache:
@@ -96,6 +99,8 @@ def _driver_for_tier(
             kwargs["mini_model_class"] = mini_model_class
         if tier == 4 and tier4_bare:
             kwargs["bare"] = tier4_bare
+        if container_runtime:
+            kwargs["runtime"] = container_runtime
         driver = get_driver(tier, docker=True, **kwargs)
         # Each tier now has its own docker driver (T1/T2/T4 wrap mini /
         # claude with docker exec; T3 keeps the legacy ChatDBG-in-
@@ -232,6 +237,12 @@ def main() -> int:
                         "macOS because gdb cannot run native arm64 binaries — see "
                         "bench/analysis_artifacts/HARNESS_AUDIT.md Round 5 for "
                         "validation evidence.")
+    p.add_argument("--runtime", default=None,
+                   choices=["docker", "apptainer"],
+                   help="(--docker only) Container runtime. Default = "
+                        "auto-detect (docker > apptainer on PATH). Use "
+                        "'apptainer' on HPC clusters that lack Docker (e.g. "
+                        "adroit, della).")
     args = p.parse_args()
 
     if args.docker:
@@ -276,6 +287,11 @@ def main() -> int:
     # Tag every ContainerSession spawned during this sweep so prune_sweep
     # can sweep up orphans at the end.
     set_default_sweep_label(run_name)
+    # Pin the container runtime for the sweep so every implicit
+    # ContainerSession (and its prune_sweep) targets the same backend.
+    if args.runtime:
+        set_default_runtime(args.runtime)
+        print(f"[orchestrator] runtime: {args.runtime}")
 
     specs = build_matrix(
         cases, args.models, cfgs, args.trials, args.context_lines, args.tiers,
@@ -328,6 +344,7 @@ def main() -> int:
                 mini_model_class=args.mini_model_class,
                 tier2_linux=args.tier2_linux,
                 tier4_bare=args.tier4_bare,
+                container_runtime=args.runtime,
             )
             result = driver.run(spec, run_dir, timeout=args.timeout)
         except Exception as e:

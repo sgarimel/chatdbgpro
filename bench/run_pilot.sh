@@ -52,6 +52,7 @@ NAME=""
 SKIP_JUDGE=0
 JUDGE_MODEL="openrouter/openai/gpt-4o"
 ONLY_MODELS=""
+RUNTIME=""
 
 # ───── arg parsing ──────────────────────────────────────────────────────────
 
@@ -66,6 +67,7 @@ while [[ $# -gt 0 ]]; do
         --name)          NAME="$2"; shift 2 ;;
         --skip-judge)    SKIP_JUDGE=1; shift ;;
         --judge-model)   JUDGE_MODEL="$2"; shift 2 ;;
+        --runtime)       RUNTIME="$2"; shift 2 ;;
         -h|--help)
             sed -n '2,30p' "${BASH_SOURCE[0]}"; exit 0 ;;
         *) echo "Unknown arg: $1" >&2; exit 2 ;;
@@ -247,6 +249,8 @@ if [[ ${#ALL_TIERS_NON_T4[@]} -gt 0 && ${#MODELS_OPENROUTER[@]} -gt 0 ]]; then
             *) echo "[pilot] no tool-config mapped for tier $t"; continue ;;
         esac
         echo "[pilot] sweep T$t × ${#MODELS_OPENROUTER[@]} models × ${#BUG_IDS[@]} cases (× $TRIALS trials)"
+        RUNTIME_ARGS=()
+        [[ -n "$RUNTIME" ]] && RUNTIME_ARGS=(--runtime "$RUNTIME")
         .venv-bench-39/bin/python -m bench.orchestrator \
             --models "${MODELS_OPENROUTER[@]}" \
             --tool-configs "$CFG" \
@@ -255,12 +259,15 @@ if [[ ${#ALL_TIERS_NON_T4[@]} -gt 0 && ${#MODELS_OPENROUTER[@]} -gt 0 ]]; then
             --trials "$TRIALS" \
             --timeout "$TIMEOUT" \
             --name "$SWEEP_NAME" \
-            --skip-existing
+            --skip-existing \
+            "${RUNTIME_ARGS[@]}"
     done
 fi
 
 if [[ " ${TIERS[*]} " == *" 4 "* && ${#MODELS_CLAUDE[@]} -gt 0 ]]; then
     echo "[pilot] sweep T4 × ${#MODELS_CLAUDE[@]} models × ${#BUG_IDS[@]} cases (× $TRIALS trials)"
+    RUNTIME_ARGS=()
+    [[ -n "$RUNTIME" ]] && RUNTIME_ARGS=(--runtime "$RUNTIME")
     .venv-bench-39/bin/python -m bench.orchestrator \
         --models "${MODELS_CLAUDE[@]}" \
         --tool-configs bench/configs/tier4_claude_code.json \
@@ -270,7 +277,8 @@ if [[ " ${TIERS[*]} " == *" 4 "* && ${#MODELS_CLAUDE[@]} -gt 0 ]]; then
         --timeout "$TIMEOUT" \
         --name "$SWEEP_NAME" \
         --skip-existing \
-        --tier4-bare auto
+        --tier4-bare auto \
+        "${RUNTIME_ARGS[@]}"
 fi
 
 echo "[pilot] sweep complete: $SWEEP_DIR"

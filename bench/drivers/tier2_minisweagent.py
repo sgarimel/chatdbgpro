@@ -50,7 +50,7 @@ from bench.common import (
     prepare_injected_workspace,
     write_docker_case_yaml,
 )
-from bench.drivers.container_session import ContainerSession
+from bench.drivers.container_session import ContainerSession, resolve_runtime
 from bench.drivers.tier3_gdb import _run_debugger
 
 
@@ -240,6 +240,7 @@ class Tier2Driver:
         mini_model_class: str | None = None,
         prefer_linux: str | None = None,
         docker: bool = False,
+        runtime: str | None = None,
     ):
         self.dry_run = dry_run
         self.step_limit = step_limit
@@ -251,10 +252,11 @@ class Tier2Driver:
         self._use_linux_container = _need_linux_container(prefer_linux)
         # docker=True: BugsCPP path. Driver opens a per-case
         # ContainerSession (chatdbgpro/gdb-<project>) and points both
-        # mini's bash AND the persistent gdb at it via docker exec.
+        # mini's bash AND the persistent gdb at it via <runtime> exec.
         # Distinct from `_use_linux_container` which is the macOS-host
         # workaround for synthetic + injected_repo cases.
         self.docker = docker
+        self.runtime = runtime
 
     def run(self, spec: RunSpec, run_dir: Path, *, timeout: float) -> dict:
         run_dir.mkdir(parents=True, exist_ok=True)
@@ -392,6 +394,8 @@ class Tier2Driver:
         task = _build_bugscpp_task(case, binary_in_container, gdb_args)
         (run_dir / "task.md").write_text(task)
 
+        runtime = resolve_runtime(self.runtime)
+
         import uuid as _uuid
         container_name = f"bench-t2-{_uuid.uuid4().hex[:20]}"
 
@@ -407,6 +411,7 @@ class Tier2Driver:
             "--cost-limit", str(self.cost_limit),
             "--docker-container", container_name,
             "--container-cwd", "/work",
+            "--container-runtime", runtime,
         ]
         if self.mini_model_class:
             runner_argv += ["--mini-model-class", self.mini_model_class]
@@ -428,6 +433,7 @@ class Tier2Driver:
             image=image_tag,
             workspace_src=case.workspace_path,
             run_dir=run_dir,
+            runtime=runtime,
             platform="linux/amd64",
             ptrace=True,
             hermetic_workspace=True,
