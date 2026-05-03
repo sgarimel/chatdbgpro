@@ -66,6 +66,29 @@ Skipped cells get `status=skipped_platform` so they don't pollute the
 matrix. To run the full T2/T3 BugsCPP matrix, use a Linux/amd64 host —
 the same `bench/run_pilot.sh` invocation works there with no changes.
 
+### Running on HPC clusters (adroit, della, ...) without Docker
+
+When `docker` isn't on PATH but `apptainer` (or `singularity`) is, the
+harness auto-uses the apptainer runtime. Force it explicitly with
+`--runtime apptainer`:
+
+```bash
+bench/run_pilot.sh --runtime apptainer --models haiku --tiers 1 2 3 4
+```
+
+Lifecycle differences (transparent to the model):
+
+  | Operation | docker | apptainer |
+  |---|---|---|
+  | start container | `docker run -d --rm sleep infinity` | `apptainer instance start` |
+  | run command | `docker exec -w /work N bash -c '...'` | `apptainer exec --pwd /work instance://N ...` |
+  | stop | `docker rm -f N` | `apptainer instance stop N` |
+
+Images are pulled from `ghcr.io/diodide/chatdbgpro-gdb-<project>:latest`
+on first use; apptainer caches the SIF in `~/.apptainer/cache/`. Override
+the registry namespace via `BENCH_APPTAINER_REGISTRY` if you've
+published your own.
+
 ## Custom sweeps (legacy axis-only mode)
 
 ```bash
