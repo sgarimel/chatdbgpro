@@ -42,12 +42,14 @@ SMALL_IMAGE = os.environ.get(
     "BENCH_APPTAINER_SMOKE_IMAGE",
     "docker://docker.io/library/alpine:latest",
 )
-# gdb-capable image — ubuntu:24.04 ships gdb in its package mirror; we
-# install at first run inside the container so we don't need a custom
-# .sif. ~80MB pull. Override via env var if you have a pre-built sif.
+# gdb-capable image — `docker://gcc:latest` ships gcc + gdb pre-installed
+# (Debian-based, ~1GB). Rootless apptainer can't apt-get/dnf-install
+# packages on the fly (no root inside the user-namespace container), so
+# the image must be self-sufficient. Override via env var with a custom
+# .sif path or alternative ref.
 GDB_IMAGE = os.environ.get(
     "BENCH_APPTAINER_GDB_IMAGE",
-    "docker://docker.io/library/ubuntu:24.04",
+    "docker://docker.io/library/gcc:latest",
 )
 
 
@@ -121,35 +123,26 @@ class ApptainerSmokeTests(unittest.TestCase):
             image=GDB_IMAGE, workspace_src=ws, run_dir=run_dir,
             runtime="apptainer", ptrace=True,
         ) as s:
-            # ubuntu:24.04 ships without gcc/gdb; install first.
-            install = s.exec(
-                "apt-get update -qq >/dev/null 2>&1 && "
-                "apt-get install -y -qq gcc gdb >/dev/null 2>&1; "
-                "command -v gcc && command -v gdb",
-                timeout=300.0,
-            )
-            if not install.ok:
-                # On adroit, apt won't have privileges; skip with a
-                # diagnostic. The actual pilot will use chatdbgpro/gdb-*
-                # images which already contain gdb so this isn't a
-                # regression of the harness — just of the smoke test.
+            # `gcc:latest` ships gcc + gdb pre-installed.
+            check = s.exec("command -v gcc && command -v gdb", timeout=10.0)
+            if not check.ok:
                 self.skipTest(
-                    f"can't install gcc/gdb in this image: {install.stdout}\n"
-                    f"{install.stderr}"
+                    f"image lacks gcc/gdb: {check.stdout} {check.stderr}"
                 )
-            # Compile a SEGV program.
+            # Compile a SEGV program. /tmp inside apptainer is bind-mounted
+            # from host /tmp, so the binary is host-visible too.
             compile_r = s.exec(
-                "cat > /tmp/t.c << 'EOF'\n"
+                "cat > /tmp/t_apt.c << 'EOF'\n"
                 "int main(){ int *p = 0; *p = 1; return 0; }\n"
                 "EOF\n"
-                "gcc -g /tmp/t.c -o /tmp/t",
+                "gcc -g /tmp/t_apt.c -o /tmp/t_apt",
                 timeout=30.0,
             )
             self.assertTrue(compile_r.ok, f"compile failed: {compile_r.stderr}")
             # Run gdb. ptrace works → real backtrace; ptrace blocked →
             # 'Function not implemented' (or worse).
             gdb_r = s.exec(
-                "gdb -nx -batch -ex run -ex 'bt 1' -ex quit /tmp/t 2>&1",
+                "gdb -nx -batch -ex run -ex 'bt 1' -ex quit /tmp/t_apt 2>&1",
                 timeout=30.0,
             )
             self.assertNotIn("Function not implemented", gdb_r.stdout,

@@ -397,9 +397,12 @@ class ContainerSession:
         # Env vars pass via --env K=V (apptainer ≥1.1).
         for k, v in self.env.items():
             argv += ["--env", f"{k}={v}"]
-        # Working dir for the startup script. exec's --pwd overrides this
-        # per-call; set it here for symmetry with docker -w.
-        argv += ["--pwd", self.workspace_in_container]
+        # Note: `apptainer instance start` does NOT accept --pwd (unlike
+        # `apptainer exec`). The startup process's cwd is whatever the
+        # caller's pwd was; per-exec cwd is set on each `apptainer exec
+        # --pwd ...` call (handled in _exec_prefix). The host pwd
+        # generally doesn't matter since we only use the instance for
+        # exec'ing in defined working dirs.
         # Image ref + instance name. apptainer accepts:
         #   /path/to/img.sif
         #   docker://docker.io/foo/bar:tag
