@@ -585,9 +585,18 @@ class ContainerSession:
         # apptainer exec needs no -i flag — it's always pipe-friendly.
         if cwd is not None:
             prefix += ["--pwd", cwd]
+        # Apptainer's `instance start --env K=V` does NOT propagate to
+        # subsequent `apptainer exec` calls — each exec is a fresh
+        # process with its own env. Re-pass the session-level env on
+        # every exec so the container actually sees it. Per-call env
+        # (passed via the env= arg) is layered on top.
+        merged: dict[str, str] = {}
+        if self.env:
+            merged.update(self.env)
         if env:
-            for k, v in env.items():
-                prefix += ["--env", f"{k}={v}"]
+            merged.update(env)
+        for k, v in merged.items():
+            prefix += ["--env", f"{k}={v}"]
         prefix.append(f"instance://{self.container_name}")
         return prefix
 
