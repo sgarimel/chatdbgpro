@@ -62,6 +62,12 @@ _HANDLERS_INSTALLED = False
 # any orphans. Drivers don't need to know about it.
 _DEFAULT_SWEEP_LABEL: str | None = None
 
+# Container runtime override. If set, ContainerSession uses this runtime
+# unless an instance passes `runtime=` explicitly. Set by the orchestrator
+# (or by hand on HPC clusters where docker is unavailable). Valid values:
+# "docker" or "apptainer". Falls back to auto-detect if None.
+_DEFAULT_RUNTIME: str | None = None
+
 
 def set_default_sweep_label(label: str | None) -> None:
     """Set the sweep label that subsequent ContainerSession instances
@@ -69,6 +75,37 @@ def set_default_sweep_label(label: str | None) -> None:
     orchestrator calls this once at sweep start."""
     global _DEFAULT_SWEEP_LABEL
     _DEFAULT_SWEEP_LABEL = label
+
+
+def set_default_runtime(name: str | None) -> None:
+    """Set the container runtime that subsequent ContainerSession
+    instances will use unless they pass `runtime=` explicitly.
+    Valid values: "docker", "apptainer", or None (auto-detect)."""
+    global _DEFAULT_RUNTIME
+    _DEFAULT_RUNTIME = name
+
+
+def detect_runtime() -> str:
+    """Pick a container runtime based on what's installed on PATH.
+    Preference: docker (faster on dev machines) over apptainer/singularity
+    (HPC fallback). `singularity` is treated as a synonym for `apptainer`
+    since modern singularity ships as apptainer with the legacy CLI name.
+    """
+    if shutil.which("docker"):
+        return "docker"
+    if shutil.which("apptainer") or shutil.which("singularity"):
+        return "apptainer"
+    raise RuntimeError(
+        "No container runtime found on PATH. Install docker, apptainer, "
+        "or singularity, or pass runtime= explicitly."
+    )
+
+
+def _apptainer_cli() -> str:
+    """Return the apptainer/singularity CLI on PATH. Apptainer is preferred;
+    older HPC sites still ship `singularity` (which is now an apptainer
+    alias on RHEL 9-era systems)."""
+    return shutil.which("apptainer") or shutil.which("singularity") or "apptainer"
 
 
 def _docker_env() -> dict:
@@ -149,7 +186,11 @@ class Mount:
 # sessions in a WeakSet for cleanup.
 @dataclass(eq=False)
 class ContainerSession:
-    """Configuration for a long-lived per-case Docker container.
+    """Configuration for a long-lived per-case Linux container.
+
+    Two backends, same API:
+      - runtime="docker"    — `docker run -d ... sleep infinity` + `docker exec`
+      - runtime="apptainer" — `apptainer instance start <sif>` + `apptainer exec instance://`
 
     Use as a context manager:
 
@@ -163,10 +204,21 @@ class ContainerSession:
     The container is started on __enter__ and removed on __exit__ (and
     via atexit/signal as a safety net). Do NOT cache or reuse a session
     across cases — workspace mounts are per-case.
+
+    Image refs:
+      - docker: standard docker tag, e.g. "chatdbgpro/gdb-yara:latest".
+      - apptainer: either a SIF path (`/path/to/img.sif`), a registry
+        URI (`docker://docker.io/foo/bar:tag`), or a local docker daemon
+        ref (`docker-daemon://foo/bar:tag`). The `image` field carries
+        whichever string apptainer's CLI accepts.
     """
     image: str
     workspace_src: Path
     run_dir: Path
+
+    # --- Runtime ---------------------------------------------------------
+    # "docker", "apptainer", or "" (resolve via _DEFAULT_RUNTIME or detect_runtime()).
+    runtime: str = ""
 
     # --- Mount layout ------------------------------------------------------
     # Workspace is bind-mounted at this path inside the container.
@@ -179,10 +231,15 @@ class ContainerSession:
     # --- Container behavior -----------------------------------------------
     platform: str = "linux/amd64"
     # gdb / debuggers need ptrace; seccomp must be relaxed too.
+    # Apptainer in user-namespace mode allows ptrace by default for the
+    # user's own processes — the flag still propagates so docker can do
+    # the right thing.
     ptrace: bool = False
     # Memory cap to prevent runaway model-issued processes.
+    # Apptainer doesn't enforce cgroup limits in unprivileged mode; this
+    # is silently ignored for runtime="apptainer".
     memory_limit: str = "4g"
-    # Pids cap — same reason.
+    # Pids cap — same reason. Same caveat for apptainer.
     pids_limit: int = 512
 
     # --- Workspace hermeticity --------------------------------------------
@@ -193,20 +250,22 @@ class ContainerSession:
     scratch_parent: Path | None = None
 
     # --- Identification / fleet management --------------------------------
-    # Container name. Auto-generated if None. Visible to the agent (e.g.
-    # T4's prompt mentions it for `docker exec`).
+    # Container/instance name. Auto-generated if None. Visible to the
+    # agent (T4's prompt mentions it for `docker exec` / `apptainer exec`).
     name: str | None = None
-    # Optional sweep-level label so a single `docker container prune
-    # --filter label=bench-runner=<sweep_id>` cleans the fleet.
+    # Optional sweep-level label. Docker uses --label; apptainer doesn't
+    # expose labels, so we encode it in the instance name suffix (`-l-X`)
+    # so prune_sweep can still find orphans by name pattern.
     sweep_label: str | None = None
 
-    # --- Env vars passed to `docker run` (visible to processes inside) ----
+    # --- Env vars passed to `docker run` / `apptainer instance start` -----
     env: dict[str, str] = field(default_factory=dict)
 
     # --- Internal state (filled at __enter__) -----------------------------
     _container_id: str | None = field(default=None, init=False, repr=False)
     _scratch_dir: Path | None = field(default=None, init=False, repr=False)
     _started: bool = field(default=False, init=False, repr=False)
+    _resolved_runtime: str = field(default="", init=False, repr=False)
 
     # ------------------------------------------------------------------
     def workspace_mount_path(self) -> Path:
@@ -228,12 +287,41 @@ class ContainerSession:
             raise RuntimeError("ContainerSession already started")
         _install_global_handlers()
 
+        # Resolve runtime once and pin it for the session's lifetime.
+        rt = self.runtime or _DEFAULT_RUNTIME or detect_runtime()
+        if rt not in ("docker", "apptainer"):
+            raise ValueError(f"Unknown runtime: {rt!r}")
+        self._resolved_runtime = rt
+
         if self.name is None:
-            # Docker name: alnum + - + _, max 64 chars.
-            self.name = f"bench-{uuid.uuid4().hex[:24]}"
+            # Container/instance name: alnum + - + _, ≤64 chars.
+            base = f"bench-{uuid.uuid4().hex[:24]}"
+            label = self.sweep_label or _DEFAULT_SWEEP_LABEL
+            if label and rt == "apptainer":
+                # Apptainer has no --label; encode in name so prune_sweep
+                # can match it via name pattern.
+                # Sanitize label for instance-name compatibility.
+                safe_label = "".join(c if c.isalnum() else "-" for c in label)[:30]
+                base = f"bench-{safe_label}-{uuid.uuid4().hex[:12]}"
+            self.name = base
 
         self._maybe_copy_workspace()
 
+        try:
+            if rt == "docker":
+                self._enter_docker()
+            else:
+                self._enter_apptainer()
+        except Exception:
+            self._maybe_remove_scratch()
+            raise
+
+        self._started = True
+        with _CLEANUP_LOCK:
+            _LIVE_SESSIONS.add(self)
+        return self
+
+    def _enter_docker(self) -> None:
         argv: list[str] = [
             "docker", "run", "-d", "--rm",
             "--name", self.name,
@@ -242,9 +330,6 @@ class ContainerSession:
             "--memory", self.memory_limit,
             "--pids-limit", str(self.pids_limit),
         ]
-        # Pass --platform only when non-empty. An empty string means
-        # "let docker pick the native arch" — useful for synthetic
-        # runners that need to avoid emulation.
         if self.platform:
             argv += ["--platform", self.platform]
         for mnt in self.extra_mounts:
@@ -253,21 +338,15 @@ class ContainerSession:
                 spec += ":ro"
             argv += ["-v", spec]
         if self.ptrace:
-            # gdb needs ptrace + relaxed seccomp. Without seccomp tweak
-            # the default Docker profile blocks personality(ADDR_NO_RANDOMIZE)
-            # which gdb 14 issues at attach time.
             argv += [
                 "--cap-add", "SYS_PTRACE",
                 "--security-opt", "seccomp=unconfined",
             ]
         for k, v in self.env.items():
             argv += ["-e", f"{k}={v}"]
-        # Auto-inherit the sweep-wide label if the caller didn't set one.
-        # Set by orchestrator via set_default_sweep_label() at sweep start.
         effective_label = self.sweep_label or _DEFAULT_SWEEP_LABEL
         if effective_label:
             argv += ["--label", f"bench-runner={effective_label}"]
-        # Workdir defaults to /work for ergonomics.
         argv += ["-w", self.workspace_in_container]
         argv += [self.image, "sleep", "infinity"]
 
@@ -276,17 +355,71 @@ class ContainerSession:
             timeout=120.0,
         )
         if proc.returncode != 0:
-            self._maybe_remove_scratch()
             raise RuntimeError(
                 f"docker run failed (exit {proc.returncode}):\n"
                 f"  argv: {' '.join(shlex.quote(a) for a in argv)}\n"
                 f"  stderr: {proc.stderr.strip()}"
             )
         self._container_id = (proc.stdout or "").strip()
-        self._started = True
-        with _CLEANUP_LOCK:
-            _LIVE_SESSIONS.add(self)
-        return self
+
+    def _enter_apptainer(self) -> None:
+        """Start a long-lived apptainer instance.
+
+        Apptainer's lifecycle: `apptainer instance start <image> <name>`
+        runs the image's startup script in the background; subsequent
+        `apptainer exec instance://<name> ...` calls execute commands
+        inside it. Mounts, env, and ptrace mostly map 1:1, but the
+        flags differ:
+          docker -v src:dst     →   apptainer --bind src:dst
+          docker -e K=V         →   apptainer --env K=V
+          docker -w PATH        →   apptainer --pwd PATH
+          docker --cap-add ...  →   (none — userns gives ptrace by default)
+          docker --memory ...   →   (none — only with --apply-cgroups, root only)
+          docker --label ...    →   (none — encoded in instance name)
+        """
+        cli = _apptainer_cli()
+        argv: list[str] = [cli, "instance", "start"]
+        # Bind mounts. Apptainer auto-binds $HOME, /tmp, /sys, /proc; our
+        # explicit binds are layered on top.
+        argv += [
+            "--bind",
+            f"{self.workspace_mount_path().resolve()}:{self.workspace_in_container}",
+        ]
+        argv += [
+            "--bind",
+            f"{self.run_dir.resolve()}:{self.run_dir_in_container}",
+        ]
+        for mnt in self.extra_mounts:
+            spec = f"{mnt.host.resolve()}:{mnt.container}"
+            if mnt.readonly:
+                spec += ":ro"
+            argv += ["--bind", spec]
+        # Env vars pass via --env K=V (apptainer ≥1.1).
+        for k, v in self.env.items():
+            argv += ["--env", f"{k}={v}"]
+        # Working dir for the startup script. exec's --pwd overrides this
+        # per-call; set it here for symmetry with docker -w.
+        argv += ["--pwd", self.workspace_in_container]
+        # Image ref + instance name. apptainer accepts:
+        #   /path/to/img.sif
+        #   docker://docker.io/foo/bar:tag
+        #   docker-daemon://foo/bar:tag (only if local docker daemon present)
+        argv += [self.image, self.name]
+
+        proc = subprocess.run(
+            argv, capture_output=True, text=True, env=_docker_env(),
+            timeout=300.0,  # apptainer pull from registry can take minutes
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"apptainer instance start failed (exit {proc.returncode}):\n"
+                f"  argv: {' '.join(shlex.quote(a) for a in argv)}\n"
+                f"  stderr: {proc.stderr.strip()}\n"
+                f"  stdout: {proc.stdout.strip()}"
+            )
+        # Apptainer instances aren't identified by a hash like docker; the
+        # name IS the canonical handle. Store it consistently.
+        self._container_id = self.name
 
     def _maybe_copy_workspace(self) -> None:
         if not self.hermetic_workspace:
@@ -341,13 +474,21 @@ class ContainerSession:
             self._maybe_remove_scratch()
             return
         self._started = False
+        rt = self._resolved_runtime or "docker"
         if self.name:
             try:
-                subprocess.run(
-                    ["docker", "rm", "-f", self.name],
-                    capture_output=True, text=True, env=_docker_env(),
-                    timeout=15.0,
-                )
+                if rt == "docker":
+                    subprocess.run(
+                        ["docker", "rm", "-f", self.name],
+                        capture_output=True, text=True, env=_docker_env(),
+                        timeout=15.0,
+                    )
+                else:  # apptainer
+                    subprocess.run(
+                        [_apptainer_cli(), "instance", "stop", self.name],
+                        capture_output=True, text=True, env=_docker_env(),
+                        timeout=15.0,
+                    )
             except Exception:  # noqa: BLE001
                 pass  # best effort — atexit/signal still fires
         self._maybe_remove_scratch()
@@ -416,16 +557,58 @@ class ContainerSession:
         env: dict[str, str] | None = None,
         interactive: bool = False,
     ) -> list[str]:
-        prefix = ["docker", "exec"]
-        if interactive:
-            prefix.append("-i")
+        rt = self._resolved_runtime or "docker"
+        if rt == "docker":
+            prefix = ["docker", "exec"]
+            if interactive:
+                prefix.append("-i")
+            if cwd is not None:
+                prefix += ["-w", cwd]
+            if env:
+                for k, v in env.items():
+                    prefix += ["-e", f"{k}={v}"]
+            prefix.append(self.container_name)
+            return prefix
+        # apptainer
+        prefix = [_apptainer_cli(), "exec"]
+        # apptainer exec needs no -i flag — it's always pipe-friendly.
         if cwd is not None:
-            prefix += ["-w", cwd]
+            prefix += ["--pwd", cwd]
         if env:
             for k, v in env.items():
-                prefix += ["-e", f"{k}={v}"]
-        prefix.append(self.container_name)
+                prefix += ["--env", f"{k}={v}"]
+        prefix.append(f"instance://{self.container_name}")
         return prefix
+
+    # ------------------------------------------------------------------
+    def gdb_command_prefix(
+        self, *, cwd: str | None = None,
+        env: dict[str, str] | None = None,
+    ) -> list[str]:
+        """Return the argv prefix to launch a long-lived gdb subprocess
+        inside the session. Used by T2's `GdbSessionConfig.command_prefix`
+        so the same `gdb -q -nx --args ...` invocation works under both
+        docker and apptainer.
+
+        Caller appends the gdb executable + args. Example:
+            cfg.command_prefix = session.gdb_command_prefix(cwd="/work")
+            argv = cfg.command_prefix + ["gdb", "-q", "--args", binary, ...]
+        """
+        # The prefix needs an interactive-style stdio setup. Docker needs
+        # explicit `-i`; apptainer's exec is always interactive. Reuse
+        # _exec_prefix to keep the cwd/env logic in one place.
+        return self._exec_prefix(cwd=cwd, env=env, interactive=True)
+
+    # ------------------------------------------------------------------
+    def docker_exec_template(self, *, cwd: str | None = "/work") -> str:
+        """Return a human-readable shell template for the agent's task
+        prompt, e.g. 'docker exec -w /work <name> bash -c ...' or
+        'apptainer exec --pwd /work instance://<name> bash -c ...'.
+
+        Used by T4's prompt builder so Claude's Bash tool can target the
+        container correctly regardless of runtime."""
+        prefix = self._exec_prefix(cwd=cwd, interactive=True)
+        return " ".join(shlex.quote(p) for p in prefix) + " bash -c '<cmd>'"
 
     def _run(
         self, argv: list[str], *,
@@ -467,20 +650,55 @@ class ContainerSession:
 # ---------------------------------------------------------------------------
 
 def prune_sweep(sweep_label: str) -> int:
-    """Remove every container labeled bench-runner=<sweep_label>. Useful
-    at orchestrator end as a final safety net. Returns the number of
-    containers removed."""
+    """Remove every bench-* container/instance for the given sweep.
+
+    Docker: filtered by label. Apptainer: filtered by instance-name
+    pattern (since apptainer has no labels — see _enter_apptainer's
+    note on encoding the label in the name).
+
+    Returns the total count removed across runtimes.
+    """
     if not sweep_label:
         return 0
-    r = subprocess.run(
-        ["docker", "ps", "-aq", "--filter", f"label=bench-runner={sweep_label}"],
-        capture_output=True, text=True, env=_docker_env(),
-    )
-    ids = [x for x in (r.stdout or "").split() if x]
-    if not ids:
-        return 0
-    subprocess.run(
-        ["docker", "rm", "-f", *ids],
-        capture_output=True, text=True, env=_docker_env(),
-    )
-    return len(ids)
+    removed = 0
+
+    # Docker side.
+    if shutil.which("docker"):
+        r = subprocess.run(
+            ["docker", "ps", "-aq", "--filter", f"label=bench-runner={sweep_label}"],
+            capture_output=True, text=True, env=_docker_env(),
+        )
+        ids = [x for x in (r.stdout or "").split() if x]
+        if ids:
+            subprocess.run(
+                ["docker", "rm", "-f", *ids],
+                capture_output=True, text=True, env=_docker_env(),
+            )
+            removed += len(ids)
+
+    # Apptainer side.
+    cli = shutil.which("apptainer") or shutil.which("singularity")
+    if cli:
+        # `apptainer instance list` prints columns with header. Match
+        # instance names that start with bench-<safe_label>-.
+        r = subprocess.run(
+            [cli, "instance", "list"],
+            capture_output=True, text=True, env=_docker_env(),
+        )
+        safe_label = "".join(c if c.isalnum() else "-" for c in sweep_label)[:30]
+        prefix = f"bench-{safe_label}-"
+        names: list[str] = []
+        for line in (r.stdout or "").splitlines():
+            tok = line.split()
+            if not tok:
+                continue
+            if tok[0].startswith(prefix):
+                names.append(tok[0])
+        for n in names:
+            subprocess.run(
+                [cli, "instance", "stop", n],
+                capture_output=True, text=True, env=_docker_env(),
+            )
+        removed += len(names)
+
+    return removed
