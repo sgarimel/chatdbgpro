@@ -212,10 +212,13 @@ class DockerDriver:
                 exit_code=-1, elapsed_s=0.0,
             )
 
-        # Ensure gdb-enabled Docker image exists.
+        # Ensure gdb-enabled image is available. For docker, that's a
+        # local build; for apptainer, a docker:// registry URL.
+        from bench.drivers.container_session import resolve_runtime
+        runtime = resolve_runtime(self.runtime)
         try:
             from pipeline2.ensure_image import ensure_gdb_image
-            image_tag = ensure_gdb_image(case.project)
+            image_tag = ensure_gdb_image(case.project, runtime=runtime)
         except Exception as e:
             (run_dir / "docker_build.log").write_text(str(e))
             return finalize_result(
@@ -223,7 +226,10 @@ class DockerDriver:
                 status="docker_build_failed",
                 exit_code=-1, elapsed_s=0.0,
             )
-        if image_tag != case.gdb_image:
+        # case.gdb_image is set by pipeline2/seed.py to the docker tag.
+        # In apptainer mode, ensure_gdb_image returns a docker:// URL —
+        # those legitimately differ; trust the runtime-aware return.
+        if runtime == "docker" and image_tag != case.gdb_image:
             (run_dir / "docker_build.log").write_text(
                 f"DB image {case.gdb_image!r} differs from local tag {image_tag!r}\n"
             )
@@ -338,7 +344,7 @@ class DockerDriver:
             run_dir=run_dir,
             run_dir_in_container="/results",  # legacy ChatDBG env-var contract
             extra_mounts=[Mount(host=REPO_DIR / "src", container="/chatdbg-src", readonly=True)],
-            runtime=self.runtime or "",
+            runtime=runtime,
             platform="linux/amd64",
             ptrace=True,  # gdb needs ptrace
             env=container_env,

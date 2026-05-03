@@ -301,11 +301,19 @@ class Tier1Driver:
                 status="workspace_missing", exit_code=-1, elapsed_s=0.0,
             )
 
-        # Ensure the gdb-enabled image is present (pulls from upstream
-        # base + COPYs /opt/* — usually a no-op cache hit).
+        # Resolve runtime once: explicit driver setting > orchestrator
+        # default > host PATH detection. Same value goes to ContainerSession,
+        # ensure_gdb_image (returns docker tag for docker, registry URL
+        # for apptainer), and the mini-runner subprocess (which can't
+        # share the process-local _DEFAULT_RUNTIME).
+        runtime = resolve_runtime(self.runtime)
+
+        # Ensure the gdb-enabled image is available. For docker this
+        # builds locally; for apptainer this just returns a docker://
+        # registry URL that apptainer pulls + caches on first use.
         try:
             from pipeline2.ensure_image import ensure_gdb_image
-            image_tag = ensure_gdb_image(case.project)
+            image_tag = ensure_gdb_image(case.project, runtime=runtime)
         except Exception as e:
             (run_dir / "docker_build.log").write_text(str(e))
             return finalize_result(
@@ -323,12 +331,6 @@ class Tier1Driver:
         # workspace it's looking at.
         task = _build_bugscpp_task(case)
         (run_dir / "task.md").write_text(task)
-
-        # Resolve runtime once: explicit driver setting > orchestrator
-        # default > host PATH detection. Same value goes to ContainerSession
-        # and to the mini-runner subprocess (which can't share the
-        # process-local _DEFAULT_RUNTIME).
-        runtime = resolve_runtime(self.runtime)
 
         # Mini-runner argv. Same as synthetic except the bash environment
         # is now a DockerExecEnvironment pointing at our container.

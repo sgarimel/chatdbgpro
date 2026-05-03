@@ -558,9 +558,10 @@ class Tier4Driver:
                 run_dir, spec,
                 status="workspace_missing", exit_code=-1, elapsed_s=0.0,
             )
+        runtime = resolve_runtime(self.runtime)
         try:
             from pipeline2.ensure_image import ensure_gdb_image
-            image_tag = ensure_gdb_image(case.project)
+            image_tag = ensure_gdb_image(case.project, runtime=runtime)
         except Exception as e:
             (run_dir / "docker_build.log").write_text(str(e))
             return finalize_result(
@@ -578,8 +579,6 @@ class Tier4Driver:
         # Claude's `<runtime> exec` calls land here.
         import uuid as _uuid
         container_name = f"bench-t4-{_uuid.uuid4().hex[:20]}"
-
-        runtime = resolve_runtime(self.runtime)
 
         trigger_str = (
             " ".join(case.buggy_binary_argv) if case.buggy_binary_argv

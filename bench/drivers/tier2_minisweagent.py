@@ -357,9 +357,10 @@ class Tier2Driver:
                 run_dir, spec,
                 status="workspace_missing", exit_code=-1, elapsed_s=0.0,
             )
+        runtime = resolve_runtime(self.runtime)
         try:
             from pipeline2.ensure_image import ensure_gdb_image
-            image_tag = ensure_gdb_image(case.project)
+            image_tag = ensure_gdb_image(case.project, runtime=runtime)
         except Exception as e:
             (run_dir / "docker_build.log").write_text(str(e))
             return finalize_result(
@@ -394,8 +395,7 @@ class Tier2Driver:
         task = _build_bugscpp_task(case, binary_in_container, gdb_args)
         (run_dir / "task.md").write_text(task)
 
-        runtime = resolve_runtime(self.runtime)
-
+        # `runtime` already resolved above (before ensure_gdb_image).
         import uuid as _uuid
         container_name = f"bench-t2-{_uuid.uuid4().hex[:20]}"
 
