@@ -30,14 +30,22 @@ def ensure_gdb_image(project: str, *, force: bool = False) -> str:
     tag = gdb_image_tag(project)
     if not force and _image_exists(tag):
         return tag
+    # hschoe/defects4cpp-ubuntu:<project> ships amd64 only. On arm64 Macs the
+    # build (and `docker run` later) must explicitly pin linux/amd64 — without
+    # this Docker fails to pull stage-2 FROM with "no matching manifest". The
+    # build still runs natively for stage 1 and via Rosetta/QEMU for stage 2.
     cmd = [
         "docker", "build",
+        "--platform", "linux/amd64",
         "-t", tag,
         "--build-arg", f"PROJECT={project}",
         "-f", str(DOCKERFILE),
         str(REPO_ROOT),
     ]
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
+    # Stage 1 (Python 3.11 + gdb 14.2 from source) takes ~35 min on x86 and
+    # significantly longer under emulation on Apple Silicon. Bumping timeout
+    # to 2h for the first build; stage-2-only builds finish in a few minutes.
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
     if r.returncode != 0:
         raise RuntimeError(
             f"docker build failed for {project}:\n{r.stderr[-2000:]}"

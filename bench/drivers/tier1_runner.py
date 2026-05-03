@@ -405,6 +405,94 @@ def _tally_tokens(messages: list[dict]) -> tuple[int, int]:
     return p, c
 
 
+def _build_docker_environment(*, container_name: str, cwd_in_container: str):
+    """Construct a mini Environment whose `.execute()` shells out to
+    `docker exec` against an already-running container.
+
+    Mini's LocalEnvironment runs `subprocess.run(['bash','-c', cmd], ...)`.
+    For BugsCPP cases the agent must operate inside the per-project
+    Docker container (where the buggy binary, its libs, and gdb live);
+    we override execute() to wrap each command in
+    `docker exec -w <cwd> <name> bash -c <cmd>`.
+
+    Mini's expected return shape: `{"output": str, "returncode": int}`.
+    Bash command timeouts are enforced via `subprocess.run(timeout=...)`
+    on the OUTER docker exec call — when it fires we kill the docker
+    exec; the in-container process may linger briefly but the container
+    is per-case and gets nuked by the driver afterwards.
+    """
+    import subprocess as _sp
+
+    from minisweagent.environments.local import LocalEnvironment
+
+    class DockerExecEnvironment(LocalEnvironment):
+        def __init__(self):
+            super().__init__(cwd=cwd_in_container, env={
+                "PAGER": "cat",
+                "MANPAGER": "cat",
+                "LESS": "-R",
+                "PIP_PROGRESS_BAR": "off",
+                "TQDM_DISABLE": "1",
+            }, timeout=30)
+            self._container = container_name
+            self._cwd_in_container = cwd_in_container
+
+        def execute(self, command, cwd: str = "", *, timeout: int | None = None):
+            # mini calls execute(cmd_str). cmd_str is the bash one-liner
+            # the model emitted. Honor an optional cwd= override (mini
+            # uses it for per-command cd) by translating to docker
+            # exec's -w flag.
+            if isinstance(command, dict):
+                cmd_text = command.get("command") or command.get("commands") or ""
+            else:
+                cmd_text = str(command)
+            workdir = cwd or self._cwd_in_container
+            argv = [
+                "docker", "exec",
+                "-w", workdir,
+                "-e", "PAGER=cat",
+                "-e", "MANPAGER=cat",
+                "-e", "LESS=-R",
+                "-e", "PIP_PROGRESS_BAR=off",
+                "-e", "TQDM_DISABLE=1",
+                self._container,
+                "bash", "-c", cmd_text,
+            ]
+            t = timeout if timeout is not None else self.config.timeout
+            try:
+                cp = _sp.run(
+                    argv, capture_output=True, text=True, timeout=t,
+                    encoding="utf-8", errors="replace",
+                )
+                # Mini concatenates stdout+stderr per its LocalEnvironment
+                # convention; preserve that so the model sees diagnostics.
+                output = (cp.stdout or "") + (cp.stderr or "")
+                result = {
+                    "output": output,
+                    "returncode": cp.returncode,
+                    # Mini's jinja observation template references
+                    # `exception_info`; missing the key under
+                    # StrictUndefined raises UndefinedError and aborts
+                    # the agent loop.
+                    "exception_info": "",
+                }
+            except _sp.TimeoutExpired as e:
+                output = ""
+                if isinstance(e.stdout, (bytes, str)):
+                    output += e.stdout if isinstance(e.stdout, str) else e.stdout.decode("utf-8", "replace")
+                if isinstance(e.stderr, (bytes, str)):
+                    output += e.stderr if isinstance(e.stderr, str) else e.stderr.decode("utf-8", "replace")
+                output += f"\n[bench] command exceeded {t}s timeout — killed."
+                result = {
+                    "output": output, "returncode": -1,
+                    "exception_info": "TimeoutExpired",
+                }
+            self._check_finished(result)
+            return result
+
+    return DockerExecEnvironment()
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--run-dir", required=True, type=Path)
@@ -425,6 +513,15 @@ def main() -> int:
                         "openrouter, openrouter_textbased, openrouter_response, "
                         "portkey, portkey_response, requesty. "
                         "Empty string means auto.")
+    p.add_argument("--docker-container", default=None,
+                   help="(BugsCPP path) Run mini's bash inside this docker "
+                        "container via `docker exec`. cwd inside the "
+                        "container should match --container-cwd. The "
+                        "container is started/stopped by Tier1Driver, NOT "
+                        "by this runner.")
+    p.add_argument("--container-cwd", default="/work",
+                   help="(--docker-container only) Working directory inside "
+                        "the container for each docker exec call.")
     args = p.parse_args()
 
     run_dir = args.run_dir.resolve()
@@ -483,18 +580,24 @@ def main() -> int:
     # logic to mini rather than reimplementing it.
     model = get_model(args.model, model_config)
 
-    env = LocalEnvironment(
-        cwd=agent_cwd,
-        env={
-            # Tame interactive helpers — same set as swebench.yaml.
-            "PAGER": "cat",
-            "MANPAGER": "cat",
-            "LESS": "-R",
-            "PIP_PROGRESS_BAR": "off",
-            "TQDM_DISABLE": "1",
-        },
-        timeout=30,
-    )
+    if args.docker_container:
+        env = _build_docker_environment(
+            container_name=args.docker_container,
+            cwd_in_container=args.container_cwd,
+        )
+    else:
+        env = LocalEnvironment(
+            cwd=agent_cwd,
+            env={
+                # Tame interactive helpers — same set as swebench.yaml.
+                "PAGER": "cat",
+                "MANPAGER": "cat",
+                "LESS": "-R",
+                "PIP_PROGRESS_BAR": "off",
+                "TQDM_DISABLE": "1",
+            },
+            timeout=30,
+        )
 
     agent = DefaultAgent(
         model, env,

@@ -94,12 +94,15 @@ from pathlib import Path
 
 from bench.common import (
     Case,
+    DockerCase,
     REPO_DIR,
     RunSpec,
     compile_case,
     finalize_result,
     prepare_injected_workspace,
+    write_docker_case_yaml,
 )
+from bench.drivers.container_session import ContainerSession
 from bench.drivers.tier3_gdb import _run_debugger
 
 
@@ -131,6 +134,51 @@ When done, your final response MUST include three labelled paragraphs:
   GLOBAL FIX: <structural change preventing this CLASS of bug>
 
 Do NOT modify the source file. Just investigate and produce the \
+diagnosis as your final assistant message.
+"""
+
+
+BUGSCPP_TASK_TEMPLATE = """\
+You're debugging a real-codebase bug in `{case_id}` (project `{project}`, \
+an open-source C/C++ project from the BugsC++ corpus).
+
+The buggy source tree is on the host at `{workspace_host}` and is also \
+mounted at `/work` inside a Linux/amd64 container named \
+`{container_name}` (gdb, the buggy binary, and all build deps live in \
+that container; the binary is NOT runnable on this host directly).
+
+Buggy binary inside the container: `/work/{buggy_binary}`
+Failing test invocation:           `{trigger_argv}`
+Observed behavior:                  `{bug_observed}`
+
+How to investigate
+------------------
+* To READ source code, use Read / Grep / your normal tools — the source \
+tree is at `{workspace_host}` (it's been added via `--add-dir`).
+* To RUN the binary, run gdb, or execute anything else inside the build \
+environment, use Bash with this template:
+
+      docker exec -w /work {container_name} bash -c '<your-command-here>'
+
+  e.g.
+      docker exec -w /work {container_name} bash -c 'ls -la'
+      docker exec -w /work {container_name} bash -c 'gdb -batch -ex run -ex bt --args {trigger_argv}'
+
+  The container is dedicated to this case; it'll be torn down when this \
+session ends, so don't worry about cleanup.
+
+Final answer
+------------
+Identify the root cause in the source, propose both a local fix and a \
+structural global fix.
+
+Your final response MUST include three labelled paragraphs:
+
+  ROOT CAUSE: <file:line and what is wrong>
+  LOCAL FIX:  <minimal code change>
+  GLOBAL FIX: <structural change preventing this CLASS of bug>
+
+Do NOT modify the source files on disk. Just investigate and produce the \
 diagnosis as your final assistant message.
 """
 
@@ -366,17 +414,27 @@ class Tier4Driver:
         dry_run: bool = False,
         cost_limit: float = 0.5,
         bare: str = "auto",
+        docker: bool = False,
     ):
         self.dry_run = dry_run
         self.cost_limit = cost_limit
         # bare ∈ {"auto", "always", "never"}
         self.bare = bare
+        # docker=True wires the BugsCPP path. Claude itself runs on the
+        # host (it's a Node CLI, not packaged for our amd64 Linux
+        # containers); the driver opens a per-case ContainerSession and
+        # bakes the container name into the task prompt so Claude's
+        # Bash tool can `docker exec` for any in-container execution.
+        self.docker = docker
 
     # ---- main entry ----------------------------------------------------
 
     def run(self, spec: RunSpec, run_dir: Path, *, timeout: float) -> dict:
         run_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copy(spec.case.case_dir / "case.yaml", run_dir / "case.yaml")
+        # DockerCase has no case_dir; case.yaml synthesized at finalize
+        # time by write_docker_case_yaml() inside _run_bugscpp.
+        if spec.case.kind != "docker_bugscpp":
+            shutil.copy(spec.case.case_dir / "case.yaml", run_dir / "case.yaml")
 
         if not spec.case.platform_supported():
             (run_dir / "skip.log").write_text(
@@ -452,6 +510,8 @@ class Tier4Driver:
 
         if spec.case.kind == "injected_repo":
             return self._run_injected(spec, run_dir, timeout=timeout)
+        if spec.case.kind == "docker_bugscpp":
+            return self._run_bugscpp(spec, run_dir, timeout=timeout)
         return self._run_synthetic(spec, run_dir, timeout=timeout)
 
     # ---- synthetic -----------------------------------------------------
@@ -480,6 +540,99 @@ class Tier4Driver:
         (run_dir / "task.md").write_text(task)
         return self._invoke_claude(spec, run_dir, agent_cwd=run_dir,
                                     task=task, timeout=timeout)
+
+    # ---- BugsCPP --------------------------------------------------------
+
+    def _run_bugscpp(self, spec: RunSpec, run_dir: Path, *, timeout: float) -> dict:
+        """T4 BugsCPP: Claude Code on the host with --add-dir on the
+        workspace, plus a per-case Docker container for any execution
+        the model wants to do. The task prompt teaches Claude the
+        `docker exec <name> ...` template so its existing Bash tool
+        suffices — no Claude-side modification."""
+        case: DockerCase = spec.case  # type: ignore[assignment]
+        if not case.workspace_path.exists():
+            return finalize_result(
+                run_dir, spec,
+                status="workspace_missing", exit_code=-1, elapsed_s=0.0,
+            )
+        try:
+            from pipeline2.ensure_image import ensure_gdb_image
+            image_tag = ensure_gdb_image(case.project)
+        except Exception as e:
+            (run_dir / "docker_build.log").write_text(str(e))
+            return finalize_result(
+                run_dir, spec,
+                status="docker_build_failed", exit_code=-1, elapsed_s=0.0,
+            )
+
+        if self.dry_run:
+            return finalize_result(
+                run_dir, spec,
+                status="dry_run", exit_code=0, elapsed_s=0.0,
+            )
+
+        # Deterministic container name; baked into the task prompt so
+        # Claude's `docker exec` calls land here.
+        import uuid as _uuid
+        container_name = f"bench-t4-{_uuid.uuid4().hex[:20]}"
+
+        trigger_str = (
+            " ".join(case.buggy_binary_argv) if case.buggy_binary_argv
+            else " ".join(case.trigger_argv) if case.trigger_argv
+            else "(no trigger argv recorded)"
+        )
+
+        # ContainerSession copies workspace to a per-run scratch dir so
+        # mutations (model-issued `make`, etc.) don't pollute the
+        # canonical workspace. Claude reads source from the host
+        # workspace (--add-dir below); execution is via the container.
+        # Note: that means changes Claude makes IN the container don't
+        # propagate to the host source it's reading. That's fine — we
+        # explicitly tell Claude not to modify source files.
+        session = ContainerSession(
+            image=image_tag,
+            workspace_src=case.workspace_path,
+            run_dir=run_dir,
+            platform="linux/amd64",
+            ptrace=True,
+            hermetic_workspace=True,
+            name=container_name,
+            env={
+                **{k: os.environ[k] for k in (
+                    "OPENROUTER_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_BASE",
+                ) if k in os.environ},
+            },
+        )
+
+        try:
+            with session:
+                task = BUGSCPP_TASK_TEMPLATE.format(
+                    case_id=case.bug_id,
+                    project=case.project,
+                    workspace_host=str(case.workspace_path.resolve()),
+                    container_name=container_name,
+                    buggy_binary=case.buggy_binary_path or "(see /work for binary)",
+                    trigger_argv=trigger_str,
+                    bug_observed=case.bug_observed or "(unknown)",
+                )
+                (run_dir / "task.md").write_text(task)
+                write_docker_case_yaml(case, run_dir)
+                # agent_cwd: a host directory Claude can navigate. Use
+                # the canonical workspace (read-only enough — Claude
+                # has --dangerously-skip-permissions for execution but
+                # the task says not to modify source).
+                return self._invoke_claude(
+                    spec, run_dir,
+                    agent_cwd=case.workspace_path,
+                    task=task, timeout=timeout,
+                    extra_dirs=[run_dir],
+                )
+        except RuntimeError as e:
+            (run_dir / "docker_run.log").write_text(str(e))
+            return finalize_result(
+                run_dir, spec,
+                status="docker_run_failed", exit_code=-1, elapsed_s=0.0,
+            )
 
     # ---- injected_repo --------------------------------------------------
 
@@ -666,10 +819,15 @@ class Tier4Driver:
         }
         (run_dir / "collect.json").write_text(json.dumps(collect, indent=2))
 
-        # status taxonomy aligned with the other tiers
+        # status taxonomy aligned with the other tiers. The judge only
+        # needs a non-empty response to score; a budget-exit ("error_max_
+        # budget_usd") that still produced a complete diagnosis is "ok"
+        # for grading purposes — distinguishing it from a true no_collect
+        # (Claude crashed before any reasoning) avoids dropping
+        # cost-limited cells from the pilot.
         if not events or not response.strip():
             status = "no_collect"
-        elif exit_code != 0 and not stats["completed"]:
+        elif exit_code != 0 and not stats["completed"] and not response.strip():
             status = "no_collect"
         else:
             status = "ok"

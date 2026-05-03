@@ -28,12 +28,16 @@ from pathlib import Path
 
 from bench.common import (
     Case,
+    DockerCase,
     REPO_DIR,
     RunSpec,
+    build_oracle_strings,
     compile_case,
     finalize_result,
     prepare_injected_workspace,
+    write_docker_case_yaml,
 )
+from bench.drivers.container_session import ContainerSession
 from bench.drivers.tier3_gdb import _run_debugger
 
 
@@ -74,6 +78,33 @@ def _build_synthetic_task(case: Case) -> str:
         f"Use bash to investigate (run the binary, run gdb in batch mode, "
         f"read the source). Identify the root cause and propose both a "
         f"local fix and a structural global fix.\n"
+    )
+
+
+def _build_bugscpp_task(case: DockerCase) -> str:
+    """Per-case task description for BugsCPP cases — the agent debugs an
+    open-source C/C++ project's real bug inside a Linux container with
+    the workspace mounted at /work. Mirrors the synthetic-task framing
+    so the only varying axis is case content / exec surface."""
+    binary_in = case.buggy_binary_path or "(see workspace)"
+    if case.buggy_binary_argv:
+        argv_str = " ".join(case.buggy_binary_argv)
+    else:
+        argv_str = " ".join(case.trigger_argv) if case.trigger_argv else "(none)"
+    obs = case.bug_observed or "(unknown)"
+    return (
+        f"You're debugging a real-codebase bug in `{case.bug_id}` (project "
+        f"`{case.project}`, an open-source C/C++ project from the BugsC++ "
+        f"corpus).\n\n"
+        f"You are inside a Linux/amd64 container at /work — that's the "
+        f"project's source tree with the buggy binary already built. "
+        f"Use bash to investigate: cd, ls, cat, run the binary, run gdb "
+        f"in batch mode, etc.\n\n"
+        f"The buggy binary in this case is `/work/{binary_in}`.\n"
+        f"Failing test invocation: `{argv_str}`\n"
+        f"Observed behavior: `{obs}`.\n\n"
+        f"Investigate the failure, localize the defect in the source, "
+        f"and propose both a local fix and a structural global fix.\n"
     )
 
 
@@ -125,6 +156,7 @@ class Tier1Driver:
         step_limit: int = 15,
         cost_limit: float = 0.5,
         mini_model_class: str | None = None,
+        docker: bool = False,
     ):
         self.dry_run = dry_run
         self.step_limit = step_limit
@@ -134,13 +166,21 @@ class Tier1Driver:
         # Useful escape hatch for text-only models or for explicit
         # ablations across mini's model class taxonomy.
         self.mini_model_class = mini_model_class
+        # docker=True means we're driving BugsCPP cases (kind ==
+        # "docker_bugscpp"). The driver routes through _run_bugscpp,
+        # which spins up a per-case ContainerSession and points mini's
+        # bash sandbox at it via tier1_runner.py --docker-container.
+        self.docker = docker
 
     def run(self, spec: RunSpec, run_dir: Path, *, timeout: float) -> dict:
         run_dir.mkdir(parents=True, exist_ok=True)
         # Mirror Tier3 archival: case.yaml gets a copy next to the run.
         # The judge consumes case.yaml for its criteria, so this is
-        # load-bearing (not just for human inspection).
-        shutil.copy(spec.case.case_dir / "case.yaml", run_dir / "case.yaml")
+        # load-bearing (not just for human inspection). DockerCase has
+        # no case_dir on disk; _run_bugscpp synthesizes a case.yaml at
+        # finalize time via write_docker_case_yaml().
+        if spec.case.kind != "docker_bugscpp":
+            shutil.copy(spec.case.case_dir / "case.yaml", run_dir / "case.yaml")
 
         # Platform gate (e.g. MSan on macOS) — same semantics as Tier3.
         if not spec.case.platform_supported():
@@ -154,6 +194,8 @@ class Tier1Driver:
 
         if spec.case.kind == "injected_repo":
             return self._run_injected(spec, run_dir, timeout=timeout)
+        if spec.case.kind == "docker_bugscpp":
+            return self._run_bugscpp(spec, run_dir, timeout=timeout)
         return self._run_synthetic(spec, run_dir, timeout=timeout)
 
     # ---- synthetic single-file path -------------------------------------
@@ -235,6 +277,109 @@ class Tier1Driver:
             )
 
         return self._spawn_runner(spec, run_dir, argv, timeout=timeout)
+
+    # ---- BugsCPP path --------------------------------------------------
+
+    def _run_bugscpp(self, spec: RunSpec, run_dir: Path, *, timeout: float) -> dict:
+        """T1 BugsCPP: spin up the per-project gdb container, point mini's
+        bash sandbox at it via `docker exec`, and run the same agent loop
+        we use for synthetic and injected_repo cases.
+
+        Workspace handling: ContainerSession copies the workspace to a
+        per-run scratch dir before mounting at /work, so a model that
+        runs `make` or otherwise mutates files doesn't affect later runs.
+        """
+        case: DockerCase = spec.case  # type: ignore[assignment]
+        if not case.workspace_path.exists():
+            return finalize_result(
+                run_dir, spec,
+                status="workspace_missing", exit_code=-1, elapsed_s=0.0,
+            )
+
+        # Ensure the gdb-enabled image is present (pulls from upstream
+        # base + COPYs /opt/* — usually a no-op cache hit).
+        try:
+            from pipeline2.ensure_image import ensure_gdb_image
+            image_tag = ensure_gdb_image(case.project)
+        except Exception as e:
+            (run_dir / "docker_build.log").write_text(str(e))
+            return finalize_result(
+                run_dir, spec,
+                status="docker_build_failed", exit_code=-1, elapsed_s=0.0,
+            )
+
+        if self.dry_run:
+            return finalize_result(
+                run_dir, spec,
+                status="dry_run", exit_code=0, elapsed_s=0.0,
+            )
+
+        # Task prompt is BugsCPP-specific so the model knows what
+        # workspace it's looking at.
+        task = _build_bugscpp_task(case)
+        (run_dir / "task.md").write_text(task)
+
+        # Mini-runner argv. Same as synthetic except the bash environment
+        # is now a DockerExecEnvironment pointing at our container.
+        # We pass --container-cwd=/work since the workspace lives there.
+        # The container name is set by ContainerSession; we generate it
+        # here so we can pass it to the runner.
+        import uuid as _uuid
+        container_name = f"bench-t1-{_uuid.uuid4().hex[:20]}"
+
+        argv = [
+            str(MINI_VENV_PYTHON), str(TIER1_RUNNER),
+            "--run-dir", str(run_dir.resolve()),
+            "--model", spec.model,
+            "--task-file", str((run_dir / "task.md").resolve()),
+            "--cwd", str(run_dir.resolve()),  # mini's local cwd; bash exec'd in container
+            "--step-limit", str(self.step_limit),
+            "--cost-limit", str(self.cost_limit),
+            "--docker-container", container_name,
+            "--container-cwd", "/work",
+        ]
+        if self.mini_model_class:
+            argv += ["--mini-model-class", self.mini_model_class]
+        (run_dir / "session.cmds").write_text(
+            "# Tier-1 runner invocation (mini-swe-agent v2, BugsCPP)\n"
+            f"# Docker container: {container_name} (image {image_tag})\n"
+            + " ".join(repr(a) if " " in a else a for a in argv)
+            + "\n"
+        )
+
+        if not _check_mini_venv(run_dir):
+            return finalize_result(
+                run_dir, spec,
+                status="missing_dep", exit_code=-1, elapsed_s=0.0,
+            )
+
+        session = ContainerSession(
+            image=image_tag,
+            workspace_src=case.workspace_path,
+            run_dir=run_dir,
+            platform="linux/amd64",
+            ptrace=True,  # T1 has bash only but ptrace=True lets the
+                          # model run gdb itself if it chooses to.
+            hermetic_workspace=True,
+            name=container_name,
+            env={
+                # Forward API keys for tools the model might invoke.
+                **{k: os.environ[k] for k in (
+                    "OPENROUTER_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_BASE",
+                ) if k in os.environ},
+            },
+        )
+
+        try:
+            with session:
+                write_docker_case_yaml(case, run_dir)
+                return self._spawn_runner(spec, run_dir, argv, timeout=timeout)
+        except RuntimeError as e:
+            (run_dir / "docker_run.log").write_text(str(e))
+            return finalize_result(
+                run_dir, spec,
+                status="docker_run_failed", exit_code=-1, elapsed_s=0.0,
+            )
 
     # ---- shared subprocess plumbing ------------------------------------
 
