@@ -47,6 +47,7 @@ from bench.common import (
     RunSpec,
     compile_case,
     finalize_result,
+    prepare_bugbench_workspace,
     prepare_injected_workspace,
     write_docker_case_yaml,
 )
@@ -298,6 +299,10 @@ class Tier2Driver:
         if spec.case.kind == "docker_bugscpp":
             return self._run_bugscpp(spec, run_dir, timeout=timeout)
 
+        # BugBench: native host binary, no container needed.
+        if spec.case.kind == "bugbench":
+            return self._run_bugbench(spec, run_dir, timeout=timeout)
+
         # Linux-container path (Darwin host by default, or
         # `--tier2-linux always`). gdb on macOS arm64 cannot run
         # native binaries — without this branch every gdb call from
@@ -478,6 +483,70 @@ class Tier2Driver:
             )
 
     # ---- injected_repo path --------------------------------------------
+
+    def _run_bugbench(self, spec: RunSpec, run_dir: Path, *, timeout: float) -> dict:
+        prep = prepare_bugbench_workspace(spec.case)
+        (run_dir / "compile.log").write_text(prep.log)
+        if prep.status != "ok" or prep.binary is None:
+            return finalize_result(
+                run_dir, spec,
+                status=prep.status if prep.status != "ok" else "build_failed",
+                exit_code=-1, elapsed_s=0.0,
+            )
+
+        if self.dry_run:
+            return finalize_result(
+                run_dir, spec, status="dry_run", exit_code=0, elapsed_s=0.0,
+            )
+
+        workdir = prep.workdir
+
+        # Read crash args generated at build time
+        crash_args_file = workdir / "crash_args.json"
+        crash_args = json.loads(crash_args_file.read_text()) if crash_args_file.exists() else {}
+        gdb_args = crash_args.get("args", [])
+
+        src_cfg = spec.case.meta.get("source", {})
+        bug_cfg = spec.case.meta.get("bug", {})
+        key_files = src_cfg.get("key_files", [])
+        description = spec.case.meta.get("description", "")
+
+        repro_hint = ""
+        if gdb_args:
+            shown = [a[:60] + "..." if len(a) > 60 else a for a in gdb_args]
+            repro_hint = f"Crash reproduction: `./{prep.binary.name} {' '.join(shown)}`\n"
+        stdin_path = crash_args.get("stdin_file")
+        if stdin_path:
+            repro_hint += f"Crash reproduction (stdin): `./{prep.binary.name} < crash_stdin.bin`\n"
+
+        task = (
+            f"You're debugging a bug in `{spec.case.case_id}`, a real C program "
+            f"from the BugBench benchmark suite.\n\n"
+            f"{description.strip()}\n\n"
+            f"You are in the project's source directory. The buggy binary is "
+            f"at `./{prep.binary.name}`.\n"
+            f"Key source file(s): {', '.join(key_files)}.\n\n"
+            f"{repro_hint}\n"
+            f"You have two tools: `bash` (a shell) and `gdb` (a stateful "
+            f"debugger session pre-loaded with the buggy binary). Use both "
+            f"to investigate the crash, identify the root cause, and propose "
+            f"both a local fix and a structural global fix.\n"
+        )
+        (run_dir / "task.md").write_text(task)
+        argv = self._runner_argv(spec, run_dir, agent_cwd=workdir,
+                                 gdb_binary=prep.binary, gdb_args=gdb_args)
+        (run_dir / "session.cmds").write_text(
+            "# Tier-2 runner invocation (mini-swe-agent v2 + bash + gdb, bugbench)\n"
+            + " ".join(repr(a) if " " in a else a for a in argv)
+            + "\n"
+        )
+
+        if not _check_mini_venv(run_dir):
+            return finalize_result(
+                run_dir, spec, status="missing_dep",
+                exit_code=-1, elapsed_s=0.0,
+            )
+        return self._spawn_runner(spec, run_dir, argv, timeout=timeout)
 
     def _run_injected(self, spec: RunSpec, run_dir: Path, *, timeout: float) -> dict:
         prep = prepare_injected_workspace(spec.case)

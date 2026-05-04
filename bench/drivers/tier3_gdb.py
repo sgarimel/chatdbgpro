@@ -36,6 +36,7 @@ from bench.common import (
     RunSpec,
     compile_case,
     finalize_result,
+    prepare_bugbench_workspace,
     prepare_injected_workspace,
 )
 from bench.drivers.container_session import ContainerSession, Mount
@@ -304,6 +305,9 @@ class Tier3Driver:
         if spec.case.kind == "injected_repo":
             return self._run_injected(spec, run_dir, timeout=timeout)
 
+        if spec.case.kind == "bugbench":
+            return self._run_bugbench(spec, run_dir, timeout=timeout)
+
         if self.containerize:
             return self._run_synthetic_in_container(spec, run_dir, timeout=timeout)
 
@@ -351,6 +355,14 @@ class Tier3Driver:
         if existing:
             parts.append(existing)
         env["PYTHONPATH"] = os.pathsep.join(parts)
+
+        # Check-my-work: pass case.yaml path so the CMW tool loads criteria.
+        if spec.check_my_work:
+            env["CHATDBG_CMW_CASE_YAML"] = str(run_dir / "case.yaml")
+            if spec.cmw_judge_model:
+                env["CHATDBG_CMW_JUDGE_MODEL"] = spec.cmw_judge_model
+            if spec.cmw_max_stale:
+                env["CHATDBG_CMW_MAX_STALE"] = str(spec.cmw_max_stale)
 
         if spec.case.meta.get("run", {}).get("clean_env"):
             for k in list(env.keys()):
@@ -537,6 +549,13 @@ class Tier3Driver:
             v = os.environ.get(key)
             if v:
                 container_env[key] = v
+        # Check-my-work: case.yaml is at /run/case.yaml inside container
+        if spec.check_my_work:
+            container_env["CHATDBG_CMW_CASE_YAML"] = "/run/case.yaml"
+            if spec.cmw_judge_model:
+                container_env["CHATDBG_CMW_JUDGE_MODEL"] = spec.cmw_judge_model
+            if spec.cmw_max_stale:
+                container_env["CHATDBG_CMW_MAX_STALE"] = str(spec.cmw_max_stale)
         if spec.case.meta.get("run", {}).get("clean_env"):
             for k in list(container_env.keys()):
                 if k.startswith("USER") or k in ("LOGNAME", "ADMIN_USER"):
@@ -718,6 +737,97 @@ class Tier3Driver:
             status=status, exit_code=exit_code, elapsed_s=elapsed,
         )
 
+    def _run_bugbench(self, spec: RunSpec, run_dir: Path, *, timeout: float) -> dict:
+        """Tier-3 path for `kind: bugbench` cases.
+
+        Copies BugBench source from bugbench-src/, builds with ASan,
+        then runs under lldb with ChatDBG. No Docker needed — the binary
+        runs natively on the host."""
+        prep = prepare_bugbench_workspace(spec.case)
+        (run_dir / "compile.log").write_text(prep.log)
+        if prep.status != "ok" or prep.binary is None:
+            return finalize_result(
+                run_dir, spec,
+                status=prep.status if prep.status != "ok" else "build_failed",
+                exit_code=-1, elapsed_s=0.0,
+            )
+        workdir = prep.workdir
+        binary = prep.binary
+
+        # Copy key source files to run_dir for the judge
+        for kf in spec.case.meta.get("source", {}).get("key_files", []):
+            src = workdir / kf
+            if src.exists():
+                shutil.copy(src, run_dir / src.name)
+
+        if self.dry_run:
+            return finalize_result(
+                run_dir, spec,
+                status="dry_run", exit_code=0, elapsed_s=0.0,
+            )
+
+        collect_path = run_dir / "collect.json"
+        env = self._chatdbg_env(spec, run_dir, collect_path)
+
+        # Read crash args generated at build time
+        import json as _json
+        crash_args_file = workdir / "crash_args.json"
+        crash_args = _json.loads(crash_args_file.read_text()) if crash_args_file.exists() else {}
+        args = crash_args.get("args", [])
+        stdin_path = crash_args.get("stdin_file")
+
+        # Build lldb session script
+        lines = ["command script import chatdbg.chatdbg_lldb"]
+        if args:
+            lines.append("settings set target.run-args -- "
+                         + " ".join(shlex.quote(str(a)) for a in args))
+        if stdin_path:
+            stdin_dst = run_dir / "stdin.bin"
+            shutil.copy(stdin_path, stdin_dst)
+            lines.append(f"settings set target.input-path {stdin_dst}")
+        lines.append("run")
+        lines.append(f"why {spec.question}")
+        script = "\n".join(lines) + "\n"
+        (run_dir / "session.cmds").write_text(script)
+
+        argv = [
+            lldb_binary(),
+            "-o", "settings set use-color false",
+            "-s", str(run_dir / "session.cmds"),
+            "--", str(binary),
+        ]
+
+        start = time.time()
+        try:
+            proc = subprocess.run(
+                argv,
+                stdin=subprocess.DEVNULL,
+                text=True, capture_output=True,
+                env=env, cwd=workdir, timeout=timeout,
+            )
+            status = "ok" if collect_path.exists() else "no_collect"
+            exit_code = proc.returncode
+        except subprocess.TimeoutExpired as e:
+            def _decode(x):
+                if isinstance(x, bytes):
+                    return x.decode("utf-8", errors="replace")
+                return x or ""
+            (run_dir / "stdout.log").write_text(_decode(e.stdout))
+            (run_dir / "stderr.log").write_text(_decode(e.stderr))
+            elapsed = time.time() - start
+            return finalize_result(
+                run_dir, spec,
+                status="timeout", exit_code=-1, elapsed_s=elapsed,
+            )
+
+        elapsed = time.time() - start
+        (run_dir / "stdout.log").write_text(proc.stdout or "")
+        (run_dir / "stderr.log").write_text(proc.stderr or "")
+        return finalize_result(
+            run_dir, spec,
+            status=status, exit_code=exit_code, elapsed_s=elapsed,
+        )
+
     def _chatdbg_env(self, spec: RunSpec, run_dir: Path, collect_path: Path) -> dict:
         """Build the child env dict shared by synthetic + injected runs.
 
@@ -739,4 +849,15 @@ class Tier3Driver:
         if existing:
             parts.append(existing)
         env["PYTHONPATH"] = os.pathsep.join(parts)
+
+        # Check-my-work: pass the case.yaml path so the CMW tool can
+        # load criteria at runtime. The case.yaml is already copied to
+        # run_dir by the caller.
+        if spec.check_my_work:
+            env["CHATDBG_CMW_CASE_YAML"] = str(run_dir / "case.yaml")
+            if spec.cmw_judge_model:
+                env["CHATDBG_CMW_JUDGE_MODEL"] = spec.cmw_judge_model
+            if spec.cmw_max_stale:
+                env["CHATDBG_CMW_MAX_STALE"] = str(spec.cmw_max_stale)
+
         return env

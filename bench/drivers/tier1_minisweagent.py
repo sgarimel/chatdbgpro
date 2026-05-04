@@ -34,6 +34,7 @@ from bench.common import (
     build_oracle_strings,
     compile_case,
     finalize_result,
+    prepare_bugbench_workspace,
     prepare_injected_workspace,
     write_docker_case_yaml,
 )
@@ -237,6 +238,8 @@ class Tier1Driver:
 
         if spec.case.kind == "injected_repo":
             return self._run_injected(spec, run_dir, timeout=timeout)
+        if spec.case.kind == "bugbench":
+            return self._run_bugbench(spec, run_dir, timeout=timeout)
         if spec.case.kind == "docker_bugscpp":
             return self._run_bugscpp(spec, run_dir, timeout=timeout)
         return self._run_synthetic(spec, run_dir, timeout=timeout)
@@ -309,6 +312,76 @@ class Tier1Driver:
         argv = self._runner_argv(spec, run_dir, agent_cwd=workdir)
         (run_dir / "session.cmds").write_text(
             "# Tier-1 runner invocation (mini-swe-agent v2, injected)\n"
+            + " ".join(repr(a) if " " in a else a for a in argv)
+            + "\n"
+        )
+
+        if not _check_mini_venv(run_dir):
+            return finalize_result(
+                run_dir, spec, status="missing_dep",
+                exit_code=-1, elapsed_s=0.0,
+            )
+
+        return self._spawn_runner(spec, run_dir, argv, timeout=timeout)
+
+    # ---- BugBench path -------------------------------------------------
+
+    def _run_bugbench(self, spec: RunSpec, run_dir: Path, *, timeout: float) -> dict:
+        prep = prepare_bugbench_workspace(spec.case)
+        (run_dir / "compile.log").write_text(prep.log)
+        if prep.status != "ok" or prep.binary is None:
+            return finalize_result(
+                run_dir, spec,
+                status=prep.status if prep.status != "ok" else "build_failed",
+                exit_code=-1, elapsed_s=0.0,
+            )
+
+        if self.dry_run:
+            return finalize_result(
+                run_dir, spec, status="dry_run", exit_code=0, elapsed_s=0.0,
+            )
+
+        workdir = prep.workdir
+        binary = prep.binary
+        src_cfg = spec.case.meta.get("source", {})
+        bug_cfg = spec.case.meta.get("bug", {})
+        key_files = src_cfg.get("key_files", [])
+        description = spec.case.meta.get("description", "")
+
+        # Read crash args to build a reproduction hint
+        import json as _json
+        crash_args_file = workdir / "crash_args.json"
+        crash_args = _json.loads(crash_args_file.read_text()) if crash_args_file.exists() else {}
+        repro_args = crash_args.get("args", [])
+        repro_stdin = crash_args.get("stdin_file")
+
+        repro_hint = ""
+        if repro_args:
+            # Show truncated args so the model knows the pattern
+            shown = [a[:60] + "..." if len(a) > 60 else a for a in repro_args]
+            repro_hint = f"Crash reproduction: `./{binary.name} {' '.join(shown)}`\n"
+        if repro_stdin:
+            repro_hint += f"Crash reproduction (stdin): `./{binary.name} < crash_stdin.bin`\n"
+
+        task = (
+            f"You're debugging a bug in `{spec.case.case_id}`, a real C program "
+            f"from the BugBench benchmark suite.\n\n"
+            f"{description.strip()}\n\n"
+            f"You are in the project's source directory. The buggy binary is "
+            f"at `./{binary.name}`.\n"
+            f"Key source file(s): {', '.join(key_files)}.\n\n"
+            f"{repro_hint}\n"
+            f"The binary was compiled with AddressSanitizer (-fsanitize=address). "
+            f"Running it with the crashing input will produce an ASan report "
+            f"showing the exact overflow location.\n\n"
+            f"Use bash to investigate: read the source, reproduce the crash, "
+            f"run gdb in batch mode, etc. Identify the root cause and propose "
+            f"both a local fix and a structural global fix.\n"
+        )
+        (run_dir / "task.md").write_text(task)
+        argv = self._runner_argv(spec, run_dir, agent_cwd=workdir)
+        (run_dir / "session.cmds").write_text(
+            "# Tier-1 runner invocation (mini-swe-agent v2, bugbench)\n"
             + " ".join(repr(a) if " " in a else a for a in argv)
             + "\n"
         )

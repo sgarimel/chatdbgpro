@@ -135,6 +135,10 @@ class RunSpec:
     breakpoint_at_patch: bool = False
     # B3: ask a structural-fix follow-up after the first answer.
     structural_fix_turn: bool = False
+    # Check-my-work: mid-session judge feedback loop.
+    check_my_work: bool = False
+    cmw_judge_model: str | None = None
+    cmw_max_stale: int | None = None
 
 
 def _validate_case_meta(meta: dict, case_dir: Path) -> list[str]:
@@ -170,6 +174,14 @@ def _validate_case_meta(meta: dict, case_dir: Path) -> list[str]:
             errs.append(f"{case_dir.name}: injected case missing repo.url or repo.sha")
         if not meta.get("bug", {}).get("root_cause_file"):
             errs.append(f"{case_dir.name}: injected case missing bug.root_cause_file")
+    elif kind == "bugbench":
+        src = meta.get("source", {})
+        if not src.get("dir"):
+            errs.append(f"{case_dir.name}: bugbench case missing source.dir")
+        if not src.get("build_commands"):
+            errs.append(f"{case_dir.name}: bugbench case missing source.build_commands")
+        if not src.get("binary"):
+            errs.append(f"{case_dir.name}: bugbench case missing source.binary")
     return errs
 
 
@@ -366,6 +378,103 @@ def prepare_injected_workspace(
     return InjectedPrepResult(workdir, binary_path, "ok", "".join(log))
 
 
+def prepare_bugbench_workspace(
+    case: Case, *, rebuild: bool = False,
+    cache_dir: Path | None = None,
+) -> InjectedPrepResult:
+    """Copy BugBench source from bugbench-src/ and build with ASan.
+
+    Similar to prepare_injected_workspace but uses a local directory
+    (source.dir relative to REPO_DIR) instead of cloning a git repo.
+    The buggy source is checked out at the first commit of the bugbench
+    repo (unpatched/buggy version)."""
+    src_cfg = case.meta.get("source", {})
+    src_dir_rel = src_cfg.get("dir", "")
+    src_dir = REPO_DIR / src_dir_rel
+    if not src_dir.exists():
+        return InjectedPrepResult(None, None, "build_failed",
+                                  f"bugbench source dir missing: {src_dir}\n")
+
+    binary_name = src_cfg.get("binary", "")
+    build_cmds = src_cfg.get("build_commands", [])
+
+    cache_root = cache_dir if cache_dir is not None else WORKSPACE_CACHE
+    workdir = cache_root / case.case_id
+    binary_path = workdir / binary_name if binary_name else None
+
+    import hashlib
+    cache_key_blob = json.dumps({
+        "source": src_cfg,
+    }, sort_keys=True).encode("utf-8")
+    cache_key = hashlib.sha256(cache_key_blob).hexdigest()[:16]
+    sentinel = workdir / f".prepared.{cache_key}.ok"
+
+    if sentinel.exists() and not rebuild and binary_path and binary_path.exists():
+        return InjectedPrepResult(workdir, binary_path, "ok",
+                                  f"reusing cached workspace: {workdir} (key={cache_key})\n")
+
+    if workdir.exists():
+        shutil.rmtree(workdir)
+    cache_root.mkdir(parents=True, exist_ok=True)
+
+    # Copy the entire source directory
+    shutil.copytree(src_dir, workdir)
+
+    log: list[str] = [f"copied bugbench source: {src_dir} -> {workdir}\n"]
+    def run(cmd: list[str], cwd: Path | None = None) -> int:
+        log.append("$ " + " ".join(cmd) + (f"   (cwd={cwd})" if cwd else "") + "\n")
+        cp = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+        if cp.stdout:
+            log.append(cp.stdout if cp.stdout.endswith("\n") else cp.stdout + "\n")
+        if cp.stderr:
+            log.append(cp.stderr if cp.stderr.endswith("\n") else cp.stderr + "\n")
+        return cp.returncode
+
+    for build_cmd in build_cmds:
+        if run(["bash", "-c", build_cmd], cwd=workdir) != 0:
+            return InjectedPrepResult(None, None, "build_failed", "".join(log))
+
+    if binary_path and not binary_path.exists():
+        log.append(f"build completed but binary missing: {binary_name}\n")
+        return InjectedPrepResult(None, None, "build_failed", "".join(log))
+
+    # Generate crash args file so drivers know how to trigger the bug.
+    # crash_args.json contains {"args": [...], "stdin_file": "..."}.
+    run_cfg = case.meta.get("run", {})
+    debug_cfg = case.meta.get("debug", {})
+    crash_args: dict = {}
+
+    # Generate args from script if specified
+    args_script = debug_cfg.get("args_script") or run_cfg.get("crash_args_script")
+    if args_script:
+        cp = subprocess.run(
+            ["bash", "-c", args_script], capture_output=True, text=True
+        )
+        if cp.returncode == 0 and cp.stdout.strip():
+            if debug_cfg.get("args_multiline"):
+                crash_args["args"] = cp.stdout.strip().split("\n")
+            else:
+                crash_args["args"] = cp.stdout.strip().split()
+    elif run_cfg.get("args"):
+        crash_args["args"] = run_cfg["args"]
+
+    # Copy stdin file if specified
+    stdin_rel = debug_cfg.get("stdin_file") or run_cfg.get("stdin_file")
+    if stdin_rel:
+        stdin_src = REPO_DIR / stdin_rel
+        if stdin_src.exists():
+            stdin_dst = workdir / "crash_stdin.bin"
+            shutil.copy(stdin_src, stdin_dst)
+            crash_args["stdin_file"] = str(stdin_dst)
+
+    if crash_args:
+        (workdir / "crash_args.json").write_text(json.dumps(crash_args))
+        log.append(f"wrote crash_args.json: {crash_args.get('args', ['(stdin)'])[:2]}...\n")
+
+    sentinel.write_text("")
+    return InjectedPrepResult(workdir, binary_path, "ok", "".join(log))
+
+
 def compile_case(case: Case, build_dir: Path) -> tuple[subprocess.CompletedProcess, Path]:
     build_dir.mkdir(parents=True, exist_ok=True)
     binary = build_dir / "prog"
@@ -435,6 +544,9 @@ def build_matrix(
     *,
     breakpoint_at_patch: bool = False,
     structural_fix_turn: bool = False,
+    check_my_work: bool = False,
+    cmw_judge_model: str | None = None,
+    cmw_max_stale: int | None = None,
 ) -> list[RunSpec]:
     specs: list[RunSpec] = []
     for case in cases:
@@ -450,6 +562,9 @@ def build_matrix(
                                 tier=tier,
                                 breakpoint_at_patch=breakpoint_at_patch,
                                 structural_fix_turn=structural_fix_turn,
+                                check_my_work=check_my_work,
+                                cmw_judge_model=cmw_judge_model,
+                                cmw_max_stale=cmw_max_stale,
                             ))
     return specs
 

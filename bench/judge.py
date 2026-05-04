@@ -266,6 +266,13 @@ def judge_one(
     ptok = getattr(last_usage, "prompt_tokens", None) or (last_usage.get("prompt_tokens", 0) if isinstance(last_usage, dict) else 0)
     ctok = getattr(last_usage, "completion_tokens", None) or (last_usage.get("completion_tokens", 0) if isinstance(last_usage, dict) else 0)
 
+    try:
+        cost = litellm.completion_cost(completion_response=resp)
+    except Exception:
+        # Fallback: compute from token counts manually.
+        # OpenRouter pricing for gpt-5-mini: $0.30/M in, $1.20/M out
+        cost = ptok * 0.30 / 1_000_000 + ctok * 1.20 / 1_000_000
+
     score = {
         "judge_model": judge_model,
         "elapsed_s": round(last_elapsed, 3),
@@ -273,6 +280,7 @@ def judge_one(
         "judge_output_tokens": ctok,
         "raw_judge_output": last_content,
         "judge_attempts": attempts,
+        "judge_cost_usd": round(cost, 6) if 'cost' in dir() else 0,
         "mut": meta,
     }
     if parsed is None:
@@ -332,6 +340,7 @@ def main() -> int:
     if args.limit:
         child_runs = child_runs[:args.limit]
 
+    total_cost = 0.0
     print(f"[judge] scoring {len(child_runs)} runs with {args.judge_model}")
     for i, d in enumerate(child_runs, 1):
         try:
@@ -343,12 +352,15 @@ def main() -> int:
         if score is None:
             print(f"[{i}/{len(child_runs)}] {d.name}  skipped (no source/result)")
             continue
+        run_cost = score.get("judge_cost_usd", 0.0)
+        total_cost += run_cost
         s = score.get("scores", {})
         print(f"[{i}/{len(child_runs)}] {d.name}  "
               f"rc={s.get('root_cause', 0)} "
               f"lf={s.get('local_fix', 0)} "
               f"gf={s.get('global_fix', 0)} "
-              f"({score.get('status')})")
+              f"({score.get('status')})  ${run_cost:.4f}")
+    print(f"\n[judge] total cost: ${total_cost:.4f}")
     return 0
 
 
