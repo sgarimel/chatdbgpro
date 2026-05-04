@@ -159,12 +159,30 @@ def _build_gdb_session(
     # different code path, etc.).
     for fn in PROJECT_ASSERT_BREAKS.get(project or "", []):
         lines.append(f"break {fn}")
+    # Failure-path breakpoints, but with a shell-filter: a bash wrapper
+    # script (`bash -c "echo > flag && make check"`) calls libc `exit`
+    # too — we must skip those silently or gdb stops on the inner bash
+    # before the test binary even runs (observed on yara: gdb stopped
+    # on `exit_shell()` and the model never saw a yara stack frame).
+    # Python `gdb.Breakpoint.stop()` returning False auto-continues;
+    # returning True stops as usual. The list of shell binaries is
+    # explicit so future shells just need to be added here.
     lines += [
-        # Stop on any failure-or-exit path so ChatDBG always has a frame.
-        "break abort",
-        "break __assert_fail",
-        "break exit",
-        "break _exit",
+        "python",
+        "import gdb",
+        "_BENCH_SHELL_NAMES = ('/bash', '/sh', '/dash', '/zsh', '/ash', '/ksh')",
+        "def _bench_in_shell():",
+        "    inf = gdb.selected_inferior()",
+        "    f = (inf.progspace.filename or '').lower()",
+        "    return any(s in f for s in _BENCH_SHELL_NAMES)",
+        "class _BenchFailureBreak(gdb.Breakpoint):",
+        "    def __init__(self, sym):",
+        "        super().__init__(sym, internal=False)",
+        "    def stop(self):",
+        "        return not _bench_in_shell()",
+        "for _sym in ('abort', '__assert_fail', 'exit', '_exit'):",
+        "    _BenchFailureBreak(_sym)",
+        "end",
         "source /chatdbg-src/chatdbg/chatdbg_gdb.py",
     ]
     if breakpoint_spec:
