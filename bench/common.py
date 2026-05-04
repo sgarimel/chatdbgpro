@@ -684,8 +684,12 @@ def build_oracle_strings(case: DockerCase) -> dict[str, str]:
     # corpus). Even when buggy_binary_argv is populated and we attach
     # gdb directly to the test binary, the model benefits from seeing
     # the failing-test command as the human-runnable invocation.
+    # Use plain join (NOT shlex.quote): this string is passed through
+    # apptainer's `--env` flag, whose CSV-style parser rejects bare `"`
+    # characters — and shlex.quote inserts `"` when the value contains
+    # `'` (yara's trigger does). Plain join keeps it pure single-quotes.
     if case.trigger_argv:
-        extras.append("trigger=" + shlex.quote(" ".join(case.trigger_argv)))
+        extras.append("trigger=" + " ".join(case.trigger_argv))
     if extras:
         out["CHATDBG_PROMPT_EXTRA"] = ", ".join(extras)
 
