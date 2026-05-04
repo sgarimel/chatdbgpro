@@ -86,7 +86,7 @@ Next steps (after the matrix succeeds)
 
 EOF
 
-slugs=(berry coreutils cpp_peglib cppcheck dlt_daemon exiv2 libchewing libssh libtiff libucl libxml2 md4c ndpi proj wget2 wireshark yaml_cpp yara zsh)
+slugs=(berry coreutils cpp_peglib cppcheck dlt_daemon exiv2 libchewing libssh libtiff libucl libxml2 md4c ndpi proj wget2 wireshark yara zsh)
 for s in "${slugs[@]}"; do
     echo "   https://github.com/users/$owner/packages/container/chatdbgpro-gdb-$s/settings"
 done

@@ -36,7 +36,7 @@ PATCHES_DIR = REPO_ROOT / "data" / "patches"
 WORKSPACES_DIR = REPO_ROOT / "data" / "workspaces"
 
 SKIP_PROJECTS = {"example"}
-CPP_PROJECTS = {"cpp_peglib", "cppcheck", "exiv2", "yaml_cpp"}
+CPP_PROJECTS = {"cpp_peglib", "cppcheck", "exiv2"}
 
 _SHELL_METACHARS = set("$`\\&|;<>()*?[]{}~!#")
 _ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
