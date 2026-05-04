@@ -122,30 +122,35 @@ def _build_gdb_session(
     lines = [
         "set pagination off",
         "set confirm off",
-        # Required so gdb follows into the real binary when trigger_argv is
-        # ["bash", "-c", ...] (the majority of bugscpp triggers).
+        # When the trigger is a wrapper (`bash -c "..."`, `make check`,
+        # `ctest`, ...), the buggy binary is several forks deep. Two
+        # settings keep gdb from losing track:
+        #   follow-fork-mode child      — descend into each fork's child
+        #   detach-on-fork off          — keep the parent as a tracked
+        #                                 inferior too so we don't lose
+        #                                 the bash that runs `make check`
+        #                                 after spawning a sibling for
+        #                                 `echo > flag-file && ...`
         "set follow-fork-mode child",
-        "set detach-on-fork on",
+        "set detach-on-fork off",
         # Allow breakpoints on libc symbols not yet resolved at startup.
         "set breakpoint pending on",
+        # `set follow-exec-mode new` makes each exec() spawn a fresh
+        # inferior with its own symbol table — so when the deep buggy
+        # binary loads, gdb gets the right symbols and the
+        # break-abort/exit/assert breakpoints fire inside *that* binary
+        # rather than in the bash wrapper. `catch exec` + auto-continue
+        # silently chases through the entire wrapper-script exec chain.
+        # Always-on (was previously gated on buggy_binary_path) so cases
+        # without a strace-pinpointed binary don't get gdb attached to
+        # the bash that runs `make check` and stays there forever.
+        "set follow-exec-mode new",
+        "catch exec",
+        "commands",
+        "  silent",
+        "  continue",
+        "end",
     ]
-    if buggy_binary_path:
-        # `set follow-exec-mode new` makes each exec() spawn a fresh inferior
-        # with its own symbol table — so when the deep buggy binary loads,
-        # gdb's selected inferior switches to it and the existing
-        # break-exit/abort/assert breakpoints fire inside *that* binary
-        # (with proper symbols) instead of the outer wrapper. `catch exec`
-        # logs every exec for debugging; `commands ... continue` makes the
-        # catchpoint silent (auto-resume). gdb 14 doesn't accept a path
-        # argument to `catch exec`, so we let it fire on every exec rather
-        # than filter — the auto-continue keeps it cheap.
-        lines += [
-            "set follow-exec-mode new",
-            "catch exec",
-            "commands",
-            "continue",
-            "end",
-        ]
     # Project-specific application-level breakpoints first — they fire
     # earliest on the failure path and leave the application call stack
     # fully on the stack when gdb stops, which is what the model needs to
@@ -154,12 +159,30 @@ def _build_gdb_session(
     # different code path, etc.).
     for fn in PROJECT_ASSERT_BREAKS.get(project or "", []):
         lines.append(f"break {fn}")
+    # Failure-path breakpoints, but with a shell-filter: a bash wrapper
+    # script (`bash -c "echo > flag && make check"`) calls libc `exit`
+    # too — we must skip those silently or gdb stops on the inner bash
+    # before the test binary even runs (observed on yara: gdb stopped
+    # on `exit_shell()` and the model never saw a yara stack frame).
+    # Python `gdb.Breakpoint.stop()` returning False auto-continues;
+    # returning True stops as usual. The list of shell binaries is
+    # explicit so future shells just need to be added here.
     lines += [
-        # Stop on any failure-or-exit path so ChatDBG always has a frame.
-        "break abort",
-        "break __assert_fail",
-        "break exit",
-        "break _exit",
+        "python",
+        "import gdb",
+        "_BENCH_SHELL_NAMES = ('/bash', '/sh', '/dash', '/zsh', '/ash', '/ksh')",
+        "def _bench_in_shell():",
+        "    inf = gdb.selected_inferior()",
+        "    f = (inf.progspace.filename or '').lower()",
+        "    return any(s in f for s in _BENCH_SHELL_NAMES)",
+        "class _BenchFailureBreak(gdb.Breakpoint):",
+        "    def __init__(self, sym):",
+        "        super().__init__(sym, internal=False)",
+        "    def stop(self):",
+        "        return not _bench_in_shell()",
+        "for _sym in ('abort', '__assert_fail', 'exit', '_exit'):",
+        "    _BenchFailureBreak(_sym)",
+        "end",
         "source /chatdbg-src/chatdbg/chatdbg_gdb.py",
     ]
     if breakpoint_spec:

@@ -40,6 +40,39 @@ def current_platform() -> str:
     Used to gate platform-limited cases (e.g. MSan is Linux-only)."""
     return _platform.system().lower()
 
+
+# Repo root for workspace-path resolution. bench/common.py lives at
+# REPO_ROOT/bench/common.py; .parents[1] is REPO_ROOT.
+_BENCH_REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _resolve_workspace_path(raw: str, bug_id: str, project: str,
+                            bug_index: int) -> Path:
+    """Make corpus.db's `workspace_path` portable across hosts.
+
+    The corpus was originally seeded on a Windows machine, so the DB
+    contains paths like `C:\\Users\\Owner\\OneDrive\\...\\data\\workspaces\\
+    yara-1\\yara\\buggy-1`. On Linux/macOS those resolve to non-existent
+    files and every tier returns `workspace_missing`.
+
+    Strategy: ignore the recorded prefix; reconstruct the path from
+    `bug_id`, `project`, `bug_index` against the local repo root. The
+    convention is fixed (data/workspaces/<bug_id>/<project>/buggy-<idx>)
+    so any host with the workspaces directory present works. If the
+    reconstructed path doesn't exist but the raw path does (e.g. an
+    out-of-tree workspace dir), fall back to the raw value.
+    """
+    canonical = (_BENCH_REPO_ROOT / "data" / "workspaces" /
+                 bug_id / project / f"buggy-{bug_index}")
+    if canonical.exists():
+        return canonical
+    raw_path = Path(raw)
+    if raw_path.exists():
+        return raw_path
+    # Neither resolves — return the canonical so the workspace_missing
+    # error message points at the path the user probably expected.
+    return canonical
+
 DEFAULT_QUESTION = (
     "What is the root cause of this crash? Walk through the program "
     "state, identify the defect, and propose a fix in code. Cover both "
@@ -555,7 +588,9 @@ def discover_docker_cases(
             bug_index=r["bug_index"],
             gdb_image=r["gdb_image"],
             trigger_argv=json.loads(r["trigger_argv_json"]),
-            workspace_path=Path(r["workspace_path"]),
+            workspace_path=_resolve_workspace_path(
+                r["workspace_path"], r["bug_id"], r["project"], r["bug_index"],
+            ),
             crash_signal=r["crash_signal"],
             user_frame_function=r["user_frame_function"],
             user_frame_file=r["user_frame_file"],
@@ -649,10 +684,20 @@ def build_oracle_strings(case: DockerCase) -> dict[str, str]:
     # corpus). Even when buggy_binary_argv is populated and we attach
     # gdb directly to the test binary, the model benefits from seeing
     # the failing-test command as the human-runnable invocation.
+    # Use plain join (NOT shlex.quote): this string is passed through
+    # apptainer's `--env` flag, whose CSV-style parser rejects bare `"`
+    # characters — and shlex.quote inserts `"` when the value contains
+    # `'` (yara's trigger does). Plain join keeps it pure single-quotes.
     if case.trigger_argv:
-        extras.append("trigger=" + shlex.quote(" ".join(case.trigger_argv)))
+        extras.append("trigger=" + " ".join(case.trigger_argv))
     if extras:
-        out["CHATDBG_PROMPT_EXTRA"] = ", ".join(extras)
+        # Separator is "; " not ", ": apptainer's `--env K=V` flag parses
+        # value as CSV (cobra StringToString), so every comma splits the
+        # value into a separate env entry. Empirical fallout: with `, `
+        # the container only saw CHATDBG_PROMPT_EXTRA=project=yara — the
+        # remaining language/workspace/bug_type/trigger fields were
+        # silently dropped. Semicolons aren't CSV-special.
+        out["CHATDBG_PROMPT_EXTRA"] = "; ".join(extras)
 
     return out
 

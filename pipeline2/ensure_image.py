@@ -37,9 +37,20 @@ def gdb_image_tag(project: str) -> str:
 
 
 def gdb_image_apptainer_url(project: str) -> str:
-    """docker:// URL apptainer can pull. Honors $BENCH_APPTAINER_REGISTRY
-    so a researcher running on a different namespace doesn't need a
-    code change."""
+    """Image ref apptainer can run.
+
+    Resolution order:
+      1. $BENCH_APPTAINER_SIF_DIR/gdb-<project>.sif if that file exists
+         (lets us bake extra tools — strace, etc. — into a locally-built
+         SIF without re-publishing the registry image).
+      2. docker://$BENCH_APPTAINER_REGISTRY/chatdbgpro-gdb-<project>:latest
+         (registry pull; default namespace is the publisher's).
+    """
+    sif_dir = os.environ.get("BENCH_APPTAINER_SIF_DIR")
+    if sif_dir:
+        sif = Path(os.path.expanduser(sif_dir)) / f"gdb-{project}.sif"
+        if sif.exists():
+            return str(sif)
     registry = os.environ.get("BENCH_APPTAINER_REGISTRY", DEFAULT_APPTAINER_REGISTRY)
     return f"docker://{registry}/chatdbgpro-gdb-{project}:latest"
 
