@@ -5,11 +5,10 @@ BugsC++:
 
 ```bash
 python scripts/import_external_benchmarks.py
-python bench/orchestrator.py \
+python -m bench.external_runner \
   --cases crashbench-abo1 juliet-cwe121-char-type-overrun-memcpy-01 \
   --models openrouter/moonshotai/kimi-k2.5 \
-  --tool-configs tier3_gdb_only \
-  --tiers 3 \
+  --tiers 1 2 3 \
   --trials 1
 ```
 
@@ -30,9 +29,8 @@ Chart outputs land in `bench/results/<sweep-name>/analysis/charts/`:
 
 The imported cases live under `bench/cases/external/` and are ordinary
 synthetic cases. They do not need BugsC++ project Docker images or
-`data/corpus.db`. Tier 3 runs them through the synthetic gdb runner image
-(`chatdbgpro/synthetic-runner:latest`), so the debugger surface is still gdb
-with ChatDBG loaded.
+`data/corpus.db`. Use `bench.external_runner` for them; it never passes
+through Docker and forces Tier 2/Tier 3 onto native debugger paths.
 
 ## Ready Now
 
@@ -138,15 +136,19 @@ git clone --depth 1 https://github.com/codeflaws/codeflaws.git external/benchmar
 python scripts/import_external_benchmarks.py
 ```
 
-## GDB Requirements
+## Native Requirements
 
-For local synthetic cases, the easiest path is the repo's synthetic runner:
+External cases are intentionally Docker-free. Run them from WSL/Linux for the
+full T1-T4 matrix:
 
 ```bash
-docker build -t chatdbgpro/synthetic-runner:latest \
-  -f bench/drivers/synthetic_runner.Dockerfile bench/drivers/
+sudo apt-get update
+sudo apt-get install -y build-essential clang gdb python3-venv git
+python3 -m venv .venv-bench
+.venv-bench/bin/pip install mini-swe-agent pyyaml litellm
 ```
 
-That image provides clang, ASan runtimes, gdb with Python support, and the
-ChatDBG Python dependencies. It is separate from the BugsC++
-`chatdbgpro/gdb-<project>:latest` images.
+Mac teammates can run T1, T3 via lldb, and T4 natively if they install the
+toolchain, but T2's persistent debugger tool is gdb-based. For full T1-T4
+external sweeps on macOS, use a Linux VM/remote Linux/WSL-equivalent shell
+rather than Docker.

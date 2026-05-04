@@ -92,7 +92,7 @@ def build_gdb_script(binary: Path, case: Case, question: str,
                      *, breakpoint_spec: str | None = None,
                      structural_followup: bool = False) -> str:
     args = case.meta.get("run", {}).get("args", [])
-    lines = ["source -s chatdbg.chatdbg_gdb"]
+    lines = [f"source {REPO_DIR / 'src' / 'chatdbg' / 'chatdbg_gdb.py'}"]
     if args:
         quoted = " ".join(shlex.quote(str(a)) for a in args)
         lines.append(f"set args {quoted}")
@@ -239,7 +239,7 @@ class Tier3Driver:
 
     def __init__(
         self, debugger: str = "gdb", dry_run: bool = False,
-        containerize: bool = True,
+        containerize: bool = False,
         synthetic_runner_image: str = SYNTHETIC_RUNNER_IMAGE,
     ):
         # `debugger` controls the host-mode legacy path. When
