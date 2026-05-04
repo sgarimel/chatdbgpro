@@ -170,9 +170,10 @@ ENV DEBIAN_FRONTEND=noninteractive
 # (source-highlight-dev in stage 1); libtool-bin is needed by build.py
 # for libtool wrapper handling; `patch` is already in the base.
 RUN sed -i '/kitware/d' /etc/apt/sources.list /etc/apt/sources.list.d/*.list 2>/dev/null || true \
+ && echo 'APT::Sandbox::User "root";' > /etc/apt/apt.conf.d/00sandbox-user \
  && apt-get update \
  && apt-get install -y --no-install-recommends \
-        libtool-bin patch libsource-highlight4v5 \
+        libtool-bin patch libsource-highlight4v5 strace \
  && rm -rf /var/lib/apt/lists/*
 
 # Drop in Python 3.11, gdb, and the ChatDBG venv from the builder.
