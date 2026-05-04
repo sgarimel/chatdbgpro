@@ -54,7 +54,8 @@ from bench.drivers.container_session import ContainerSession, resolve_runtime
 from bench.drivers.tier3_gdb import _run_debugger
 
 
-MINI_VENV_PYTHON = REPO_DIR / ".venv-bench" / "bin" / "python3"
+# Same dual-venv resolution as tier1; see tier1_minisweagent._resolve_mini_py.
+from bench.drivers.tier1_minisweagent import MINI_VENV_PYTHON  # noqa: E402
 TIER2_RUNNER = REPO_DIR / "bench" / "drivers" / "tier2_runner.py"
 
 # Linux-container path constants. On macOS arm64, gdb cannot run native
@@ -80,7 +81,10 @@ def _need_linux_container(prefer_linux: str | None) -> bool:
         return True
     if prefer_linux == "never":
         return False
-    return platform.system() == "Darwin"
+    # Windows: native gdb absent and `select.select` doesn't accept pipe
+    # FDs, so the LocalGdbBashEnvironment startup blows up. Always route
+    # through the Linux runner image, same logic as Darwin.
+    return platform.system() in ("Darwin", "Windows")
 
 
 def _ensure_image() -> tuple[bool, str]:
@@ -252,7 +256,7 @@ class Tier2Driver:
         self,
         *,
         dry_run: bool = False,
-        step_limit: int = 15,
+        step_limit: int = 100,
         cost_limit: float = 0.5,
         mini_model_class: str | None = None,
         prefer_linux: str | None = None,

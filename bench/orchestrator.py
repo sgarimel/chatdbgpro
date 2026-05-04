@@ -23,6 +23,16 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+# Load API keys from repo-root .env so tier 3 (which never imports litellm
+# at the orchestrator level) can still propagate them into containers.
+# Litellm autoloads its own .env when imported, but tier3's docker dispatch
+# fires before any litellm import happens.
+try:
+    import dotenv
+    dotenv.load_dotenv(_REPO_ROOT / ".env")
+except ImportError:
+    pass
+
 from bench.common import (  # noqa: E402
     CONFIGS_DIR,
     RESULTS_DIR,

@@ -147,7 +147,7 @@ mounted at `/work` inside a Linux/amd64 container named \
 `{container_name}` (gdb, the buggy binary, and all build deps live in \
 that container; the binary is NOT runnable on this host directly).
 
-Buggy binary inside the container: `/work/{buggy_binary}`
+Buggy binary inside the container: `{buggy_binary_loc}`
 Failing test invocation:           `{trigger_argv}`
 Observed behavior:                  `{bug_observed}`
 Bug type:                          `{bug_type}`
@@ -637,12 +637,21 @@ class Tier4Driver:
                         f"docker exec -w /work {container_name} "
                         f"bash -c 'gdb -batch -ex run -ex bt --args {trigger_str}'"
                     )
+                # When buggy_binary_path is None we render a sensible
+                # English fallback in place of the broken `/work/(see ...)`.
+                if case.buggy_binary_path:
+                    buggy_binary_loc = f"/work/{case.buggy_binary_path}"
+                else:
+                    buggy_binary_loc = (
+                        "(not pre-identified — find via failing-test command)"
+                    )
                 task = BUGSCPP_TASK_TEMPLATE.format(
                     case_id=case.bug_id,
                     project=case.project,
                     workspace_host=str(case.workspace_path.resolve()),
                     container_name=container_name,
-                    buggy_binary=case.buggy_binary_path or "(see /work for binary)",
+                    buggy_binary_loc=buggy_binary_loc,
+                    buggy_binary=case.buggy_binary_path or "(unknown)",
                     trigger_argv=trigger_str,
                     bug_observed=case.bug_observed or "(unknown)",
                     bug_type=case.bug_type or "unspecified",

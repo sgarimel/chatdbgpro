@@ -44,8 +44,24 @@ from bench.drivers.tier3_gdb import _run_debugger
 # Mini-swe-agent v2 lives in the bench's secondary Python venv. The
 # tier-3 driver uses .venv-bench-39 (Apple lldb pinned to Python 3.9);
 # tier 1 uses .venv-bench (Python 3.14+), where `pip install mini-swe-agent`
-# was run.
-MINI_VENV_PYTHON = REPO_DIR / ".venv-bench" / "bin" / "python3"
+# was run. On Windows the venv layout is `Scripts/python.exe`; we also
+# accept the existing `chatdbg-eval-env` venv name used on the original
+# Windows host. CHATDBG_MINI_PY env var overrides everything.
+def _resolve_mini_py() -> Path:
+    env = os.environ.get("CHATDBG_MINI_PY")
+    if env:
+        return Path(env)
+    candidates = [
+        REPO_DIR / ".venv-bench" / "bin" / "python3",
+        REPO_DIR / ".venv-bench" / "Scripts" / "python.exe",
+        REPO_DIR / "chatdbg-eval-env" / "Scripts" / "python.exe",
+        REPO_DIR / "chatdbg-eval-env" / "bin" / "python3",
+    ]
+    for c in candidates:
+        if c.exists():
+            return c
+    return candidates[0]  # report the canonical path in the error message
+MINI_VENV_PYTHON = _resolve_mini_py()
 TIER1_RUNNER = REPO_DIR / "bench" / "drivers" / "tier1_runner.py"
 
 
@@ -86,7 +102,12 @@ def _build_bugscpp_task(case: DockerCase) -> str:
     open-source C/C++ project's real bug inside a Linux container with
     the workspace mounted at /work. Mirrors the synthetic-task framing
     so the only varying axis is case content / exec surface."""
-    binary_in = case.buggy_binary_path or "(see /work for the binary)"
+    if case.buggy_binary_path:
+        binary_line = f"/work/{case.buggy_binary_path}"
+        gdb_hint = f"`gdb -batch -ex run -ex bt --args {binary_line} ...`"
+    else:
+        binary_line = "(not pre-identified — find it via the failing-test command)"
+        gdb_hint = "`gdb -batch -ex run -ex bt --args <binary> ...` (find <binary> first)"
     if case.buggy_binary_argv:
         argv_str = " ".join(case.buggy_binary_argv)
     else:
@@ -102,7 +123,7 @@ def _build_bugscpp_task(case: DockerCase) -> str:
         f"You are inside a Linux/amd64 container at /work — that's the "
         f"project's source tree with the buggy binary already built.\n\n"
         f"## What we know\n"
-        f"- Buggy binary: `/work/{binary_in}`\n"
+        f"- Buggy binary: `{binary_line}`\n"
         f"- Failing test invocation: `{argv_str}`\n"
         f"- Observed behavior: `{obs}`\n"
         f"- Bug type: `{bug_type}`\n"
@@ -110,7 +131,7 @@ def _build_bugscpp_task(case: DockerCase) -> str:
         f"## How to investigate\n"
         f"Use bash inside the container — run commands like `cd`, `ls`, "
         f"`grep -rn`, `cat`, `find`, run the binary, run gdb in batch "
-        f"mode (`gdb -batch -ex run -ex bt --args /work/{binary_in} ...`).\n\n"
+        f"mode ({gdb_hint}).\n\n"
         f"Suggested first moves:\n"
         f"1. Run the failing-test command and capture its output to "
         f"understand what fails.\n"
@@ -170,7 +191,7 @@ class Tier1Driver:
         self,
         *,
         dry_run: bool = False,
-        step_limit: int = 15,
+        step_limit: int = 100,
         cost_limit: float = 0.5,
         mini_model_class: str | None = None,
         docker: bool = False,
