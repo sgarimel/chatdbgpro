@@ -104,7 +104,16 @@ def preflight(cases, tiers: list[int], *, dry_run: bool) -> list[str]:
     return problems
 
 
-def build_specs(cases, tiers, models, tier4_models, trials, context_lines):
+def _resolve_config_path(value: str) -> Path:
+    path = Path(value)
+    if not path.is_absolute():
+        path = CONFIGS_DIR / value
+    if not path.exists():
+        raise FileNotFoundError(f"Tool config not found: {path}")
+    return path
+
+
+def build_specs(cases, tiers, models, tier4_models, trials, context_lines, tier_config):
     specs: list[RunSpec] = []
     for case in cases:
         for tier in tiers:
@@ -115,7 +124,7 @@ def build_specs(cases, tiers, models, tier4_models, trials, context_lines):
                         specs.append(RunSpec(
                             case=case,
                             model=model,
-                            tool_config_path=TIER_CONFIG[tier],
+                            tool_config_path=tier_config[tier],
                             trial=trial,
                             context_lines=ctx,
                             tier=tier,
@@ -182,6 +191,11 @@ def main() -> int:
     parser.add_argument("--strict-schema", action="store_true")
     parser.add_argument("--debugger", choices=("gdb", "lldb"), default=None,
                         help="Force T3 debugger. Default: autodetect.")
+    parser.add_argument("--tier3-config", default=TIER_CONFIG[3].name,
+                        help=(
+                            "Tool config for Tier 3, as a bench/configs filename "
+                            "or absolute path. Default: tier3_gdb_only.json."
+                        ))
     parser.add_argument("--mini-model-class", default=None)
     parser.add_argument("--tier4-bare", default="auto",
                         choices=("auto", "always", "never"))
@@ -207,6 +221,13 @@ def main() -> int:
     out_root = RESULTS_DIR / run_name
     out_root.mkdir(parents=True, exist_ok=True)
 
+    tier_config = dict(TIER_CONFIG)
+    try:
+        tier_config[3] = _resolve_config_path(args.tier3_config)
+    except FileNotFoundError as exc:
+        sys.stderr.write(f"[external_runner] {exc}\n")
+        return 2
+
     specs = build_specs(
         cases,
         args.tiers,
@@ -214,9 +235,12 @@ def main() -> int:
         args.tier4_models or [],
         args.trials,
         args.context_lines,
+        tier_config,
     )
     print(f"[external_runner] {len(specs)} native runs -> {out_root}")
     print("[external_runner] Docker is disabled for this runner.")
+    if 3 in args.tiers:
+        print(f"[external_runner] T3 tool config: {tier_config[3]}")
 
     driver_cache: dict = {}
     index: list[dict] = []
