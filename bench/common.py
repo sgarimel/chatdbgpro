@@ -645,6 +645,12 @@ def build_oracle_strings(case: DockerCase) -> dict[str, str]:
     extras.append("workspace=/work")
     if case.bug_type:
         extras.append(f"bug_type={case.bug_type}")
+    # Surface the trigger command (the bash wrapper as recorded in the
+    # corpus). Even when buggy_binary_argv is populated and we attach
+    # gdb directly to the test binary, the model benefits from seeing
+    # the failing-test command as the human-runnable invocation.
+    if case.trigger_argv:
+        extras.append("trigger=" + shlex.quote(" ".join(case.trigger_argv)))
     if extras:
         out["CHATDBG_PROMPT_EXTRA"] = ", ".join(extras)
 

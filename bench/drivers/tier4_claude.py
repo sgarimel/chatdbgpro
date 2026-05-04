@@ -150,6 +150,8 @@ that container; the binary is NOT runnable on this host directly).
 Buggy binary inside the container: `/work/{buggy_binary}`
 Failing test invocation:           `{trigger_argv}`
 Observed behavior:                  `{bug_observed}`
+Bug type:                          `{bug_type}`
+Language:                          `{language}`
 
 How to investigate
 ------------------
@@ -643,6 +645,8 @@ class Tier4Driver:
                     buggy_binary=case.buggy_binary_path or "(see /work for binary)",
                     trigger_argv=trigger_str,
                     bug_observed=case.bug_observed or "(unknown)",
+                    bug_type=case.bug_type or "unspecified",
+                    language=case.db_language or "c",
                     exec_template=exec_template,
                     exec_example_ls=exec_example_ls,
                     exec_example_gdb=exec_example_gdb,

@@ -86,23 +86,40 @@ def _build_bugscpp_task(case: DockerCase) -> str:
     open-source C/C++ project's real bug inside a Linux container with
     the workspace mounted at /work. Mirrors the synthetic-task framing
     so the only varying axis is case content / exec surface."""
-    binary_in = case.buggy_binary_path or "(see workspace)"
+    binary_in = case.buggy_binary_path or "(see /work for the binary)"
     if case.buggy_binary_argv:
         argv_str = " ".join(case.buggy_binary_argv)
     else:
         argv_str = " ".join(case.trigger_argv) if case.trigger_argv else "(none)"
     obs = case.bug_observed or "(unknown)"
+    lang = case.db_language or "c"
+    bug_type = case.bug_type or "unspecified"
+    src_ext = "c" if lang == "c" else ("cpp" if lang in ("cpp", "c++") else lang)
     return (
         f"You're debugging a real-codebase bug in `{case.bug_id}` (project "
         f"`{case.project}`, an open-source C/C++ project from the BugsC++ "
         f"corpus).\n\n"
         f"You are inside a Linux/amd64 container at /work — that's the "
-        f"project's source tree with the buggy binary already built. "
-        f"Use bash to investigate: cd, ls, cat, run the binary, run gdb "
-        f"in batch mode, etc.\n\n"
-        f"The buggy binary in this case is `/work/{binary_in}`.\n"
-        f"Failing test invocation: `{argv_str}`\n"
-        f"Observed behavior: `{obs}`.\n\n"
+        f"project's source tree with the buggy binary already built.\n\n"
+        f"## What we know\n"
+        f"- Buggy binary: `/work/{binary_in}`\n"
+        f"- Failing test invocation: `{argv_str}`\n"
+        f"- Observed behavior: `{obs}`\n"
+        f"- Bug type: `{bug_type}`\n"
+        f"- Language: `{lang}`\n\n"
+        f"## How to investigate\n"
+        f"Use bash inside the container — run commands like `cd`, `ls`, "
+        f"`grep -rn`, `cat`, `find`, run the binary, run gdb in batch "
+        f"mode (`gdb -batch -ex run -ex bt --args /work/{binary_in} ...`).\n\n"
+        f"Suggested first moves:\n"
+        f"1. Run the failing-test command and capture its output to "
+        f"understand what fails.\n"
+        f"2. List source files: "
+        f"`find /work -name '*.{src_ext}' -not -path '*/test*' | head -30`.\n"
+        f"3. Read the test file driving the failure to learn what "
+        f"behavior was expected.\n"
+        f"4. Search the source for functions related to the failing "
+        f"test and inspect them.\n\n"
         f"Investigate the failure, localize the defect in the source, "
         f"and propose both a local fix and a structural global fix.\n"
     )
