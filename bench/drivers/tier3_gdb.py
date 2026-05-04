@@ -139,7 +139,10 @@ def _repo_venv_site_packages() -> str | None:
     """Return the bench venv's site-packages path, if a venv exists
     AND its compiled extensions match the current platform.
 
-    Two layouts are supported:
+    Three layouts are supported:
+      `.venv`           — repo/runtime env used by WSL/Linux native runs.
+                         Prefer this when present so Mini-SWE's separate
+                         `.venv-bench` can keep its own dependency versions.
       `.venv-bench-39` — built against Python 3.9 (Apple's bundled lldb).
                          Holds ChatDBG's deps with `ipython<9` etc., the
                          only versions that import on 3.9.
@@ -155,7 +158,7 @@ def _repo_venv_site_packages() -> str | None:
     """
     import sysconfig
     host_ext_suffix = sysconfig.get_config_var("EXT_SUFFIX") or ""
-    for name in (".venv-bench-39", ".venv-bench"):
+    for name in (".venv", ".venv-bench-39", ".venv-bench"):
         venv = REPO_DIR / name
         if not venv.exists():
             continue
