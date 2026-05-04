@@ -192,7 +192,7 @@ class Tier1Driver:
         *,
         dry_run: bool = False,
         step_limit: int = 100,
-        cost_limit: float = 0.5,
+        cost_limit: float = 1.0,
         mini_model_class: str | None = None,
         docker: bool = False,
         runtime: str | None = None,

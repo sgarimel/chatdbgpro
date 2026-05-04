@@ -204,9 +204,9 @@ def _run_debugger(
     blocked for 47 minutes despite a 240s subprocess.run timeout because
     lldb owned its own process group and ignored the SIGTERM Python sent.
     """
-    import os, signal
-    proc = subprocess.Popen(
-        argv,
+    import os, signal, platform
+    is_windows = platform.system() == "Windows"
+    popen_kwargs = dict(
         stdin=subprocess.PIPE if isinstance(stdin_for_proc, str)
               else (stdin_for_proc if stdin_for_proc is not None else subprocess.DEVNULL),
         stdout=subprocess.PIPE,
@@ -214,8 +214,36 @@ def _run_debugger(
         text=True,
         env=env,
         cwd=run_dir,
-        start_new_session=True,
     )
+    # Process-group isolation: POSIX uses setsid + killpg. Windows has
+    # no equivalent; use CREATE_NEW_PROCESS_GROUP so we can send
+    # CTRL_BREAK_EVENT, plus terminate()/kill() on the leader.
+    if is_windows:
+        popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        popen_kwargs["start_new_session"] = True
+    proc = subprocess.Popen(argv, **popen_kwargs)
+
+    def _kill_tree():
+        if is_windows:
+            # taskkill /F /T walks the child process tree by parent PID.
+            # Falls back to proc.kill() if taskkill isn't available.
+            try:
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                    capture_output=True, timeout=5,
+                )
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+        else:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+
     try:
         if isinstance(stdin_for_proc, str):
             stdout, stderr = proc.communicate(input=stdin_for_proc, timeout=timeout)
@@ -223,10 +251,7 @@ def _run_debugger(
             stdout, stderr = proc.communicate(timeout=timeout)
         return (stdout or "", stderr or "", proc.returncode, False)
     except subprocess.TimeoutExpired:
-        try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            pass
+        _kill_tree()
         try:
             stdout, stderr = proc.communicate(timeout=5)
         except subprocess.TimeoutExpired:
@@ -370,9 +395,8 @@ class Tier3Driver:
                 structural_followup=spec.structural_fix_turn,
             )
             (run_dir / "session.cmds").write_text(script)
-            argv = ["gdb", "-nx", "-batch-silent"]
-            argv += ["-ex", "source /dev/stdin", str(binary)]
-            stdin_for_proc = script
+            argv = ["gdb", "-nx", "-batch-silent", "-x", str(run_dir / "session.cmds"), str(binary)]
+            stdin_for_proc = subprocess.DEVNULL
         else:
             raise ValueError(f"Unknown debugger: {self.debugger}")
 

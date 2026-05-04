@@ -367,6 +367,13 @@ def main() -> int:
                 "tool_config": spec.tool_config_path.name,
                 "tier": spec.tier,
             }
+            # Persist a result.json so the cell isn't silently invisible
+            # to the judge / summary scripts. Without this, errored cells
+            # only appear in index.json and look like "didn't run".
+            try:
+                (run_dir / "result.json").write_text(json.dumps(result, indent=2))
+            except OSError:
+                pass
         index.append(result)
         (out_root / "index.json").write_text(json.dumps(index, indent=2))
 
