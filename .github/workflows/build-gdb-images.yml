@@ -1,0 +1,172 @@
+name: Build & publish gdb-base images to GHCR
+
+# Builds chatdbgpro/gdb-<project>:latest for every BugsCPP project in
+# the corpus and pushes them to ghcr.io/${{ github.repository_owner }}/
+# so anyone can `apptainer pull docker://ghcr.io/<owner>/chatdbgpro-gdb-
+# <project>:latest`.
+#
+# Why this workflow: the original images live at ghcr.io/anikamehrotra,
+# the publisher's personal namespace. Cross-user pushes from a personal
+# token aren't permitted on GitHub, so anyone else needs to publish under
+# their own namespace. Doing 19 docker builds locally on a laptop is
+# painful (especially under arm64→amd64 emulation on Apple Silicon);
+# GitHub Actions runners are linux/amd64 native and have built-in
+# GHCR auth via GITHUB_TOKEN.
+#
+# Trigger:
+#   - workflow_dispatch (manual): builds the full matrix or a subset
+#   - push to gdb-base.Dockerfile / this workflow file: rebuild matrix
+#
+# Stage-1 cache:
+#   The Python 3.11 + gdb 14.2 build (stage 1) is ~30 min and identical
+#   across projects. GHA's docker-buildx cache shares that layer across
+#   the 19 matrix jobs via type=gha,scope=stage1.
+
+on:
+  workflow_dispatch:
+    inputs:
+      projects:
+        description: 'Comma-separated project subset (empty = all 19)'
+        required: false
+        default: ''
+      visibility:
+        description: 'Package visibility after push (public|private)'
+        required: false
+        default: 'private'
+  push:
+    branches: [main]
+    paths:
+      - 'pipeline2/docker/gdb-base.Dockerfile'
+      - '.github/workflows/build-gdb-images.yml'
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 8  # GHA free tier caps concurrency at 20; leave headroom
+      matrix:
+        project:
+          - berry
+          - coreutils
+          - cpp_peglib
+          - cppcheck
+          - dlt_daemon
+          - exiv2
+          - libchewing
+          - libssh
+          - libtiff
+          - libucl
+          - libxml2
+          - md4c
+          - ndpi
+          - proj
+          - wget2
+          - wireshark
+          - yaml_cpp
+          - yara
+          - zsh
+
+    name: build-${{ matrix.project }}
+
+    steps:
+      - name: Honor manual subset
+        id: select
+        run: |
+          # workflow_dispatch input "projects" is a comma list; if non-empty
+          # and the matrix project isn't in it, skip this job entirely.
+          input='${{ github.event.inputs.projects }}'
+          want='${{ matrix.project }}'
+          if [[ -n "$input" ]]; then
+            if echo ",$input," | grep -q ",$want,"; then
+              echo "skip=false" >> $GITHUB_OUTPUT
+            else
+              echo "skip=true"  >> $GITHUB_OUTPUT
+              echo "::notice::Skipping $want (not in subset: $input)"
+            fi
+          else
+            echo "skip=false" >> $GITHUB_OUTPUT
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.select.outputs.skip == 'false'
+
+      - name: Set up QEMU
+        if: steps.select.outputs.skip == 'false'
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: linux/amd64
+
+      - name: Set up Buildx
+        if: steps.select.outputs.skip == 'false'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: steps.select.outputs.skip == 'false'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Lowercase owner
+        if: steps.select.outputs.skip == 'false'
+        id: owner
+        run: |
+          echo "name=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_OUTPUT
+
+      - name: Build & push
+        if: steps.select.outputs.skip == 'false'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: pipeline2/docker/gdb-base.Dockerfile
+          platforms: linux/amd64
+          push: true
+          # Tag both :latest and :sha so callers can pin a specific build
+          # if they need stability across re-pushes of the latest tag.
+          tags: |
+            ghcr.io/${{ steps.owner.outputs.name }}/chatdbgpro-gdb-${{ matrix.project }}:latest
+            ghcr.io/${{ steps.owner.outputs.name }}/chatdbgpro-gdb-${{ matrix.project }}:${{ github.sha }}
+          build-args: |
+            PROJECT=${{ matrix.project }}
+          # Stage-1 (Python 3.11 + gdb 14.2 from source, ~30 min) is the
+          # same across all projects. Sharing a buildx cache scope cuts
+          # subsequent matrix jobs from 30 min to 5 min.
+          cache-from: type=gha,scope=gdb-base-stage1
+          cache-to: type=gha,scope=gdb-base-stage1,mode=max
+
+      - name: Summary
+        if: steps.select.outputs.skip == 'false'
+        run: |
+          echo "## Built chatdbgpro-gdb-${{ matrix.project }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Pull commands:" >> $GITHUB_STEP_SUMMARY
+          echo '```bash' >> $GITHUB_STEP_SUMMARY
+          echo "docker pull ghcr.io/${{ steps.owner.outputs.name }}/chatdbgpro-gdb-${{ matrix.project }}:latest" >> $GITHUB_STEP_SUMMARY
+          echo "apptainer pull docker://ghcr.io/${{ steps.owner.outputs.name }}/chatdbgpro-gdb-${{ matrix.project }}:latest" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+  # GitHub's REST API doesn't expose visibility flips for user-owned
+  # packages (only org-owned). For sgarimel (a user account) you'll
+  # need to flip each package to public manually after the matrix
+  # finishes. This summary job prints the URLs.
+  link-packages:
+    needs: build
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Print package links
+        run: |
+          owner=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')
+          {
+            echo "## Package settings (flip to public if desired)"
+            echo ""
+            for p in berry coreutils cpp_peglib cppcheck dlt_daemon exiv2 libchewing libssh libtiff libucl libxml2 md4c ndpi proj wget2 wireshark yaml_cpp yara zsh; do
+              echo "- [chatdbgpro-gdb-$p](https://github.com/users/$owner/packages/container/chatdbgpro-gdb-$p/settings)"
+            done
+          } >> $GITHUB_STEP_SUMMARY
