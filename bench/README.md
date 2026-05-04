@@ -84,10 +84,12 @@ Lifecycle differences (transparent to the model):
   | run command | `docker exec -w /work N bash -c '...'` | `apptainer exec --pwd /work instance://N ...` |
   | stop | `docker rm -f N` | `apptainer instance stop N` |
 
-Images are pulled from `ghcr.io/diodide/chatdbgpro-gdb-<project>:latest`
+Images are pulled from `ghcr.io/anikamehrotra/chatdbgpro-gdb-<project>:latest`
 on first use; apptainer caches the SIF in `~/.apptainer/cache/`. Override
 the registry namespace via `BENCH_APPTAINER_REGISTRY` if you've
-published your own.
+republished your own. See [pipeline2/README.md — Sharing built Docker
+images](../pipeline2/README.md#sharing-built-docker-images) for how the
+images are published and how to bootstrap a new namespace.
 
 ## Custom sweeps (legacy axis-only mode)
 

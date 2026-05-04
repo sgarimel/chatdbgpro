@@ -288,47 +288,48 @@ output. Exits with the child's exit code.
 ## Sharing built Docker images
 
 The built workspaces and generated Docker image layers are not portable
-through git. Share the `chatdbgpro/gdb-<project>:latest` images separately,
-then teammates can run ChatDBG inside each image while keeping collection and
-evaluation artifacts on the host.
+through git. The shared registry is **`ghcr.io/anikamehrotra/chatdbgpro-gdb-<project>:latest`**
+(public). Both the bench (`bench/orchestrator.py`, `bench/drivers/container_session.py`)
+and `pipeline2/ensure_image.py` resolve to this namespace by default; teammates
+can pull and retag for local use, or republish to their own namespace via the
+`REGISTRY` / `BENCH_APPTAINER_REGISTRY` env overrides.
 
-Preferred team handoff: push the images to a registry you all can read
-(Docker Hub, GHCR, or a private course registry).
+Why this namespace: the repo (`sgarimel/chatdbgpro`) is owned by a personal
+GitHub account, not an org. GHCR doesn't allow cross-user pushes from a personal
+PAT, so collaborators with repo write access can't push to `ghcr.io/sgarimel/...`.
+Until/unless `sgarimel` is converted to an org (or a CI workflow with the repo's
+`GITHUB_TOKEN` is set up), images are published from a publisher's personal
+namespace.
 
-```bash
-docker images 'chatdbgpro/gdb-*' --format '{{.Repository}}:{{.Tag}}'
+### Pulling shared images (teammates)
 
-REGISTRY=ghcr.io/<org-or-user>/chatdbgpro
-for image in $(docker images 'chatdbgpro/gdb-*' --format '{{.Repository}}:{{.Tag}}'); do
-  project=${image#chatdbgpro/gdb-}
-  project=${project%:latest}
-  docker tag "$image" "$REGISTRY/gdb-$project:latest"
-  docker push "$REGISTRY/gdb-$project:latest"
-done
-```
-
-Teammates pull and, if needed, retag back to the names stored in
-`data/corpus.db`:
+The simplest path — `scripts/pull_gdb_images.sh` — reads
+`data/corpus.db` for the list of projects the bench expects, pulls each from
+GHCR, and retags to the local `chatdbgpro/gdb-<project>:latest` name the DB
+references:
 
 ```bash
-REGISTRY=ghcr.io/<org-or-user>/chatdbgpro
-for project in libtiff cppcheck exiv2 yaml_cpp; do
-  docker pull "$REGISTRY/gdb-$project:latest"
-  docker tag "$REGISTRY/gdb-$project:latest" "chatdbgpro/gdb-$project:latest"
-done
+# Docker (default): pulls everything in corpus.db
+scripts/pull_gdb_images.sh
+
+# Just a few projects:
+scripts/pull_gdb_images.sh libtiff cppcheck exiv2 yaml_cpp
+
+# Apptainer (HPC, no docker daemon): pre-warms ~/.apptainer/cache/*.sif
+scripts/pull_gdb_images.sh --runtime apptainer libtiff cppcheck
+
+# Pull from a different namespace (e.g. you republished):
+REGISTRY=ghcr.io/<your-namespace> scripts/pull_gdb_images.sh
 ```
 
-No-registry fallback:
+Public images need no auth. If you ever republish to a private namespace,
+log in first:
 
 ```bash
-docker save $(docker images 'chatdbgpro/gdb-*' --format '{{.Repository}}:{{.Tag}}') \
-  | gzip > chatdbgpro-gdb-images.tar.gz
-
-# On another machine:
-gunzip -c chatdbgpro-gdb-images.tar.gz | docker load
+echo $GITHUB_TOKEN | docker login ghcr.io -u <your-user> --password-stdin
 ```
 
-After importing, verify the tags match the DB values:
+Verify after pulling:
 
 ```bash
 python - <<'PY'
@@ -339,4 +340,49 @@ for (image,) in sqlite3.connect("data/corpus.db").execute(
     print(image)
 PY
 docker images 'chatdbgpro/gdb-*'
+```
+
+Each row from the SQL should now have a matching local image.
+
+### Publishing / republishing images
+
+To publish locally-built images (for example, when a new project is added to
+the corpus), use `scripts/push_gdb_images.sh`. It retags every local
+`chatdbgpro/gdb-*:latest` and pushes to GHCR:
+
+```bash
+# Prereq: gh token must include write:packages,read:packages,delete:packages.
+# Refresh it once if your token doesn't have them:
+gh auth refresh -h github.com -s write:packages,read:packages,delete:packages
+
+# Push everything (defaults to ghcr.io/anikamehrotra):
+scripts/push_gdb_images.sh
+
+# Push only specific projects:
+scripts/push_gdb_images.sh berry exiv2
+
+# Republish to a different namespace (yours):
+REGISTRY=ghcr.io/<your-namespace> scripts/push_gdb_images.sh
+
+# Preview without pushing:
+DRY_RUN=1 scripts/push_gdb_images.sh
+```
+
+After the first push to a fresh package, GitHub creates the package as
+**private**. For *user* namespaces there is no API to flip visibility — the
+script prints a list of `https://github.com/users/<user>/packages/container/<pkg>/settings`
+URLs at the end; open each, scroll to "Change visibility", select "Public",
+confirm. (Org namespaces *do* have an API; the script handles those
+automatically when `PUBLIC=1`.)
+
+### No-registry fallback
+
+If a teammate can't reach GHCR (offline machine, restricted network):
+
+```bash
+docker save $(docker images 'chatdbgpro/gdb-*' --format '{{.Repository}}:{{.Tag}}') \
+  | gzip > chatdbgpro-gdb-images.tar.gz
+
+# On another machine:
+gunzip -c chatdbgpro-gdb-images.tar.gz | docker load
 ```

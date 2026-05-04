@@ -14,9 +14,11 @@ Two runtime backends, selected at the call site:
     cache/). For HPC hosts (adroit, della, ...) that lack docker.
 
 Registry mapping:
-  Default registry: ghcr.io/diodide/chatdbgpro-gdb-<project>:latest.
-  Override via $BENCH_APPTAINER_REGISTRY (env), e.g.
-  ghcr.io/<your-namespace>/chatdbgpro-gdb-<project>:latest.
+  Default registry: ghcr.io/anikamehrotra/chatdbgpro-gdb-<project>:latest
+  (the publisher's personal namespace; sgarimel is a user account, not an
+  org, so cross-user pushes from a personal token aren't permitted).
+  Override via $BENCH_APPTAINER_REGISTRY (env) if a teammate republishes
+  to their own namespace, e.g. ghcr.io/<your-namespace>.
 """
 from __future__ import annotations
 
@@ -27,7 +29,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DOCKERFILE = REPO_ROOT / "pipeline2" / "docker" / "gdb-base.Dockerfile"
 
-DEFAULT_APPTAINER_REGISTRY = "ghcr.io/diodide"
+DEFAULT_APPTAINER_REGISTRY = "ghcr.io/anikamehrotra"
 
 
 def gdb_image_tag(project: str) -> str:
