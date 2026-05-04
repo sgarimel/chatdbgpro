@@ -691,7 +691,13 @@ def build_oracle_strings(case: DockerCase) -> dict[str, str]:
     if case.trigger_argv:
         extras.append("trigger=" + " ".join(case.trigger_argv))
     if extras:
-        out["CHATDBG_PROMPT_EXTRA"] = ", ".join(extras)
+        # Separator is "; " not ", ": apptainer's `--env K=V` flag parses
+        # value as CSV (cobra StringToString), so every comma splits the
+        # value into a separate env entry. Empirical fallout: with `, `
+        # the container only saw CHATDBG_PROMPT_EXTRA=project=yara — the
+        # remaining language/workspace/bug_type/trigger fields were
+        # silently dropped. Semicolons aren't CSV-special.
+        out["CHATDBG_PROMPT_EXTRA"] = "; ".join(extras)
 
     return out
 
