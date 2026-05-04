@@ -26,6 +26,7 @@ class AblationDataCollector(BaseAssistantListener):
         # Dialog-level state
         self._instructions = None
         self._queries = []
+        self._cmw_summary = None  # set externally by the dialog if CMW is active
 
         # Per-query state
         self._current_stream = ""
@@ -159,6 +160,9 @@ class AblationDataCollector(BaseAssistantListener):
             "instructions": self._instructions,
             "queries": self._queries,
         }
+        # Attach check_my_work summary if available
+        if self._cmw_summary:
+            data["check_my_work"] = self._cmw_summary
         try:
             os.makedirs(os.path.dirname(self._output_path) or ".", exist_ok=True)
             with open(self._output_path, "w") as f:

@@ -116,6 +116,24 @@ class ChatDBGConfig(Configurable):
         help="Model path used by the 'ask_oracle' tool (LiteLLM format)",
     ).tag(config=True)
 
+    # Check-my-work: mid-session judge feedback loop. The model calls
+    # check_my_work(diagnosis) to get per-axis scores + hints from a
+    # judge LLM without leaving the debugger session.
+    cmw_case_yaml = Unicode(
+        _chatdbg_get_env("cmw_case_yaml", ""),
+        help="Path to case.yaml for check_my_work criteria. '' disables the tool.",
+    ).tag(config=True)
+
+    cmw_judge_model = Unicode(
+        _chatdbg_get_env("cmw_judge_model", "openai/gpt-4o"),
+        help="Judge model for check_my_work (LiteLLM format)",
+    ).tag(config=True)
+
+    cmw_max_stale = Int(
+        _chatdbg_get_env("cmw_max_stale", 2),
+        help="Max consecutive check_my_work calls with no score improvement before forced stop",
+    ).tag(config=True)
+
     _user_configurable = [
         log,
         model,
@@ -126,6 +144,9 @@ class ChatDBGConfig(Configurable):
         tool_config,
         collect_data,
         oracle_model,
+        cmw_case_yaml,
+        cmw_judge_model,
+        cmw_max_stale,
     ]
 
     # Per-tool ablation state (not exposed as env vars / traitlets).
@@ -139,6 +160,7 @@ class ChatDBGConfig(Configurable):
         "enable_find_definition": "Enable the `find_definition` tool (LSP lookup)",
         "enable_oracle": "Enable the `ask_oracle` tool (escalate to a frontier model)",
         "enable_bash": "Enable the `bash` tool (run shell commands in the working directory)",
+        "enable_check_my_work": "Enable the `check_my_work` tool (mid-session judge feedback)",
     }
 
     def __init__(self, **kwargs):

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import subprocess
 import sys
 
@@ -13,6 +15,11 @@ from ..util.config import chatdbg_config
 from ..util.history import CommandHistory
 from ..util.log import ChatDBGLog
 from .stacks import build_enriched_stacktrace
+from ..util.check_my_work import (
+    CheckMyWorkState,
+    call_judge,
+    load_criteria_from_case_yaml,
+)
 
 
 class DBGError(Exception):
@@ -34,6 +41,9 @@ class DBGDialog:
         self._prompt = prompt
         self._history = CommandHistory(self._prompt)
         self._unsafe_cmd = False
+        # Check-my-work state: initialized lazily when the tool is enabled.
+        self._cmw_state: CheckMyWorkState | None = None
+        self._cmw_criteria: dict | None = None
 
     def query_and_print(self, assistant, user_text, is_followup):
         prompt = self.build_prompt(user_text, is_followup)
@@ -51,6 +61,13 @@ class DBGDialog:
         self.check_debugger_state()
 
         self.query_and_print(assistant, user_text, False)
+
+        # Check-my-work forced loop: if CMW is enabled, the harness
+        # drives a judge→feedback→retry cycle regardless of whether the
+        # model voluntarily called check_my_work during its tool loop.
+        if self._cmw_enabled():
+            self._cmw_forced_loop(assistant)
+
         while True:
             try:
                 command = input("(ChatDBG chatting) ").strip()
@@ -74,7 +91,103 @@ class DBGDialog:
                 # If it causes an error, break
                 break
 
+        # Flush check_my_work summary to any AblationDataCollector listeners
+        self._flush_cmw_to_collectors(assistant)
         assistant.close()
+
+    def _cmw_enabled(self) -> bool:
+        return bool(
+            chatdbg_config.enable_check_my_work
+            and chatdbg_config.cmw_case_yaml
+        )
+
+    def _cmw_forced_loop(self, assistant: Assistant) -> None:
+        """After the model's initial answer, force a judge check and
+        send feedback as follow-up prompts until perfect or stale.
+
+        This works even when the model ignores the check_my_work tool
+        instruction — the harness drives the loop externally."""
+        # Initialize CMW state if the model didn't call the tool itself
+        if self._cmw_criteria is None:
+            self._cmw_criteria = load_criteria_from_case_yaml(
+                chatdbg_config.cmw_case_yaml
+            )
+            self._cmw_state = CheckMyWorkState(
+                max_stale_checks=chatdbg_config.cmw_max_stale,
+            )
+
+        state = self._cmw_state
+
+        # If model already called check_my_work and got perfect, done
+        if state.is_perfect:
+            return
+
+        while not state.is_perfect and not state.is_stale:
+            # Extract the model's latest response from the conversation
+            last_response = self._extract_last_assistant_response(assistant)
+            if not last_response:
+                break
+
+            # Call the judge
+            crit = self._cmw_criteria
+            result = call_judge(
+                last_response,
+                source=crit["source"],
+                source_file=crit["source_file"],
+                language=crit["language"],
+                criteria=crit["criteria"],
+                judge_model=chatdbg_config.cmw_judge_model,
+                check_number=state.num_checks + 1,
+            )
+            state.record(result)
+
+            s = result.scores
+            f = result.feedback
+            total = result.total_score()
+            print(f"\n*** [Check #{result.check_number}] Score: {total}/3 "
+                  f"(rc={s['root_cause']} lf={s['local_fix']} gf={s['global_fix']})")
+
+            if total == 3:
+                print("*** Perfect score — accepting answer.")
+                break
+
+            if state.is_stale:
+                print(f"*** No improvement for {state.max_stale_checks} "
+                      f"consecutive checks — stopping.")
+                break
+
+            # Build feedback prompt and send as follow-up
+            lines = [
+                "A judge reviewed your diagnosis and found issues:",
+                "",
+            ]
+            for axis in ("root_cause", "local_fix", "global_fix"):
+                status = "PASS" if s[axis] == 1 else "NEEDS WORK"
+                hint = f.get(axis, "")
+                lines.append(f"  {axis}: [{status}] {hint}")
+            lines.append("")
+            lines.append(
+                "Use the debugger to investigate further and provide a "
+                "corrected diagnosis. Be specific about file, line, and "
+                "exact code changes."
+            )
+            feedback_text = "\n".join(lines)
+            print(f"*** Sending feedback to model...\n")
+            self.query_and_print(assistant, feedback_text, True)
+
+    def _extract_last_assistant_response(self, assistant: Assistant) -> str | None:
+        """Get the last assistant message content from the conversation."""
+        for msg in reversed(assistant._conversation):
+            if isinstance(msg, dict) and msg.get("role") == "assistant":
+                content = msg.get("content")
+                if content and len(content.strip()) > 20:
+                    return content
+            # litellm sometimes returns message objects
+            elif hasattr(msg, "role") and msg.role == "assistant":
+                content = getattr(msg, "content", None)
+                if content and len(content.strip()) > 20:
+                    return content
+        return None
 
     # Return string for valid command.  None if the command is not valid.
     def _run_one_command(self, command):
@@ -284,6 +397,96 @@ class DBGDialog:
             )
         return f"bash: {command}", f"{body}\n[exit={proc.returncode}]"
 
+    def llm_check_my_work(self, diagnosis: str) -> str:
+        """
+        {
+            "name": "check_my_work",
+            "description": "Submit your current diagnosis and proposed fix to a judge for feedback. The judge scores three axes (root_cause, local_fix, global_fix) and gives targeted hints for any axis you haven't satisfied yet. Call this when you believe you have identified the bug and have a fix proposal. You MUST include: (1) your root cause explanation, (2) the specific code change for a local fix, and (3) the specific code change for a global/structural fix. The session continues after the judge responds so you can refine your answer using the debugger. If you make no progress after repeated checks, the judge will tell you to stop.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "diagnosis": {
+                        "type": "string",
+                        "description": "Your complete current diagnosis including: root cause explanation, proposed local fix (specific code change), and proposed global fix (structural change). Be as specific as possible — cite lines, variables, and exact code changes."
+                    }
+                },
+                "required": ["diagnosis"]
+            }
+        }
+        """
+        # Lazy init: load criteria on first call
+        if self._cmw_criteria is None:
+            case_yaml = chatdbg_config.cmw_case_yaml
+            if not case_yaml:
+                return "check_my_work", "[check_my_work unavailable: no case.yaml configured]"
+            self._cmw_criteria = load_criteria_from_case_yaml(case_yaml)
+            self._cmw_state = CheckMyWorkState(
+                max_stale_checks=chatdbg_config.cmw_max_stale,
+            )
+
+        state = self._cmw_state
+
+        # Already perfect — tell model to finalize
+        if state.is_perfect:
+            return "check_my_work", (
+                "You already achieved a perfect score (3/3). "
+                "Please provide your final answer now."
+            )
+
+        # Stale — no improvement for too many checks
+        if state.is_stale:
+            last = state.checks[-1]
+            return "check_my_work", (
+                f"No improvement after {state.max_stale_checks} consecutive checks "
+                f"(current: rc={last.scores['root_cause']} lf={last.scores['local_fix']} "
+                f"gf={last.scores['global_fix']}). "
+                f"Please provide your FINAL answer now — no more checks allowed."
+            )
+
+        crit = self._cmw_criteria
+        result = call_judge(
+            diagnosis,
+            source=crit["source"],
+            source_file=crit["source_file"],
+            language=crit["language"],
+            criteria=crit["criteria"],
+            judge_model=chatdbg_config.cmw_judge_model,
+            check_number=state.num_checks + 1,
+        )
+        state.record(result)
+
+        # Format feedback for the model
+        s = result.scores
+        f = result.feedback
+        total = result.total_score()
+        lines = [
+            f"[Check #{result.check_number}] Score: {total}/3 "
+            f"(root_cause={s['root_cause']}, local_fix={s['local_fix']}, global_fix={s['global_fix']})",
+            "",
+        ]
+        for axis in ("root_cause", "local_fix", "global_fix"):
+            status = "PASS" if s[axis] == 1 else "FAIL"
+            lines.append(f"  {axis}: [{status}] {f.get(axis, '')}")
+
+        if total == 3:
+            lines.append("")
+            lines.append("Perfect score! Please provide your final answer now.")
+        elif state.is_stale:
+            lines.append("")
+            lines.append(
+                f"WARNING: No improvement for {state.max_stale_checks} checks. "
+                f"This is your last chance — provide your FINAL answer now."
+            )
+        else:
+            remaining = state.max_stale_checks - state._stale_count
+            lines.append("")
+            lines.append(
+                f"You may continue debugging and check again. "
+                f"({remaining} check(s) remaining before forced stop if no improvement.)"
+            )
+
+        return "check_my_work", "\n".join(lines)
+
     def _supported_functions(self):
         functions = []
         if chatdbg_config.enable_native_debug:
@@ -296,7 +499,17 @@ class DBGDialog:
             functions.append(self.llm_ask_oracle)
         if chatdbg_config.enable_bash:
             functions.append(self.llm_bash)
+        if chatdbg_config.enable_check_my_work and chatdbg_config.cmw_case_yaml:
+            functions.append(self.llm_check_my_work)
         return functions
+
+    def _flush_cmw_to_collectors(self, assistant: Assistant) -> None:
+        """Copy check_my_work summary to any AblationDataCollector listeners."""
+        if self._cmw_state and self._cmw_state.num_checks > 0:
+            from ..util.collector import AblationDataCollector
+            for listener in assistant._clients:
+                if isinstance(listener, AblationDataCollector):
+                    listener._cmw_summary = self._cmw_state.summary()
 
     def _make_assistant(self) -> Assistant:
         chatdbg_config.apply_tool_config()

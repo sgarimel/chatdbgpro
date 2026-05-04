@@ -121,7 +121,7 @@ def _driver_for_tier(
         from bench.drivers.tier3_gdb import pick_debugger
         debugger = pick_debugger(debugger_flag)
         print(f"[orchestrator] tier3 using debugger: {debugger}")
-        driver = get_driver(3, debugger=debugger, dry_run=dry_run)
+        driver = get_driver(3, debugger=debugger, dry_run=dry_run, containerize=False)
     elif tier == 1:
         # Tier 1 = mini-swe-agent (bash-only). Driver shells out to
         # .venv-bench (Py 3.14, where mini is installed) — the
@@ -253,6 +253,18 @@ def main() -> int:
                         "auto-detect (docker > apptainer on PATH). Use "
                         "'apptainer' on HPC clusters that lack Docker (e.g. "
                         "adroit, della).")
+    p.add_argument("--check-my-work", action="store_true",
+                   help="Enable mid-session judge feedback: the debugging model "
+                        "gets a check_my_work tool that calls a judge LLM for "
+                        "per-axis scores and hints without leaving the debugger. "
+                        "The session times out after N consecutive checks with "
+                        "no improvement (see --cmw-max-stale).")
+    p.add_argument("--cmw-judge-model", default="openai/gpt-4o",
+                   help="Judge model for check_my_work (LiteLLM format). "
+                        "Default: openai/gpt-4o.")
+    p.add_argument("--cmw-max-stale", type=int, default=2,
+                   help="Max consecutive check_my_work calls with no score "
+                        "improvement before forced stop. Default: 2.")
     args = p.parse_args()
 
     if args.docker:
@@ -307,6 +319,9 @@ def main() -> int:
         cases, args.models, cfgs, args.trials, args.context_lines, args.tiers,
         breakpoint_at_patch=args.breakpoint_at_patch,
         structural_fix_turn=args.structural_fix_turn,
+        check_my_work=args.check_my_work,
+        cmw_judge_model=args.cmw_judge_model,
+        cmw_max_stale=args.cmw_max_stale,
     )
     print(f"[orchestrator] {len(specs)} runs -> {out_root}")
 

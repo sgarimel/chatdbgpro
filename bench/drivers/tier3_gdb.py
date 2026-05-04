@@ -343,6 +343,27 @@ class Tier3Driver:
         env["CHATDBG_CONTEXT"] = str(spec.context_lines)
         env["CHATDBG_FORMAT"] = "text"
         env["CHATDBG_LOG"] = str(run_dir / "chatdbg.log.yaml")
+
+        # Unfence all debugger commands for benchmark runs. The safety
+        # allowlist in safety.py blocks break/step/continue/disassemble/x
+        # etc. which makes T3 artificially weaker than T2 (whose gdb
+        # session is unrestricted). See T3_T4_PROMPT_TOOL_DIAGNOSIS.md.
+        env["CHATDBG_UNSAFE"] = "true"
+
+        # Case metadata — align T3 prompt with T1/T2/T4 information.
+        sf = spec.case.meta.get("source_file", "")
+        if sf:
+            env["CHATDBG_PROMPT_SOURCE_FILE"] = sf
+        expected_crash = spec.case.meta.get("run", {}).get("expected_crash", True)
+        env["CHATDBG_PROMPT_BEHAVIOR"] = (
+            "crashes when run (likely a sanitizer report or signal)"
+            if expected_crash else
+            "runs to completion but the test oracle considers the output incorrect"
+        )
+        desc = spec.case.meta.get("description", "")
+        if desc:
+            env["CHATDBG_PROMPT_DESCRIPTION"] = desc.strip()
+
         src_path = str(REPO_DIR / "src")
         # If the repo-local venv exists (created by us for brew llvm's Python),
         # prepend its site-packages so the debugger's embedded interpreter
@@ -829,7 +850,7 @@ class Tier3Driver:
         )
 
     def _chatdbg_env(self, spec: RunSpec, run_dir: Path, collect_path: Path) -> dict:
-        """Build the child env dict shared by synthetic + injected runs.
+        """Build the child env dict shared by synthetic + injected + bugbench runs.
 
         Only the PYTHONPATH-prepending is load-bearing on macOS arm64
         where Apple's lldb embeds Python 3.9 (see lldb_binary()); the
@@ -841,6 +862,24 @@ class Tier3Driver:
         env["CHATDBG_CONTEXT"] = str(spec.context_lines)
         env["CHATDBG_FORMAT"] = "text"
         env["CHATDBG_LOG"] = str(run_dir / "chatdbg.log.yaml")
+
+        # Unfence all debugger commands for benchmark runs.
+        env["CHATDBG_UNSAFE"] = "true"
+
+        # Case metadata — align T3 prompt with T1/T2/T4 information.
+        sf = spec.case.meta.get("source_file", "")
+        if sf:
+            env["CHATDBG_PROMPT_SOURCE_FILE"] = sf
+        expected_crash = spec.case.meta.get("run", {}).get("expected_crash", True)
+        env["CHATDBG_PROMPT_BEHAVIOR"] = (
+            "crashes when run (likely a sanitizer report or signal)"
+            if expected_crash else
+            "runs to completion but the test oracle considers the output incorrect"
+        )
+        desc = spec.case.meta.get("description", "")
+        if desc:
+            env["CHATDBG_PROMPT_DESCRIPTION"] = desc.strip()
+
         parts = [str(REPO_DIR / "src")]
         venv_sp = _repo_venv_site_packages()
         if venv_sp:
