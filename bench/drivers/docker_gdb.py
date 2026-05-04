@@ -341,12 +341,34 @@ class DockerDriver:
             "CHATDBG_CONTEXT": str(spec.context_lines),
             "CHATDBG_FORMAT": "text",
             "CHATDBG_LOG": "/results/chatdbg.log.yaml",
+            # Mirror Tier3Driver: unfence debugger commands and pass the
+            # case-metadata block (source file, expected behavior) so
+            # BugsCPP T3 has the same surface as synthetic/injected T3.
+            # Without this, safety.py's allowlist blocks break/run/step/
+            # disassemble/x/set/catch/call and the model has no source-
+            # file hint to point get_code_surrounding at.
+            "CHATDBG_UNSAFE": "true",
             # PYTHONPATH must include both the bind-mounted ChatDBG source
             # and the venv where gdb-base.Dockerfile installed ChatDBG's
             # runtime deps (litellm, openai, llm_utils, ...). The venv path
             # is fixed by the Dockerfile.
             "PYTHONPATH": "/chatdbg-src:/opt/chatdbg-venv/lib/python3.11/site-packages",
         }
+        # Case-metadata env vars consumed by src/chatdbg/util/prompts.py.
+        if case.patch_first_file:
+            container_env["CHATDBG_PROMPT_SOURCE_FILE"] = case.patch_first_file
+        container_env["CHATDBG_PROMPT_BEHAVIOR"] = (
+            "crashes when run (signal or sanitizer report)"
+            if case.crash_signal else
+            "runs to completion but the test oracle considers the output incorrect"
+        )
+        desc_parts: list[str] = []
+        if case.bug_type:
+            desc_parts.append(f"bug_type={case.bug_type}")
+        if case.bug_observed:
+            desc_parts.append(f"observed={case.bug_observed}")
+        if desc_parts:
+            container_env["CHATDBG_PROMPT_DESCRIPTION"] = "; ".join(desc_parts)
         for key in ("OPENROUTER_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_BASE"):
             v = os.environ.get(key)
             if v:
