@@ -373,7 +373,18 @@ def compile_case(case: Case, build_dir: Path) -> tuple[subprocess.CompletedProce
     default_compiler = "clang++" if case.language in ("cpp", "c++") else "clang"
     compiler = build_cfg.get("compiler", default_compiler)
     flags = list(build_cfg.get("flags", []))
-    cmd = [compiler, *flags, str(case.source_path), "-o", str(binary)]
+    defines = [f"-D{name}" for name in build_cfg.get("defines", []) or []]
+    include_dirs = [
+        f"-I{case.case_dir / rel}" for rel in build_cfg.get("include_dirs", []) or []
+    ]
+    extra_sources = [
+        str(case.case_dir / rel) for rel in build_cfg.get("extra_sources", []) or []
+    ]
+    cmd = [
+        compiler, *flags, *defines, *include_dirs,
+        str(case.source_path), *extra_sources,
+        "-o", str(binary),
+    ]
     cp = subprocess.run(cmd, capture_output=True, text=True)
     return cp, binary
 

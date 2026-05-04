@@ -51,6 +51,7 @@ def gather_runs(run_root: Path) -> list[dict]:
             "model": result.get("model"),
             "tool_config": result.get("tool_config"),
             "context_lines": result.get("context_lines"),
+            "tier": result.get("tier"),
             "trial": result.get("trial"),
             "status": result.get("status"),
             "elapsed_s": result.get("elapsed_s"),

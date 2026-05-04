@@ -427,19 +427,35 @@ class Tier3Driver:
         # and /run (artifacts: collect.json, logs, session.cmds).
         source_in_run = run_dir / spec.case.source_path.name
         shutil.copy(spec.case.source_path, source_in_run)
+        build_cfg = spec.case.meta.get("build", {})
+        for rel in list(build_cfg.get("extra_sources", []) or []) + list(build_cfg.get("support_files", []) or []):
+            src = spec.case.case_dir / rel
+            dst = run_dir / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy(src, dst)
         shutil.copy(spec.tool_config_path, run_dir / "tool_config.json")
 
         # Compile command — same flags the host-mode path used; clang in
         # the synthetic-runner image accepts the same `-fsanitize=address`
         # / `-std=...` flags. Macros that depend on macOS-only headers
         # (e.g. `-isysroot`) won't work; case authors should avoid them.
-        build_cfg = spec.case.meta.get("build", {})
         default_compiler = "clang++" if spec.case.language in ("cpp", "c++") else "clang"
         compiler = build_cfg.get("compiler", default_compiler)
         flags = list(build_cfg.get("flags", []))
+        defines = [f"-D{name}" for name in build_cfg.get("defines", []) or []]
+        include_dirs = [
+            f"-I/work/{rel}" for rel in build_cfg.get("include_dirs", []) or []
+        ]
         src_in_container = f"/work/{spec.case.source_path.name}"
+        extra_sources = [
+            f"/work/{rel}" for rel in build_cfg.get("extra_sources", []) or []
+        ]
         bin_in_container = "/work/prog"
-        compile_cmd = [compiler, *flags, src_in_container, "-o", bin_in_container]
+        compile_cmd = [
+            compiler, *flags, *defines, *include_dirs,
+            src_in_container, *extra_sources,
+            "-o", bin_in_container,
+        ]
 
         # gdb session script. We can't reuse host-mode build_gdb_script's
         # `source -s chatdbg.chatdbg_gdb` syntax — that's gdb's directory-

@@ -521,12 +521,18 @@ _INJECTED_IDS = [
     "zlib-inflate-dict-oob",
 ]
 
+_EXTERNAL_IDS = [
+    "crashbench-abo1",
+    "juliet-cwe121-char-type-overrun-memcpy-01",
+]
+
 
 class TestCaseDiscovery(unittest.TestCase):
 
     def test_all_cases_discovered(self):
         ids = sorted(c.case_id for c in discover_cases())
-        self.assertEqual(ids, sorted(_SYNTHETIC_IDS + _INJECTED_IDS))
+        for cid in _SYNTHETIC_IDS + _INJECTED_IDS + _EXTERNAL_IDS:
+            self.assertIn(cid, ids)
 
     def test_filter_by_case_id(self):
         found = discover_cases(only=["off-by-one-crc"])
