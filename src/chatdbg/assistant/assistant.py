@@ -205,20 +205,17 @@ class Assistant:
             except Exception:
                 pass
 
-            # add content to conversation, but if there is no content, then the message
-            # has only tool calls, and skip this step
             response_message = completion.choices[0].message
-            if response_message.content != None:
-                # fix: remove tool calls.  They get added below.
-                response_message = response_message.copy()
-                response_message["tool_calls"] = None
-                self._conversation.append(response_message.json())
 
-            if response_message.content != None:
+            # Broadcast prose content immediately so the user sees the
+            # model's reasoning before its tool calls run.
+            if response_message.content is not None:
                 self._broadcast("on_response", response_message.content)
 
             if completion.choices[0].finish_reason == "tool_calls":
-                # create a message with just the tool calls, append that to the conversation, and generate the responses.
+                # Rebuild from tool_chunks only because
+                # litellm.stream_chunk_builder is broken on new GPT
+                # models that emit content + tool_calls in one stream.
                 tool_completion = litellm.stream_chunk_builder(
                     tool_chunks, self._conversation
                 )
@@ -230,19 +227,41 @@ class Assistant:
                     pass
 
                 tool_message = tool_completion.choices[0].message
-
                 tool_json = tool_message.json()
 
-                # patch for litellm sometimes putting index fields in the tool calls it constructs
-                # in stream_chunk_builder.  gpt-4-turbo-2024-04-09 can't handle those index fields, so
-                # just remove them for the moment.
+                # patch for litellm sometimes putting index fields in
+                # the tool calls it constructs in stream_chunk_builder.
+                # gpt-4-turbo-2024-04-09 rejects index fields.
                 for tool_call in tool_json.get("tool_calls", []):
                     _ = tool_call.pop("index", None)
 
                 tool_json["role"] = "assistant"
+                # Carry the prose content alongside the tool_calls in a
+                # SINGLE assistant message. The previous code split
+                # them into two consecutive assistant messages — that
+                # broke strict Anthropic-side validation (OpenRouter →
+                # Azure → Anthropic), which requires each tool_result
+                # block's tool_use_id to be present in the immediately-
+                # preceding assistant message. With content-only
+                # message in between, the chain broke and the second
+                # LLM call returned 400 with "Each `tool_result` block
+                # must have a corresponding `tool_use` block in the
+                # previous message". Combining keeps the Anthropic
+                # message shape valid (text + tool_use blocks → user
+                # tool_result), and OpenAI/OpenRouter/Gemini all accept
+                # this single-message form too.
+                if response_message.content is not None:
+                    tool_json["content"] = response_message.content
+
                 self._conversation.append(tool_json)
                 self._add_function_results_to_conversation(tool_message)
             else:
+                # Pure text response (no tool calls) — preserve in
+                # history so trim/inspection sees the final answer.
+                if response_message.content is not None:
+                    msg = response_message.copy()
+                    msg["tool_calls"] = None
+                    self._conversation.append(msg.json())
                 break
 
         stats = {
