@@ -206,7 +206,18 @@ def rebuild_one(bug: dict, runtime: str, log_dir: Path) -> dict:
     persists to corpus.db."""
     bug_id = bug["bug_id"]
     project = bug["project"]
-    workspace = Path(bug["workspace_path"])
+    # corpus.db.workspace_path is Windows-style on the original seed
+    # (the corpus was built on Windows). Reconstruct the canonical
+    # `data/workspaces/<bug_id>/<project>/buggy-<idx>` path against
+    # the local repo root, falling back to the raw value if that
+    # doesn't exist. Mirrors bench/common.py:_resolve_workspace_path.
+    canonical = (REPO_ROOT / "data" / "workspaces" /
+                 bug_id / project / f"buggy-{bug['bug_index']}")
+    if canonical.exists():
+        workspace = canonical
+    else:
+        raw = Path(bug["workspace_path"])
+        workspace = raw if raw.exists() else canonical
     log = log_dir / f"{bug_id}.log"
     log.parent.mkdir(parents=True, exist_ok=True)
     log_w = log.open("w")
