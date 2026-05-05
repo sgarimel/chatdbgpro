@@ -94,7 +94,13 @@ def _build_synthetic_task(case: Case) -> str:
         f"Expected behavior: {behavior}.\n\n"
         f"Use bash to investigate (run the binary, run gdb in batch mode, "
         f"read the source). Identify the root cause and propose both a "
-        f"local fix and a structural global fix.\n"
+        f"local fix and a structural global fix.\n\n"
+        f"Your final response MUST include three labelled paragraphs:\n\n"
+        f"  ROOT CAUSE: <file:line and what is wrong, in your own words>\n"
+        f"  LOCAL FIX:  <minimal code change that resolves the symptom>\n"
+        f"  GLOBAL FIX: <structural change preventing this CLASS of bug>\n\n"
+        f"Do NOT modify the source file on disk. Just investigate and "
+        f"produce the diagnosis as your final assistant message.\n"
     )
 
 
@@ -117,6 +123,12 @@ def _build_bugscpp_task(case: DockerCase) -> str:
     lang = case.db_language or "c"
     bug_type = case.bug_type or "unspecified"
     src_ext = "c" if lang == "c" else ("cpp" if lang in ("cpp", "c++") else lang)
+    src_hint = case.patch_first_file or ""
+    src_hint_line = (
+        f"- Likely-buggy source file: `{src_hint}` (the developer patch "
+        f"touched this file; start your investigation there).\n"
+        if src_hint else ""
+    )
     return (
         f"You're debugging a real-codebase bug in `{case.bug_id}` (project "
         f"`{case.project}`, an open-source C/C++ project from the BugsC++ "
@@ -128,7 +140,8 @@ def _build_bugscpp_task(case: DockerCase) -> str:
         f"- Failing test invocation: `{argv_str}`\n"
         f"- Observed behavior: `{obs}`\n"
         f"- Bug type: `{bug_type}`\n"
-        f"- Language: `{lang}`\n\n"
+        f"- Language: `{lang}`\n"
+        f"{src_hint_line}\n"
         f"## How to investigate\n"
         f"Use bash inside the container — run commands like `cd`, `ls`, "
         f"`grep -rn`, `cat`, `find`, run the binary, run gdb in batch "
@@ -143,7 +156,14 @@ def _build_bugscpp_task(case: DockerCase) -> str:
         f"4. Search the source for functions related to the failing "
         f"test and inspect them.\n\n"
         f"Investigate the failure, localize the defect in the source, "
-        f"and propose both a local fix and a structural global fix.\n"
+        f"and propose both a local fix and a structural global fix.\n\n"
+        f"## Final answer\n\n"
+        f"Your final response MUST include three labelled paragraphs:\n\n"
+        f"  ROOT CAUSE: <file:line and what is wrong, in your own words>\n"
+        f"  LOCAL FIX:  <minimal code change that resolves the symptom>\n"
+        f"  GLOBAL FIX: <structural change preventing this CLASS of bug>\n\n"
+        f"Do NOT modify the source files on disk. Just investigate and "
+        f"produce the diagnosis as your final assistant message.\n"
     )
 
 
@@ -160,7 +180,13 @@ def _build_injected_task(case: Case, workdir: Path, binary: Path) -> str:
         f"tree, a guard / check / initializer was removed or weakened.\n\n"
         f"Use bash to navigate the source tree, reproduce the failure, "
         f"localize the defect, and propose both a local fix and a "
-        f"structural global fix.\n"
+        f"structural global fix.\n\n"
+        f"Your final response MUST include three labelled paragraphs:\n\n"
+        f"  ROOT CAUSE: <file:line and what is wrong, in your own words>\n"
+        f"  LOCAL FIX:  <minimal code change that resolves the symptom>\n"
+        f"  GLOBAL FIX: <structural change preventing this CLASS of bug>\n\n"
+        f"Do NOT modify the source files on disk. Just investigate and "
+        f"produce the diagnosis as your final assistant message.\n"
     )
 
 
@@ -271,7 +297,7 @@ class Tier1Driver:
             )
 
         task = _build_synthetic_task(spec.case)
-        (run_dir / "task.md").write_text(task)
+        (run_dir / "task.md").write_text(task, encoding="utf-8")
         # session.cmds analog: log the runner invocation so a human can
         # rerun the exact same agent session by hand.
         argv = self._runner_argv(spec, run_dir, agent_cwd=run_dir)
@@ -308,7 +334,7 @@ class Tier1Driver:
 
         workdir = prep.workdir
         task = _build_injected_task(spec.case, workdir, prep.binary)
-        (run_dir / "task.md").write_text(task)
+        (run_dir / "task.md").write_text(task, encoding="utf-8")
         argv = self._runner_argv(spec, run_dir, agent_cwd=workdir)
         (run_dir / "session.cmds").write_text(
             "# Tier-1 runner invocation (mini-swe-agent v2, injected)\n"
@@ -351,7 +377,7 @@ class Tier1Driver:
         # Read crash args to build a reproduction hint
         import json as _json
         crash_args_file = workdir / "crash_args.json"
-        crash_args = _json.loads(crash_args_file.read_text()) if crash_args_file.exists() else {}
+        crash_args = _json.loads(crash_args_file.read_text(encoding="utf-8")) if crash_args_file.exists() else {}
         repro_args = crash_args.get("args", [])
         repro_stdin = crash_args.get("stdin_file")
 
@@ -378,7 +404,7 @@ class Tier1Driver:
             f"run gdb in batch mode, etc. Identify the root cause and propose "
             f"both a local fix and a structural global fix.\n"
         )
-        (run_dir / "task.md").write_text(task)
+        (run_dir / "task.md").write_text(task, encoding="utf-8")
         argv = self._runner_argv(spec, run_dir, agent_cwd=workdir)
         (run_dir / "session.cmds").write_text(
             "# Tier-1 runner invocation (mini-swe-agent v2, bugbench)\n"
@@ -441,7 +467,7 @@ class Tier1Driver:
         # Task prompt is BugsCPP-specific so the model knows what
         # workspace it's looking at.
         task = _build_bugscpp_task(case)
-        (run_dir / "task.md").write_text(task)
+        (run_dir / "task.md").write_text(task, encoding="utf-8")
 
         # Mini-runner argv. Same as synthetic except the bash environment
         # is now a DockerExecEnvironment pointing at our container.
@@ -541,6 +567,10 @@ class Tier1Driver:
         # Skip the .venv-bench-39's PYTHONPATH (which contains macOS-arm64
         # .so files); the mini venv is self-contained.
         env.pop("PYTHONPATH", None)
+        # Force UTF-8 stdio so mini's startup banner emoji doesn't
+        # crash the runner subprocess on Windows cp1252 consoles.
+        env["PYTHONUTF8"] = "1"
+        env["PYTHONIOENCODING"] = "utf-8"
 
         t0 = time.time()
         stdout, stderr, exit_code, timed_out = _run_debugger(
@@ -551,8 +581,8 @@ class Tier1Driver:
             timeout=timeout,
         )
         elapsed = time.time() - t0
-        (run_dir / "stdout.log").write_text(stdout)
-        (run_dir / "stderr.log").write_text(stderr)
+        (run_dir / "stdout.log").write_text(stdout, encoding="utf-8")
+        (run_dir / "stderr.log").write_text(stderr, encoding="utf-8")
 
         if timed_out:
             return finalize_result(
