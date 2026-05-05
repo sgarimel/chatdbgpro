@@ -106,37 +106,47 @@ def main() -> int:
             transform=ax.transAxes, va="top", fontsize=8.5,
             bbox=dict(facecolor="white", edgecolor="lightgray", alpha=0.9))
 
-    # ---- (2) Per-axis breakdown: RC / LF / GF ----
+    # ---- (2) Per-axis heatmap: models × (RC|LF|GF for synth | native) ----
     ax = fig.add_subplot(gs[1, 0])
-    axes_keys = [("root_cause", "Root Cause"),
-                 ("local_fix",  "Local Fix"),
-                 ("global_fix", "Global Fix")]
-    axis_x = np.arange(len(axes_keys))
-    bw = 0.18
-    cmap = plt.cm.Blues(np.linspace(0.55, 0.95, len(SHARED_MODELS)))
-    cmap2 = plt.cm.Reds(np.linspace(0.55, 0.95, len(SHARED_MODELS)))
+    axes_keys = [("root_cause", "RC"),
+                 ("local_fix",  "LF"),
+                 ("global_fix", "GF")]
+    # 4 rows (models) x 6 cols (3 axes for synth, 3 axes for native)
+    matrix = np.full((len(SHARED_MODELS), 2 * len(axes_keys)), np.nan)
     for i, m in enumerate(SHARED_MODELS):
-        offs = (i - (len(SHARED_MODELS) - 1)/2) * bw
-        syn_vals = [mean_axis(syn, m, k) for k, _ in axes_keys]
-        nat_vals = [mean_axis(nat, m, k) for k, _ in axes_keys]
-        ax.bar(axis_x + offs - bw*0.05, syn_vals, bw*0.45,
-               color=cmap[i], label=f"{m} (syn)" if i == 0 else None)
-        ax.bar(axis_x + offs + bw*0.5, nat_vals, bw*0.45,
-               color=cmap2[i], hatch="//", edgecolor="black", linewidth=0.3,
-               label=f"{m} (nat)" if i == 0 else None)
-    ax.set_xticks(axis_x)
-    ax.set_xticklabels([lbl for _, lbl in axes_keys])
-    ax.set_ylabel("Mean Score (0–1)")
-    ax.set_ylim(0, 1.15)
-    ax.set_title("Per-Axis Breakdown (each pair: syn / nat per model, left→right by model order)",
-                 fontsize=10)
+        for j, (k, _) in enumerate(axes_keys):
+            matrix[i, j]                     = mean_axis(syn, m, k)
+            matrix[i, j + len(axes_keys)]    = mean_axis(nat, m, k)
 
-    # Legend explaining the encoding
-    handles = [
-        plt.Rectangle((0,0),1,1, facecolor="#1976d2", label="Synthetic (solid)"),
-        plt.Rectangle((0,0),1,1, facecolor="#d32f2f", hatch="//", edgecolor="black", label="Native (hatched)"),
-    ]
-    ax.legend(handles=handles, loc="upper right", fontsize=8.5)
+    cmap = plt.cm.RdYlGn.copy()
+    cmap.set_bad(color="lightgray")
+    im = ax.imshow(matrix, cmap=cmap, vmin=0, vmax=1, aspect="auto")
+    col_labels = [f"{lbl}\nsynth" for _, lbl in axes_keys] + \
+                 [f"{lbl}\nnative" for _, lbl in axes_keys]
+    ax.set_xticks(range(len(col_labels)))
+    ax.set_xticklabels(col_labels, fontsize=9)
+    ax.set_yticks(range(len(SHARED_MODELS)))
+    ax.set_yticklabels(SHARED_MODELS, fontsize=10)
+    for i in range(len(SHARED_MODELS)):
+        for j in range(2 * len(axes_keys)):
+            v = matrix[i, j]
+            if np.isnan(v):
+                ax.text(j, i, "–", ha="center", va="center", fontsize=9, color="gray")
+            else:
+                color = "white" if (v <= 0.25 or v >= 0.85) else "black"
+                ax.text(j, i, f"{v:.2f}", ha="center", va="center",
+                        fontsize=10, fontweight="bold", color=color)
+    # vertical divider between synth and native halves
+    ax.axvline(x=len(axes_keys) - 0.5, color="black", lw=1.5)
+    # Color the column tick labels to encode synth (blue) vs native (red).
+    for i, lbl in enumerate(ax.get_xticklabels()):
+        lbl.set_color("#1976d2" if i < len(axes_keys) else "#d32f2f")
+        lbl.set_fontweight("bold")
+    plt.colorbar(im, ax=ax, fraction=0.04, pad=0.02, label="Score (0–1)")
+    ax.set_title(
+        "Per-Axis Score Heatmap — model × (axis | corpus)\n"
+        r"$\bf{blue\ columns}$ = Synthetic   |   $\bf{red\ columns}$ = External-Native",
+        fontsize=10)
 
     # ---- (3) Drop-off scatter: per-model synth-vs-native ----
     ax = fig.add_subplot(gs[1, 1])
