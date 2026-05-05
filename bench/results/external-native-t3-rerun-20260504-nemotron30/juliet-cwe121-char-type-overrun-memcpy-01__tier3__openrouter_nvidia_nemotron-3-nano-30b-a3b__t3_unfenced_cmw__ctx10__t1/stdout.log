@@ -1,0 +1,195 @@
+   (Message)
+   (ChatDBG gdb) code program.c:45
+   38         structCharVoid.voidSecond = (void *)SRC_STR;
+   39         /* Print the initial block pointed to by structCharVoid.voidSecond */
+   40         printLine((char *)structCharVoid.voidSecond);
+   41         /* FLAW: Use the sizeof(structCharVoid) which will overwrite the pointer voidSecond */
+   42         memcpy(structCharVoid.charFirst, SRC_STR, sizeof(structCharVoid));
+   43         structCharVoid.charFirst[(sizeof(structCharVoid.charFirst)/sizeof(char))-1] = '\0'; /* null terminate the string */
+   44         printLine((char *)structCharVoid.charFirst);
+   45         printLine((char *)structCharVoid.voidSecond);
+   46     }
+   47 }
+
+   (Message)
+   (ChatDBG gdb) code program.c:40
+   34 void CWE121_Stack_Based_Buffer_Overflow__char_type_overrun_memcpy_01_bad()
+   35 {
+   36     {
+   37         charVoid structCharVoid;
+   38         structCharVoid.voidSecond = (void *)SRC_STR;
+   39         /* Print the initial block pointed to by structCharVoid.voidSecond */
+   40         printLine((char *)structCharVoid.voidSecond);
+   41         /* FLAW: Use the sizeof(structCharVoid) which will overwrite the pointer voidSecond */
+   42         memcpy(structCharVoid.charFirst, SRC_STR, sizeof(structCharVoid));
+   43         structCharVoid.charFirst[(sizeof(structCharVoid.charFirst)/sizeof(char))-1] = '\0'; /* null terminate the string */
+
+   (Message)
+   (ChatDBG gdb) code program.c:25
+   18 #ifndef _WIN32
+   19 #include <wchar.h>
+   20 #endif
+   21 
+   22 /* SRC_STR is 32 char long, including the null terminator, for 64-bit architectures */
+   23 #define SRC_STR "0123456789abcdef0123456789abcde"
+   24 
+   25 typedef struct _charVoid
+   26 {
+   27     char charFirst[16];
+   28     void * voidSecond;
+
+   (Message)
+   (ChatDBG gdb) code program.c:46
+   39         /* Print the initial block pointed to by structCharVoid.voidSecond */
+   40         printLine((char *)structCharVoid.voidSecond);
+   41         /* FLAW: Use the sizeof(structCharVoid) which will overwrite the pointer voidSecond */
+   42         memcpy(structCharVoid.charFirst, SRC_STR, sizeof(structCharVoid));
+   43         structCharVoid.charFirst[(sizeof(structCharVoid.charFirst)/sizeof(char))-1] = '\0'; /* null terminate the string */
+   44         printLine((char *)structCharVoid.charFirst);
+   45         printLine((char *)structCharVoid.voidSecond);
+   46     }
+   47 }
+   48 
+   49 #endif /* OMITBAD */
+
+   
+   (Message) **ROOT CAUSE**
+   The program crashes because the `memcpy` at line 42 copies far more data than
+   the `charFirst` array can hold.
+   `charFirst` is a 16‑byte array, but the copy size is `sizeof(structCharVoid)`
+   (24 bytes on a 64‑bit build). The extra 8 bytes overwrite the adjacent `void
+   * voidSecond` member. That member originally held the safe address of
+   `SRC_STR`. After the overflow it contains a garbage value that, when
+   interpreted as a pointer and passed to `printLine`, points to the unmapped
+   address `0x3736353433323130`. Dereferencing that address inside `printf`
+   triggers a SIGSEGV.
+   
+   In short, the defect is a classic *stack‑based buffer overflow* caused by
+   copying the whole structure size into a buffer that is smaller than the
+   source data, corrupting a pointer that is later used.
+   
+   **LOCAL FIX**
+   Only the bytes that fit into `charFirst` should be copied, and the copy size
+   must be limited to the actual size of that array. The fix also keeps the
+   null‑termination logic inside the buffer bounds.
+   
+   ```diff
+   @@
+   -    /* FLAW: Use the sizeof(structCharVoid) which will overwrite the pointer voidSecond */
+   -    memcpy(structCharVoid.charFirst, SRC_STR, sizeof(structCharVoid));
+   +    /*
+   +       Correct copy: only copy up to the size of charFirst (16 bytes) and
+   +       never write past the buffer.  Use strncpy (or memcpy with a bounded
+   +       length) to avoid overflow and then explicitly null‑terminate.
+   +    */
+   +    size_t copy_len = strlen(SRC_STR);
+   +    if (copy_len > sizeof(structCharVoid.charFirst) - 1)
+   +        copy_len = sizeof(structCharVoid.charFirst) - 1;
+   +    memcpy(structCharVoid.charFirst, SRC_STR, copy_len);
+   +    structCharVoid.charFirst[copy_len] = '\0';   /* guaranteed null‑termination */
+   ```
+   
+   The rest of the function can stay unchanged; after this change `voidSecond`
+   still holds the correct address of `SRC_STR`, so both `printLine` calls
+   succeed.
+   
+   **GLOBAL FIX**
+   The underlying design mixes a data buffer with a pointer in the same struct,
+   which makes it easy to overflow one and corrupt the other. A more robust
+   approach is to separate concerns:
+   
+   * Use distinct, appropriately‑sized buffers for strings and for pointers.
+   * Never use `sizeof(struct)` as the copy length when only part of the struct
+   is a buffer.
+   * Prefer explicit constants or `sizeof(pointer_type)` for pointer copies.
+   * Adopt safer library routines (`strncpy`, `strlcpy`, `memcpy_s`) that
+   enforce destination size at compile‑time or runtime.
+   
+   A disciplined rewrite could look like:
+   
+   ```c
+   void CWE121_Stack_Based_Buffer_Overflow__char_type_overrun_memcpy_01_bad(void)
+   {
+       /* Allocate a dedicated buffer for the string data */
+       char buf[64];                     /* large enough for SRC_STR + 1 */
+       strncpy(buf, SRC_STR, sizeof(buf) - 1);
+       buf[sizeof(buf) - 1] = '\0';
+   
+       printLine(buf);
+       /* No pointer is stored in the struct; only the safe string buffer is used */
+   }
+   ```
+   
+   This redesign eliminates the pointer‑overlap issue altogether and prevents
+   any future overflow of the pointer field, making the code resilient to
+   similar bugs.
+   (Message) **ROOT CAUSE**
+   The program crashes because the `memcpy` at line 42 copies far more data than
+   the `charFirst` array can hold.
+   `charFirst` is a 16‑byte array, but the copy size is `sizeof(structCharVoid)`
+   (24 bytes on a 64‑bit build). The extra 8 bytes overwrite the adjacent `void
+   * voidSecond` member. That member originally held the safe address of
+   `SRC_STR`. After the overflow it contains a garbage value that, when
+   interpreted as a pointer and passed to `printLine`, points to the unmapped
+   address `0x3736353433323130`. Dereferencing that address inside `printf`
+   triggers a SIGSEGV.
+   
+   In short, the defect is a classic *stack‑based buffer overflow* caused by
+   copying the whole structure size into a buffer that is smaller than the
+   source data, corrupting a pointer that is later used.
+   
+   **LOCAL FIX**
+   Only the bytes that fit into `charFirst` should be copied, and the copy size
+   must be limited to the actual size of that array. The fix also keeps the
+   null‑termination logic inside the buffer bounds.
+   
+   ```diff
+   @@
+   -    /* FLAW: Use the sizeof(structCharVoid) which will overwrite the pointer voidSecond */
+   -    memcpy(structCharVoid.charFirst, SRC_STR, sizeof(structCharVoid));
+   +    /*
+   +       Correct copy: only copy up to the size of charFirst (16 bytes) and
+   +       never write past the buffer.  Use strncpy (or memcpy with a bounded
+   +       length) to avoid overflow and then explicitly null‑terminate.
+   +    */
+   +    size_t copy_len = strlen(SRC_STR);
+   +    if (copy_len > sizeof(structCharVoid.charFirst) - 1)
+   +        copy_len = sizeof(structCharVoid.charFirst) - 1;
+   +    memcpy(structCharVoid.charFirst, SRC_STR, copy_len);
+   +    structCharVoid.charFirst[copy_len] = '\0';   /* guaranteed null‑termination */
+   ```
+   
+   The rest of the function can stay unchanged; after this change `voidSecond`
+   still holds the correct address of `SRC_STR`, so both `printLine` calls
+   succeed.
+   
+   **GLOBAL FIX**
+   The underlying design mixes a data buffer with a pointer in the same struct,
+   which makes it easy to overflow one and corrupt the other. A more robust
+   approach is to separate concerns:
+   
+   * Use distinct, appropriately‑sized buffers for strings and for pointers.
+   * Never use `sizeof(struct)` as the copy length when only part of the struct
+   is a buffer.
+   * Prefer explicit constants or `sizeof(pointer_type)` for pointer copies.
+   * Adopt safer library routines (`strncpy`, `strlcpy`, `memcpy_s`) that
+   enforce destination size at compile‑time or runtime.
+   
+   A disciplined rewrite could look like:
+   
+   ```c
+   void CWE121_Stack_Based_Buffer_Overflow__char_type_overrun_memcpy_01_bad(void)
+   {
+       /* Allocate a dedicated buffer for the string data */
+       char buf[64];                     /* large enough for SRC_STR + 1 */
+       strncpy(buf, SRC_STR, sizeof(buf) - 1);
+       buf[sizeof(buf) - 1] = '\0';
+   
+       printLine(buf);
+       /* No pointer is stored in the struct; only the safe string buffer is used */
+   }
+   ```
+   
+   This redesign eliminates the pointer‑overlap issue altogether and prevents
+   any future overflow of the pointer field, making the code resilient to
+   similar bugs.
