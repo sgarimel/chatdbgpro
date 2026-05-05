@@ -815,7 +815,13 @@ def build_oracle_strings(case: DockerCase) -> dict[str, str]:
     # characters — and shlex.quote inserts `"` when the value contains
     # `'` (yara's trigger does). Plain join keeps it pure single-quotes.
     if case.trigger_argv:
-        extras.append("trigger=" + " ".join(case.trigger_argv))
+        # Also strip bare `"` chars in the trigger: triggers like
+        # berry's that embed double-quoted shell substitutions
+        # (`bash -c "./berry $(find ... -name \"*.be\")"`) carry
+        # raw `"` into the joined string and trip apptainer's CSV
+        # parser exactly like shlex.quote did. Replace with `'` — the
+        # EXTRA value is informational, not a shell command.
+        extras.append("trigger=" + " ".join(case.trigger_argv).replace('"', "'"))
     if extras:
         # Separator is "; " not ", ": apptainer's `--env K=V` flag parses
         # value as CSV (cobra StringToString), so every comma splits the
