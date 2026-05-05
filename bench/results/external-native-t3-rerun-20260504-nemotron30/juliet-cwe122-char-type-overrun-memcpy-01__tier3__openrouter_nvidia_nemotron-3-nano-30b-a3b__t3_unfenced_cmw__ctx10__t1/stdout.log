@@ -1,0 +1,187 @@
+   (Message)
+   (ChatDBG gdb) code /root/chatdbgpro/bench/cases/external/juliet-cwe122-char-type-overrun-memcpy-01/io.c:40
+   /root/chatdbgpro/.venv/lib/python3.12/site-packages/pydantic/main.py:475: UserWarning: Pydantic serializer warnings:
+     PydanticSerializationUnexpectedValue(Expected 5 fields but got 4: Expected `Message` - serialized value may not be as expected [field_name='choices', input_value=Message(content='', role=...')], function_call=None), input_type=Message])
+     PydanticSerializationUnexpectedValue(Expected `StreamingChoices` - serialized value may not be as expected [field_name='choices', input_value=Choices(finish_reason='to...)], function_call=None)), input_type=Choices])
+     return self.__pydantic_serializer__.to_python(
+   33 {
+   34     printf("%hd\n", shortNumber);
+   35 }
+   36 
+   37 void printFloatLine (float floatNumber)
+   38 {
+   39     printf("%f\n", floatNumber);
+   40 }
+   41 
+   42 void printLongLine (long longNumber)
+   43 {
+
+   (Message)
+*** Exception in function call: DBGDialog.llm_get_code_surrounding() got an unexpected keyword argument 'include_lines'
+   (Message)
+   (ChatDBG gdb) code /root/chatdbgpro/bench/cases/external/juliet-cwe122-char-type-overrun-memcpy-01/program.c:45
+   38         structCharVoid->voidSecond = (void *)SRC_STR;
+   39         /* Print the initial block pointed to by structCharVoid->voidSecond */
+   40         printLine((char *)structCharVoid->voidSecond);
+   41         /* FLAW: Use the sizeof(*structCharVoid) which will overwrite the pointer y */
+   42         memcpy(structCharVoid->charFirst, SRC_STR, sizeof(*structCharVoid));
+   43         structCharVoid->charFirst[(sizeof(structCharVoid->charFirst)/sizeof(char))-1] = '\0'; /* null terminate the string */
+   44         printLine((char *)structCharVoid->charFirst);
+   45         printLine((char *)structCharVoid->voidSecond);
+   46         free(structCharVoid);
+   47     }
+   48 }
+
+   
+   (Message) **ROOT CAUSE:**
+   The crash originates from the function
+   `CWE122_Heap_Based_Buffer_Overflow__char_type_overrun_memcpy_01_bad()` at
+   *program.c:42*. The code copies a source string (`SRC_STR`) into
+   `structCharVoid->charFirst` using `sizeof(*structCharVoid)` as the copy size.
+   `sizeof(*structCharVoid)` evaluates to the total size of the struct, **not**
+   the size of the `charFirst` array that actually holds the data. Consequently,
+   when the source string is larger than the allocated buffer, the `memcpy`
+   overruns the heap block, corrupting adjacent heap metadata. Later, when
+   `printLine()` (frame 0, *io.c:15*) attempts to `printf("%s\n", line)` with
+   the corrupted `charFirst` pointer, the program dereferences an invalid
+   address (`0x3736353433323130`), leading to a `SIGSEGV`.
+   
+   In short: **the copy size is wrong**, causing heap overflow → corrupted
+   pointer → illegal `printf` → crash.
+   
+   ---
+   
+   ### LOCAL FIX
+   Replace the incorrect copy size with the actual size of the destination
+   buffer and ensure the buffer is null‑terminated safely.
+   
+   ```diff
+   - memcpy(structCharVoid->charFirst, SRC_STR, sizeof(*structCharVoid));
+   + /* Copy only up to the size of the charFirst array, including the terminating NUL */
+   + size_t copy_len = strlen(SRC_STR) + 1;
+   + if (copy_len > sizeof(structCharVoid->charFirst)) {
+   +     /* Optional: handle error (e.g., abort or truncate) */
+   +     abort();   /* fail fast */
+   + }
+   + memcpy(structCharVoid->charFirst, SRC_STR, copy_len);
+   ```
+   
+   *If the buffer must stay bounded, a simpler correction is:*
+   
+   ```diff
+   - memcpy(structCharVoid->charFirst, SRC_STR, sizeof(*structCharVoid));
+   + memcpy(structCharVoid->charFirst, SRC_STR, sizeof(structCharVoid->charFirst));
+   ```
+   
+   and **remove** the manual null‑termination line that relies on the wrong
+   size; let `memcpy` copy exactly the sized buffer and then add
+   `charFirst[copy_len-1] = '\0';` if you still need explicit termination.
+   
+   ---
+   
+   ### GLOBAL FIX
+   Encapsulate the buffer handling behind a type that tracks its length and
+   forbids unsafe bulk copies. A robust design would:
+   
+   1. **Add an explicit size field** to the struct, e.g.
+   ```c
+      typedef struct {
+          char *charFirst;
+          size_t charFirst_len;   /* actual allocated size */
+          void *voidSecond;
+      } CharVoid;
+      ```
+   2. **Allocate the exact needed size** based on the source length, e.g.
+   ```c
+      size_t needed = strlen(SRC_STR) + 1;
+      CharVoid *structCharVoid = malloc(sizeof(CharVoid) + needed);
+      structCharVoid->charFirst = (char *)(structCharVoid + 1);
+      structCharVoid->charFirst_len = needed;
+      ```
+   3. **Use safe copy primitives** that enforce bounds, such as `memcpy_s` (C11)
+   or POSIX `strlcpy`, or a C++ wrapper like `std::copy_n` with a compile‑time
+   check.
+   4. **Validate before any operation** that the intended copy length does not
+   exceed `charFirst_len`.
+   
+   This redesign eliminates the reliance on `sizeof` tricks, makes the buffer
+   size part of the data structure’s invariant, and prevents future
+   heap‑overflow bugs of the same class. It also enables automated checked‑copy
+   functions and static analysis tools to catch mismatches early, providing a
+   durable defense against CWE‑122 style overruns.
+   (Message) **ROOT CAUSE:**
+   The crash originates from the function
+   `CWE122_Heap_Based_Buffer_Overflow__char_type_overrun_memcpy_01_bad()` at
+   *program.c:42*. The code copies a source string (`SRC_STR`) into
+   `structCharVoid->charFirst` using `sizeof(*structCharVoid)` as the copy size.
+   `sizeof(*structCharVoid)` evaluates to the total size of the struct, **not**
+   the size of the `charFirst` array that actually holds the data. Consequently,
+   when the source string is larger than the allocated buffer, the `memcpy`
+   overruns the heap block, corrupting adjacent heap metadata. Later, when
+   `printLine()` (frame 0, *io.c:15*) attempts to `printf("%s\n", line)` with
+   the corrupted `charFirst` pointer, the program dereferences an invalid
+   address (`0x3736353433323130`), leading to a `SIGSEGV`.
+   
+   In short: **the copy size is wrong**, causing heap overflow → corrupted
+   pointer → illegal `printf` → crash.
+   
+   ---
+   
+   ### LOCAL FIX
+   Replace the incorrect copy size with the actual size of the destination
+   buffer and ensure the buffer is null‑terminated safely.
+   
+   ```diff
+   - memcpy(structCharVoid->charFirst, SRC_STR, sizeof(*structCharVoid));
+   + /* Copy only up to the size of the charFirst array, including the terminating NUL */
+   + size_t copy_len = strlen(SRC_STR) + 1;
+   + if (copy_len > sizeof(structCharVoid->charFirst)) {
+   +     /* Optional: handle error (e.g., abort or truncate) */
+   +     abort();   /* fail fast */
+   + }
+   + memcpy(structCharVoid->charFirst, SRC_STR, copy_len);
+   ```
+   
+   *If the buffer must stay bounded, a simpler correction is:*
+   
+   ```diff
+   - memcpy(structCharVoid->charFirst, SRC_STR, sizeof(*structCharVoid));
+   + memcpy(structCharVoid->charFirst, SRC_STR, sizeof(structCharVoid->charFirst));
+   ```
+   
+   and **remove** the manual null‑termination line that relies on the wrong
+   size; let `memcpy` copy exactly the sized buffer and then add
+   `charFirst[copy_len-1] = '\0';` if you still need explicit termination.
+   
+   ---
+   
+   ### GLOBAL FIX
+   Encapsulate the buffer handling behind a type that tracks its length and
+   forbids unsafe bulk copies. A robust design would:
+   
+   1. **Add an explicit size field** to the struct, e.g.
+   ```c
+      typedef struct {
+          char *charFirst;
+          size_t charFirst_len;   /* actual allocated size */
+          void *voidSecond;
+      } CharVoid;
+      ```
+   2. **Allocate the exact needed size** based on the source length, e.g.
+   ```c
+      size_t needed = strlen(SRC_STR) + 1;
+      CharVoid *structCharVoid = malloc(sizeof(CharVoid) + needed);
+      structCharVoid->charFirst = (char *)(structCharVoid + 1);
+      structCharVoid->charFirst_len = needed;
+      ```
+   3. **Use safe copy primitives** that enforce bounds, such as `memcpy_s` (C11)
+   or POSIX `strlcpy`, or a C++ wrapper like `std::copy_n` with a compile‑time
+   check.
+   4. **Validate before any operation** that the intended copy length does not
+   exceed `charFirst_len`.
+   
+   This redesign eliminates the reliance on `sizeof` tricks, makes the buffer
+   size part of the data structure’s invariant, and prevents future
+   heap‑overflow bugs of the same class. It also enables automated checked‑copy
+   functions and static analysis tools to catch mismatches early, providing a
+   durable defense against CWE‑122 style overruns.

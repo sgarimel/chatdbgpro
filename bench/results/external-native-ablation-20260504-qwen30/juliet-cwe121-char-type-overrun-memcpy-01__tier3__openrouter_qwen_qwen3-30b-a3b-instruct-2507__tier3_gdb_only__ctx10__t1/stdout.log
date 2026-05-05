@@ -1,0 +1,302 @@
+   (Message)
+   (ChatDBG gdb) code /root/chatdbgpro/bench/cases/external/juliet-cwe121-char-type-overrun-memcpy-01/io.c:15
+    8 #include <wchar.h>
+    9 #endif
+   10 
+   11 void printLine (const char * line)
+   12 {
+   13     if(line != NULL)
+   14     {
+   15         printf("%s\n", line);
+   16     }
+   17 }
+
+   (ChatDBG gdb) code /root/chatdbgpro/bench/cases/external/juliet-cwe121-char-type-overrun-memcpy-01/program.c:45
+   /root/chatdbgpro/.venv/lib/python3.12/site-packages/pydantic/main.py:475: UserWarning: Pydantic serializer warnings:
+     PydanticSerializationUnexpectedValue(Expected 5 fields but got 4: Expected `Message` - serialized value may not be as expected [field_name='choices', input_value=Message(content='', role=...')], function_call=None), input_type=Message])
+     PydanticSerializationUnexpectedValue(Expected `StreamingChoices` - serialized value may not be as expected [field_name='choices', input_value=Choices(finish_reason='to...)], function_call=None)), input_type=Choices])
+     return self.__pydantic_serializer__.to_python(
+   38         structCharVoid.voidSecond = (void *)SRC_STR;
+   39         /* Print the initial block pointed to by structCharVoid.voidSecond */
+   40         printLine((char *)structCharVoid.voidSecond);
+   41         /* FLAW: Use the sizeof(structCharVoid) which will overwrite the pointer voidSecond */
+   42         memcpy(structCharVoid.charFirst, SRC_STR, sizeof(structCharVoid));
+   43         structCharVoid.charFirst[(sizeof(structCharVoid.charFirst)/sizeof(char))-1] = '\0'; /* null terminate the string */
+   44         printLine((char *)structCharVoid.charFirst);
+   45         printLine((char *)structCharVoid.voidSecond);
+   46     }
+   47 }
+
+   (ChatDBG gdb) info locals
+   No locals.
+
+   (Message)
+   (ChatDBG gdb) frame 1
+   (Message)
+   (ChatDBG gdb) info locals
+   No symbol table info available.
+
+   (Message)
+   (ChatDBG gdb) frame 0
+   (Message)
+   (ChatDBG gdb) print line
+   No symbol "line" in current context.
+   (Message)
+   (ChatDBG gdb) x/s 0x3736353433323130
+   Command `x/s 0x3736353433323130` is not allowed.
+   (Message)
+   (ChatDBG gdb) print (char*)0x3736353433323130
+   Command `print (char*)0x3736353433323130` is not allowed.
+   (Message)
+   (ChatDBG gdb) info frame
+   Stack level 0, frame at 0x7fffffffd480:
+    rip = 0x555555633390 in __sanitizer::internal_strlen(char const*); saved rip = 0x5555555a5462
+    called by frame at 0x7fffffffdd00
+    Arglist at 0x7fffffffd470, args: 
+    Locals at 0x7fffffffd470, Previous frame's sp is 0x7fffffffd480
+    Saved registers:
+     rip at 0x7fffffffd478
+
+   (Message)
+   (ChatDBG gdb) disassemble
+   Command `disassemble` is not allowed.
+   (Message)
+   (ChatDBG gdb) backtrace
+   Command `backtrace` is not allowed.
+   (Message)
+   (ChatDBG gdb) frame 1
+   (Message)
+   (ChatDBG gdb) info args
+   No symbol table info available.
+
+   (Message)
+   (ChatDBG gdb) code /root/chatdbgpro/bench/cases/external/juliet-cwe121-char-type-overrun-memcpy-01/program.c:42
+   35 {
+   36     {
+   37         charVoid structCharVoid;
+   38         structCharVoid.voidSecond = (void *)SRC_STR;
+   39         /* Print the initial block pointed to by structCharVoid.voidSecond */
+   40         printLine((char *)structCharVoid.voidSecond);
+   41         /* FLAW: Use the sizeof(structCharVoid) which will overwrite the pointer voidSecond */
+   42         memcpy(structCharVoid.charFirst, SRC_STR, sizeof(structCharVoid));
+   43         structCharVoid.charFirst[(sizeof(structCharVoid.charFirst)/sizeof(char))-1] = '\0'; /* null terminate the string */
+   44         printLine((char *)structCharVoid.charFirst);
+   45         printLine((char *)structCharVoid.voidSecond);
+
+   
+   (Message) The crash occurs due to a **stack-based buffer overflow** that
+   corrupts the stack layout, specifically overwriting the `voidSecond` pointer
+   stored in the `structCharVoid` structure.
+   
+   ### Root Cause Analysis:
+   
+   1. **Structure Layout and Stack Layout**:
+      - The `structCharVoid` is defined as:
+   ```c
+        struct {
+            char charFirst[128];
+            void *voidSecond;
+        } structCharVoid;
+        ```
+      - On the stack, `charFirst` is allocated first (128 bytes), then
+   `voidSecond` (pointer-sized, typically 8 bytes on x86-64).
+      - The `memcpy` call at **line 42** is the flaw:
+   ```c
+        memcpy(structCharVoid.charFirst, SRC_STR, sizeof(structCharVoid));
+        ```
+        Here, `sizeof(structCharVoid)` is **128 + 8 = 136 bytes**, but
+   `structCharVoid.charFirst` is only **128 bytes**.
+      - So, `memcpy` overwrites **8 bytes past the end** of `charFirst`, which
+   **overwrites the `voidSecond` pointer** stored on the stack.
+   
+   2. **Consequence of Corruption**:
+      - After the overflow, `structCharVoid.voidSecond` now contains garbage
+   (overwritten data).
+      - When `printLine((char *)structCharVoid.voidSecond);` is called at **line
+   45**, it attempts to print a string via the corrupted pointer.
+      - The value of the pointer (e.g., `0x3736353433323130`) is interpreted as
+   a memory address, but it's not valid or readable.
+      - This leads to `SIGSEGV` when `printf` tries to access `line` – the
+   corrupted `voidSecond` pointer points to an invalid memory address.
+   
+   3. **Why `line` at `printLine` appears to be `0x3736353433323130`**:
+      - The `0x3736353433323130` is **not** a random value — it's the ASCII
+   representation of the string `"01234567"`.
+      - This suggests that somewhere in the overflow, the string literal
+   `"01234567"` (or a similar pattern) was copied into
+   `structCharVoid.charFirst`, and the **last 8 bytes** of the 136-byte `memcpy`
+   overwrote the `voidSecond` pointer with a value that looks like `"01234567"`
+   in little-endian.
+      - Example: `0x3736353433323130` in little-endian is stored as
+   `0x3031323334353637`, which corresponds to `76543210` in ASCII (reversed),
+   likely a synthetic or test string from `SRC_STR`.
+   
+   ### Summary of Execution Flow:
+   - `SRC_STR` → `char *` pointing to a string (likely longer than 128 bytes).
+   - `memcpy(structCharVoid.charFirst, SRC_STR, 136)` attempts to copy 136 bytes
+   into a 128-byte buffer.
+   - The extra 8 bytes overwrite `structCharVoid.voidSecond`.
+   - `structCharVoid.voidSecond` is now garbage.
+   - `printLine((char *)structCharVoid.voidSecond)` crashes because it tries to
+   read from an invalid memory address.
+   
+   ---
+   
+   ### Recommendation
+   
+   #### ✅ Minimal Local Fix:
+   Change the `memcpy` size from `sizeof(structCharVoid)` to the size of
+   `charFirst` only:
+   ```c
+   // Replace this:
+   memcpy(structCharVoid.charFirst, SRC_STR, sizeof(structCharVoid));
+   
+   // With this:
+   memcpy(structCharVoid.charFirst, SRC_STR, sizeof(structCharVoid.charFirst));
+   ```
+   
+   This prevents the buffer overflow and stops the corruption of `voidSecond`.
+   
+   #### 🔍 Root-Cause Fix (More Thorough):
+   The flaw lies in the assumption that copying the entire structure size via
+   `sizeof(structCharVoid)` is safe. This is incorrect because `charFirst` is
+   not large enough to hold the entire struct.
+   
+   Additionally, ensure buffer bounds are always respected:
+   - Use `strlen(SRC_STR)` or `sizeof(structCharVoid.charFirst) - 1` to avoid
+   overflow.
+   - Always null-terminate after `memcpy` if needed.
+   
+   Improved version:
+   ```c
+   size_t src_len = strlen(SRC_STR);
+   if (src_len >= sizeof(structCharVoid.charFirst)) {
+       src_len = sizeof(structCharVoid.charFirst) - 1;
+   }
+   memcpy(structCharVoid.charFirst, SRC_STR, src_len);
+   structCharVoid.charFirst[src_len] = '\0'; /* Safe null-termination */
+   ```
+   
+   This is more robust, especially if `SRC_STR` might be truncated.
+   
+   ---
+   
+   ##### Recommendation
+   Replace line 42 in `program.c`:
+   ```c
+   memcpy(structCharVoid.charFirst, SRC_STR, sizeof(structCharVoid));
+   ```
+   with:
+   ```c
+   memcpy(structCharVoid.charFirst, SRC_STR, sizeof(structCharVoid.charFirst));
+   ```
+   
+   This is the minimal, correct fix that prevents the stack buffer overflow.
+   (Message) The crash occurs due to a **stack-based buffer overflow** that
+   corrupts the stack layout, specifically overwriting the `voidSecond` pointer
+   stored in the `structCharVoid` structure.
+   
+   ### Root Cause Analysis:
+   
+   1. **Structure Layout and Stack Layout**:
+      - The `structCharVoid` is defined as:
+   ```c
+        struct {
+            char charFirst[128];
+            void *voidSecond;
+        } structCharVoid;
+        ```
+      - On the stack, `charFirst` is allocated first (128 bytes), then
+   `voidSecond` (pointer-sized, typically 8 bytes on x86-64).
+      - The `memcpy` call at **line 42** is the flaw:
+   ```c
+        memcpy(structCharVoid.charFirst, SRC_STR, sizeof(structCharVoid));
+        ```
+        Here, `sizeof(structCharVoid)` is **128 + 8 = 136 bytes**, but
+   `structCharVoid.charFirst` is only **128 bytes**.
+      - So, `memcpy` overwrites **8 bytes past the end** of `charFirst`, which
+   **overwrites the `voidSecond` pointer** stored on the stack.
+   
+   2 representation of. **Con thesequence of string `" Corruption**0:
+      - After the1 overflow,2 `structChar3Void.void4Second5` now contains
+   garbage6 (7overwritten data).
+      - When `printLine"`.
+   ((char   *) -struct ThisCharVoid suggests. thatvoidSecond somewhere in the
+   overflow, the); string` is called at **line literal 45 `"**, it attempts0 to1
+   print2 a3 string via45 the6 corrupted pointer7.
+   "`   ( - Theor value a of similar the pattern pointer (e.g)., was `0x3
+   copied73 into63 `5struct3Char4333231Void3.char0First`)`, is interpreted as a
+   and memory the address **,last but  it8's not bytes valid** or readable of.
+      - This leads to the ` SIGSE1GV` when36 `-byteprintf` ` tries to access
+   `memcpyline`` over –w therote corrupted ` thevoidSecond` pointer ` pointsvoid
+   toSecond an invalid` memory pointer address with.
+   
+   3. **Why ` aline value` that at looks `printLine` appears to be like `
+   `"00x137323634553643332731"` in30`**:
+      - little The-end `ian0.
+   x   - Example:3 `0x37363534333723361335304`3 in3323 little1-endian3 is
+   stored0 as `` is **not0x30**3 a13 random2 value33 —34 it's the3 ASCII53637`,
+   which corresponds to `76543210` in ASCII (reversed), likely a synthetic or
+   test string from `SRC_STR`.
+   
+   ### Summary of Execution Flow:
+   - `SRC_STR` → `char *` pointing to a string (likely longer than 128 bytes).
+   - `memcpy(structCharVoid.charFirst, SRC_STR, 136)` attempts to copy 136 bytes
+   into a 128-byte buffer.
+   - The extra 8 bytes overwrite `structCharVoid.voidSecond`.
+   - `structCharVoid.voidSecond` is now garbage.
+   - `printLine((char *)structCharVoid.voidSecond)` crashes because it tries to
+   read from an invalid memory address.
+   
+   ---
+   
+   ### Recommendation
+   
+   #### ✅ Minimal Local Fix:
+   Change the `memcpy` size from `sizeof(structCharVoid)` to the size of
+   `charFirst` only:
+   ```c
+   // Replace this:
+   memcpy(structCharVoid.charFirst, SRC_STR, sizeof(structCharVoid));
+   
+   // With this:
+   memcpy(structCharVoid.charFirst, SRC_STR, sizeof(structCharVoid.charFirst));
+   ```
+   
+   This prevents the buffer overflow and stops the corruption of `voidSecond`.
+   
+   #### 🔍 Root-Cause Fix (More Thorough):
+   The flaw lies in the assumption that copying the entire structure size via
+   `sizeof(structCharVoid)` is safe. This is incorrect because `charFirst` is
+   not large enough to hold the entire struct.
+   
+   Additionally, ensure buffer bounds are always respected:
+   - Use `strlen(SRC_STR)` or `sizeof(structCharVoid.charFirst) - 1` to avoid
+   overflow.
+   - Always null-terminate after `memcpy` if needed.
+   
+   Improved version:
+   ```c
+   size_t src_len = strlen(SRC_STR);
+   if (src_len >= sizeof(structCharVoid.charFirst)) {
+       src_len = sizeof(structCharVoid.charFirst) - 1;
+   }
+   memcpy(structCharVoid.charFirst, SRC_STR, src_len);
+   structCharVoid.charFirst[src_len] = '\0'; /* Safe null-termination */
+   ```
+   
+   This is more robust, especially if `SRC_STR` might be truncated.
+   
+   ---
+   
+   ##### Recommendation
+   Replace line 42 in `program.c`:
+   ```c
+   memcpy(structCharVoid.charFirst, SRC_STR, sizeof(structCharVoid));
+   ```
+   with:
+   ```c
+   memcpy(structCharVoid.charFirst, SRC_STR, sizeof(structCharVoid.charFirst));
+   ```
+   
+   This is the minimal, correct fix that prevents the stack buffer overflow.
