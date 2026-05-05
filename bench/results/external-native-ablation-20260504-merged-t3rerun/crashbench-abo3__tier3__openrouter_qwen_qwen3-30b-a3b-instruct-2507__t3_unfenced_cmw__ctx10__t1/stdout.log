@@ -1,0 +1,270 @@
+   (Message)
+   (ChatDBG gdb) bt
+   No stack.
+   (Message)
+   (ChatDBG gdb) info args
+   No frame selected.
+   (Message)
+   (ChatDBG gdb) code program.c:5
+   1 /* abo3.c                                                    *
+   2  * specially crafted to feed your brain by gera@core-sdi.com */
+   3 
+   4 /* This'll prepare you for The Next Step                     */
+   5 
+   6 int main(int argv,char **argc) {
+   7       extern system,puts;
+   8       void (*fn)(char*)=(void(*)(char*))&system;
+
+   (Message)
+   (ChatDBG gdb) code program.c:10
+    4 /* This'll prepare you for The Next Step                     */
+    5 
+    6 int main(int argv,char **argc) {
+    7      extern system,puts;
+    8      void (*fn)(char*)=(void(*)(char*))&system;
+    9      char buf[256];
+   10 
+   11      fn=(void(*)(char*))&puts;
+   12      strcpy(buf,argc[1]);
+   13      fn(argc[2]);
+
+   (Message)
+   (ChatDBG gdb) code program.c:13
+    6 int main(int argv,char **argc) {
+    7      extern system,puts;
+    8      void (*fn)(char*)=(void(*)(char*))&system;
+    9      char buf[256];
+   10 
+   11      fn=(void(*)(char*))&puts;
+   12      strcpy(buf,argc[1]);
+   13      fn(argc[2]);
+   14      exit(1);
+   15 }
+
+   
+   (Message) The program crashes due to a stack buffer overflow caused by
+   `strcpy(buf, argc[1])`, where `argc[1]` is a very long string (over 1000
+   'A's) provided on the command line. The buffer `buf` is only 256 bytes, so
+   copying a much longer string overflows into adjacent stack memory.
+   
+   Let’s trace the program state:
+   - `argc[1]` is the long "AAAAAAAA..." string (length >> 256).
+   - `strcpy(buf, argc[1])` copies the entire string into `buf`, which is only
+   256 bytes.
+   - This overwrites the stack beyond `buf`, including the return address or
+   saved frame pointer.
+   - Since AddressSanitizer (ASan) is enabled, the runtime detects this out-of-
+   bounds write and aborts the program with a memory error.
+   
+   The stack overflow occurs because `strcpy` does not check bounds — it copies
+   until it finds a null terminator, no matter how long the source string is.
+   
+   Crucially, the function pointer `fn` is reassigned to `&puts` (line 11), so
+   the subsequent `fn(argc[2])` will call `puts(argc[2])` — but the crash
+   happens **before** this call, because the buffer overflow corrupts the stack
+   during `strcpy`.
+   
+   Even though the `fn` is a function pointer, that doesn’t prevent the buffer
+   overflow: the bug is not in the function call itself, but in the unbounded
+   string copy.
+   
+   Now, the fact that the program stops with a message like “stopped (no-
+   signal)” in GDB is typical of ASan — it doesn't raise a signal directly but
+   calls `_exit` after detecting the error.
+   
+   ### Why the crash happens:
+   - Unsafe use of `strcpy` on untrusted input (`argc[1]`).
+   - No bounds checking; input length is not validated.
+   - Buffer size (256) is insufficient for the long input (over 1000
+   characters).
+   
+   ### Root cause:
+   **Using `strcpy` with a fixed-size buffer and an untrusted user-controlled
+   input string without any bounds checking leads to a stack buffer overflow,
+   which is detected and fatal due to AddressSanitizer.**
+   
+   ---
+   
+   ROOT CAUSE: `program.c:12` – `strcpy(buf, argc[1])` copies an arbitrary-
+   length user input into a fixed-size stack buffer (`buf[256]`) without bounds
+   checking, causing a stack buffer overflow that violates memory safety. The
+   input string is over 1000 characters, far exceeding the buffer size. This is
+   a classic example of a buffer overflow vulnerability exploited via untrusted
+   input.
+   
+   LOCAL FIX: Replace `strcpy` with a safe alternative like `strncpy` and ensure
+   null termination. This is a minimal change to prevent overflow.
+   
+   ```c
+   strncpy(buf, argc[1], sizeof(buf) - 1);
+   buf[sizeof(buf) - 1] = '\0'; // ensure null termination
+   ```
+   
+   GLOBAL FIX: Replace raw character arrays with bounded string types or use
+   safer string-handling APIs. A structural fix involves replacing `char
+   buf[256]` with a proper bounded string wrapper (e.g., using a library like
+   `strlcpy` or a custom bounded view), or at minimum, enforce input
+   sanitization at the application boundary.
+   
+   Better still: **use `snprintf` for format-safe copying, or avoid raw buffers
+   entirely.**
+   
+   For example:
+   ```c
+   snprintf(buf, sizeof(buf), "%s", argc[1]);
+   ```
+   But even better: employ a design that avoids copying untrusted strings
+   whenever possible.
+   
+   ---
+   
+   ### Final conclusion:
+   
+   The crash is due to a **stack buffer overflow** from using `strcpy` with
+   unbounded input on a small local buffer. The fix must prevent overflow with
+   bounds checking.
+   
+   Even though the function pointer `fn` is involved, the crash occurs
+   **before** the function call — so the pointer being `&puts` is a red herring;
+   the real bug is the overwriting of the stack during `strcpy`.
+   
+   Thus, the fix is strictly about input validation and safe string copying.
+   
+   ---
+   
+   ROOT CAUSE: `program.c:12` – The use of `strcpy` to copy user-controlled
+   input (`argc[1]`) into a fixed-size stack buffer (`buf[256]`) without
+   checking the input length leads to a stack buffer overflow. The input exceeds
+   256 characters, corrupting adjacent stack memory. AddressSanitizer detects
+   and terminates the program due to this violation.
+   
+   LOCAL FIX:
+   Replace line 12:
+   ```c
+   strcpy(buf, argc[1]);
+   ```
+   with:
+   ```c
+   strncpy(buf, argc[1], sizeof(buf) - 1);
+   buf[sizeof(buf) - 1] = '\0';
+   ```
+   
+   GLOBAL FIX:
+   Use safer string handling constructs such as `snprintf` or adopt a higher-
+   level string abstraction (e.g., `strlcpy`, custom bounded strings, or
+   compile-time length checks) to prevent buffer overflows at the source. Prefer
+   API design that enforces size bounds and automatically guarantees null
+   termination.
+   (Message) The program crashes due to a stack buffer overflow caused by
+   `strcpy(buf, argc[1])`, where `argc[1]` is a very long string (over 1000
+   'A's) provided on the command line. The buffer `buf` is only 256 bytes, so
+   copying a much longer string overflows into adjacent stack memory.
+   
+   Let’s trace the program state:
+   - `argc[1]` is the long "AAAAAAAA..." string (length >> 256).
+   - `strcpy(buf, argc[1])` copies the entire string into `buf`, which is only
+   256 bytes.
+   - This overwrites the stack beyond `buf`, including the return address or
+   saved frame pointer.
+   - Since AddressSanitizer (ASan) is enabled, the runtime detects this out-of-
+   bounds write and aborts the program with a memory error.
+   
+   The stack overflow occurs because `strcpy` does not check bounds — it copies
+   until it finds a null terminator, no matter how long the source string is.
+   
+   Crucially, the function pointer `fn` is reassigned to `&puts` (line 11), so
+   the subsequent `fn(argc[2])` will call `puts(argc[2])` — but the crash
+   happens **before** this call, because the buffer overflow corrupts the stack
+   during `strcpy`.
+   
+   Even though the `fn` is a function pointer, that doesn’t prevent the buffer
+   overflow: the bug is not in the function call itself, but in the unbounded
+   string copy.
+   
+   Now, the fact that the program stops with a message like “stopped (no-
+   signal)” in GDB is typical of ASan — it doesn't raise a signal directly but
+   calls `_exit` after detecting the error.
+   
+   ### Why the crash happens:
+   - Unsafe use of `strcpy` on untrusted input (`argc[1]`).
+   - No bounds checking; input length is not validated.
+   - Buffer size (256) is insufficient for the long input (over 1000
+   characters).
+   
+   ### Root cause:
+   **Using `strcpy` with a fixed-size buffer and an untrusted user-controlled
+   input string without any bounds checking leads to a stack buffer overflow,
+   which is detected and fatal due to AddressSanitizer.**
+   
+   ---
+   
+   ROOT CAUSE: `program.c:12` – `strcpy(buf, argc[1])` copies an arbitrary-
+   length user input into a fixed-size stack buffer (`buf[256]`) without bounds
+   checking, causing a stack buffer overflow that violates memory safety. The
+   input string is over 1000 characters, far exceeding the buffer size. This is
+   a classic example of a buffer overflow vulnerability exploited via untrusted
+   input.
+   
+   LOCAL FIX: Replace `strcpy` with a safe alternative like `strncpy` and ensure
+   null termination. This is a minimal change to prevent overflow.
+   
+   ```c
+   strncpy(buf, argc[1], sizeof(buf) - 1);
+   buf[sizeof(buf) - 1] = '\0'; // ensure null termination
+   ```
+   
+   GLOBAL FIX: Replace raw character arrays with bounded string types or use
+   safer string-handling APIs. A structural fix involves replacing `char
+   buf[256]` with a proper bounded string wrapper (e.g., using a library like
+   `strlcpy` or a custom bounded view), or at minimum, enforce input
+   sanitization at the application boundary.
+   
+   Better still: **use `snprintf` for format-safe copying, or avoid raw buffers
+   entirely.**
+   
+   For example:
+   ```c
+   snprintf(buf, sizeof(buf), "%s", argc[1]);
+   ```
+   But even better: employ a design that avoids copying untrusted strings
+   whenever possible.
+   
+   ---
+   
+   ### Final conclusion:
+   
+   The crash is due to a **stack buffer overflow** from using `strcpy` with
+   unbounded input on a small local buffer. The fix must prevent overflow with
+   bounds checking.
+   
+   Even though the function pointer `fn` is involved, the crash occurs
+   **before** the function call — so the pointer being `&puts` is a red herring;
+   the real bug is the overwriting of the stack during `strcpy`.
+   
+   Thus, the fix is strictly about input validation and safe string copying.
+   
+   ---
+   
+   ROOT CAUSE: `program.c:12` – The use of `strcpy` to copy user-controlled
+   input (`argc[1]`) into a fixed-size stack buffer (`buf[256]`) without
+   checking the input length leads to a stack buffer overflow. The input exceeds
+   256 characters, corrupting adjacent stack memory. AddressSanitizer detects
+   and terminates the program due to this violation.
+   
+   LOCAL FIX:
+   Replace line 12:
+   ```c
+   strcpy(buf, argc[1]);
+   ```
+   with:
+   ```c
+   strncpy(buf, argc[1], sizeof(buf) - 1);
+   buf[sizeof(buf) - 1] = '\0';
+   ```
+   
+   GLOBAL FIX:
+   Use safer string handling constructs such as `snprintf` or adopt a higher-
+   level string abstraction (e.g., `strlcpy`, custom bounded strings, or
+   compile-time length checks) to prevent buffer overflows at the source. Prefer
+   API design that enforces size bounds and automatically guarantees null
+   termination.

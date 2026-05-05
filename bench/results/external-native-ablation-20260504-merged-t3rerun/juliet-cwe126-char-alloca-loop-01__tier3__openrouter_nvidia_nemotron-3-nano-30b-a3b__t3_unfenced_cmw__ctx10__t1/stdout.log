@@ -1,0 +1,215 @@
+   (Message)
+   (ChatDBG gdb) bt
+   No stack.
+   (Message)
+   (ChatDBG gdb) code program.c:1
+   1 /* TEMPLATE GENERATED TESTCASE FILE
+   2 Filename: CWE126_Buffer_Overread__char_alloca_loop_01.c
+   3 Label Definition File: CWE126_Buffer_Overread.stack.label.xml
+   4 Template File: sources-sink-01.tmpl.c
+
+   (Message)
+   (ChatDBG gdb) code program.c:10
+    3 Label Definition File: CWE126_Buffer_Overread.stack.label.xml
+    4 Template File: sources-sink-01.tmpl.c
+    5 */
+    6 /*
+    7  * @description
+    8  * CWE: 126 Buffer Over-read
+    9  * BadSource:  Set data pointer to a small buffer
+   10  * GoodSource: Set data pointer to a large buffer
+   11  * Sink: loop
+   12  *    BadSink : Copy data to string using a loop
+   13  * Flow Variant: 01 Baseline
+
+   (Message)
+   (ChatDBG gdb) code program.c:30
+   23 void CWE126_Buffer_Overread__char_alloca_loop_01_bad()
+   24 {
+   25     char * data;
+   26     char * dataBadBuffer = (char *)ALLOCA(50*sizeof(char));
+   27     char * dataGoodBuffer = (char *)ALLOCA(100*sizeof(char));
+   28     memset(dataBadBuffer, 'A', 50-1); /* fill with 'A's */
+   29     dataBadBuffer[50-1] = '\0'; /* null terminate */
+   30     memset(dataGoodBuffer, 'A', 100-1); /* fill with 'A's */
+   31     dataGoodBuffer[100-1] = '\0'; /* null terminate */
+   32     /* FLAW: Set data pointer to a small buffer */
+   33     data = dataBadBuffer;
+
+   (Message)
+   (ChatDBG gdb) code program.c:40
+   33     data = dataBadBuffer;
+   34     {
+   35         size_t i, destLen;
+   36         char dest[100];
+   37         memset(dest, 'C', 100-1);
+   38         dest[100-1] = '\0'; /* null terminate */
+   39         destLen = strlen(dest);
+   40         /* POTENTIAL FLAW: using length of the dest where data
+   41          * could be smaller than dest causing buffer overread */
+   42         for (i = 0; i < destLen; i++)
+   43         {
+
+   (Message)
+   (ChatDBG gdb) code program.c:50
+   43         {
+   44             dest[i] = data[i];
+   45         }
+   46         dest[100-1] = '\0';
+   47         printLine(dest);
+   48     }
+   49 }
+   50 
+   51 #endif /* OMITBAD */
+   52 
+   53 #ifndef OMITGOOD
+
+   (Message)
+   (ChatDBG gdb) code program.c:100
+    93  * analysis tools. It is not used when compiling all the testcases as one
+    94  * application, which is how source code analysis tools are tested.
+    95  */
+    96 
+    97 #ifdef INCLUDEMAIN
+    98 
+    99 int main(int argc, char * argv[])
+   100 {
+   101     /* seed randomness */
+   102     srand( (unsigned)time(NULL) );
+   103 #ifndef OMITGOOD
+
+   (Message)
+   (ChatDBG gdb) code program.c:110
+   103 #ifndef OMITGOOD
+   104     printLine("Calling good()...");
+   105     CWE126_Buffer_Overread__char_alloca_loop_01_good();
+   106     printLine("Finished good()");
+   107 #endif /* OMITGOOD */
+   108 #ifndef OMITBAD
+   109     printLine("Calling bad()...");
+   110     CWE126_Buffer_Overread__char_alloca_loop_01_bad();
+   111     printLine("Finished bad()");
+   112 #endif /* OMITBAD */
+   113     return 0;
+
+   (Message)
+   (ChatDBG gdb) code program.c:45
+   38         dest[100-1] = '\0'; /* null terminate */
+   39         destLen = strlen(dest);
+   40         /* POTENTIAL FLAW: using length of the dest where data
+   41          * could be smaller than dest causing buffer overread */
+   42         for (i = 0; i < destLen; i++)
+   43         {
+   44             dest[i] = data[i];
+   45         }
+   46         dest[100-1] = '\0';
+   47         printLine(dest);
+   48     }
+
+   
+   (Message) **ROOT CAUSE:**
+   `program.c:42‑44` (inside `CWE126_Buffer_Overread__char_alloca_loop_01_bad`)
+   – the loop copies `destLen` characters (`destLen` is 99) from the source
+   pointer `data`, but `data` points to a only‑50‑byte buffer (`dataBadBuffer`).
+   When `i` reaches 50‑51 the code reads `data[i]` past the allocated memory of
+   that buffer, invoking undefined behavior. On typical systems this
+   out‑of‑bounds read hits unmapped stack or heap memory, causing a segmentation
+   fault that aborts the program, which appears as “stopped (no‑signal)” in the
+   test harness. The crash is not due to the destination buffer (`dest`) being
+   too small; it is caused by reading beyond the bounds of the source buffer
+   itself.
+   
+   **LOCAL FIX:**
+   Limit the copy to the actual length of the source buffer (or to the minimum
+   of source and destination lengths). One minimal change is:
+   
+   ```diff
+   -    for (i = 0; i < destLen; i++)
+   -    {
+   -        dest[i] = data[i];
+   -    }
+   +    /* copy only as many bytes as the source actually contains */
+   +    size_t src_len = strlen(data);               /* src_len == 49 for dataBadBuffer */
+   +    for (i = 0; i < destLen && i < src_len; ++i)
+   +    {
+   +        dest[i] = data[i];
+   +    }
+   ```
+   
+   This prevents reading past the end of `data` and eliminates the crash.
+   
+   **GLOBAL FIX:**
+   Introduce a safe‑copy abstraction that enforces length invariants at
+   compile‑time or runtime, preventing this class of buffer‑overread throughout
+   the code base. Examples:
+   
+   - Replace raw pointer arithmetic and manual loops with a bounded‑copy API
+   such as `strncpy_s`, `memcpy_s`, or a C‑++ wrapper that takes explicit byte
+   counts and performs runtime checks (e.g., `std::copy_n` with a checked
+   iterator).
+   - Add a compile‑time/static‑analysis rule that any copy operation must use a
+   source length check (`src_len <= dst_capacity`) and flag cases where a
+   fixed‑size source is used without validation.
+   - Adopt a container‑based approach (e.g., `std::string` or a custom bounded
+   view) that stores length metadata with the data, making it impossible to read
+   past the actual size without explicit bounds checking.
+   - Insert an invariant check early in the function (`assert(strlen(data) >=
+   destLen);`) to surface the assumption and cause a clear diagnostic early,
+   rather than relying on the loop condition.
+   
+   These changes eliminate reliance on manual length calculations and guarantee
+   that any copy operation respects the actual size of the source buffer, thus
+   preventing buffer‑overread crashes entirely.
+   (Message) **ROOT CAUSE:**
+   `program.c:42‑44` (inside `CWE126_Buffer_Overread__char_alloca_loop_01_bad`)
+   – the loop copies `destLen` characters (`destLen` is 99) from the source
+   pointer `data`, but `data` points to a only‑50‑byte buffer (`dataBadBuffer`).
+   When `i` reaches 50‑51 the code reads `data[i]` past the allocated memory of
+   that buffer, invoking undefined behavior. On typical systems this
+   out‑of‑bounds read hits unmapped stack or heap memory, causing a segmentation
+   fault that aborts the program, which appears as “stopped (no‑signal)” in the
+   test harness. The crash is not due to the destination buffer (`dest`) being
+   too small; it is caused by reading beyond the bounds of the source buffer
+   itself.
+   
+   **LOCAL FIX:**
+   Limit the copy to the actual length of the source buffer (or to the minimum
+   of source and destination lengths). One minimal change is:
+   
+   ```diff
+   -    for (i = 0; i < destLen; i++)
+   -    {
+   -        dest[i] = data[i];
+   -    }
+   +    /* copy only as many bytes as the source actually contains */
+   +    size_t src_len = strlen(data);               /* src_len == 49 for dataBadBuffer */
+   +    for (i = 0; i < destLen && i < src_len; ++i)
+   +    {
+   +        dest[i] = data[i];
+   +    }
+   ```
+   
+   This prevents reading past the end of `data` and eliminates the crash.
+   
+   **GLOBAL FIX:**
+   Introduce a safe‑copy abstraction that enforces length invariants at
+   compile‑time or runtime, preventing this class of buffer‑overread throughout
+   the code base. Examples:
+   
+   - Replace raw pointer arithmetic and manual loops with a bounded‑copy API
+   such as `strncpy_s`, `memcpy_s`, or a C‑++ wrapper that takes explicit byte
+   counts and performs runtime checks (e.g., `std::copy_n` with a checked
+   iterator).
+   - Add a compile‑time/static‑analysis rule that any copy operation must use a
+   source length check (`src_len <= dst_capacity`) and flag cases where a
+   fixed‑size source is used without validation.
+   - Adopt a container‑based approach (e.g., `std::string` or a custom bounded
+   view) that stores length metadata with the data, making it impossible to read
+   past the actual size without explicit bounds checking.
+   - Insert an invariant check early in the function (`assert(strlen(data) >=
+   destLen);`) to surface the assumption and cause a clear diagnostic early,
+   rather than relying on the loop condition.
+   
+   These changes eliminate reliance on manual length calculations and guarantee
+   that any copy operation respects the actual size of the source buffer, thus
+   preventing buffer‑overread crashes entirely.
