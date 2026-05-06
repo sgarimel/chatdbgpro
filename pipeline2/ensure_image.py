@@ -14,9 +14,9 @@ Two runtime backends, selected at the call site:
     cache/). For HPC hosts (adroit, della, ...) that lack docker.
 
 Registry mapping:
-  Default registry: ghcr.io/anikamehrotra/chatdbgpro-gdb-<project>:latest
-  (the publisher's personal namespace; sgarimel is a user account, not an
-  org, so cross-user pushes from a personal token aren't permitted).
+  Default registry: ghcr.io/sgarimel/chatdbgpro-gdb-<project>:latest
+  (mirrors the repo namespace; public). A historical mirror also exists
+  at ghcr.io/anikamehrotra/chatdbgpro-gdb-<project>:latest — either works.
   Override via $BENCH_APPTAINER_REGISTRY (env) if a teammate republishes
   to their own namespace, e.g. ghcr.io/<your-namespace>.
 """
@@ -29,7 +29,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DOCKERFILE = REPO_ROOT / "pipeline2" / "docker" / "gdb-base.Dockerfile"
 
-DEFAULT_APPTAINER_REGISTRY = "ghcr.io/anikamehrotra"
+DEFAULT_APPTAINER_REGISTRY = "ghcr.io/sgarimel"
 
 
 def gdb_image_tag(project: str) -> str:
