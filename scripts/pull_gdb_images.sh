@@ -12,8 +12,10 @@
 #   RUNTIME   docker (default) | apptainer
 set -euo pipefail
 
-REGISTRY="${REGISTRY:-ghcr.io/anikamehrotra}"
+REGISTRY="${REGISTRY:-ghcr.io/sgarimel}"
 RUNTIME="${RUNTIME:-docker}"
+# Apple Silicon hosts need to pull the linux/amd64 variant (Rosetta runs it).
+PLATFORM="${PLATFORM:-linux/amd64}"
 
 # Parse --runtime out of args, leave the rest as project names.
 projects=()
@@ -61,7 +63,7 @@ case "$RUNTIME" in
       remote="$REGISTRY/chatdbgpro-gdb-$p:latest"
       local_tag="chatdbgpro/gdb-$p:latest"
       echo "=== $p ==="
-      docker pull "$remote"
+      docker pull --platform "$PLATFORM" "$remote"
       docker tag "$remote" "$local_tag"
       echo "  retagged -> $local_tag"
     done

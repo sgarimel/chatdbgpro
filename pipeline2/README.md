@@ -288,18 +288,23 @@ output. Exits with the child's exit code.
 ## Sharing built Docker images
 
 The built workspaces and generated Docker image layers are not portable
-through git. The shared registry is **`ghcr.io/anikamehrotra/chatdbgpro-gdb-<project>:latest`**
-(public). Both the bench (`bench/orchestrator.py`, `bench/drivers/container_session.py`)
-and `pipeline2/ensure_image.py` resolve to this namespace by default; teammates
-can pull and retag for local use, or republish to their own namespace via the
-`REGISTRY` / `BENCH_APPTAINER_REGISTRY` env overrides.
+through git. The shared registry is **`ghcr.io/sgarimel/chatdbgpro-gdb-<project>:latest`**
+(public, mirrors the repo namespace). Both the bench (`bench/orchestrator.py`,
+`bench/drivers/container_session.py`) and `pipeline2/ensure_image.py` resolve
+to this namespace by default; teammates can pull and retag for local use, or
+republish to their own namespace via the `REGISTRY` / `BENCH_APPTAINER_REGISTRY`
+env overrides.
+
+A second public mirror exists at `ghcr.io/anikamehrotra/chatdbgpro-gdb-<project>:latest`
+for historical reasons — it's the namespace that originally published the
+images. Either works.
 
 Why this namespace: the repo (`sgarimel/chatdbgpro`) is owned by a personal
 GitHub account, not an org. GHCR doesn't allow cross-user pushes from a personal
-PAT, so collaborators with repo write access can't push to `ghcr.io/sgarimel/...`.
-Until/unless `sgarimel` is converted to an org (or a CI workflow with the repo's
-`GITHUB_TOKEN` is set up), images are published from a publisher's personal
-namespace.
+PAT, so only the namespace owner can push directly. The mirror at
+`ghcr.io/sgarimel/...` was published once and is now the canonical pull source
+for teammates; ad-hoc publishers add to their own namespaces and the canonical
+copy is updated by whoever owns the GitHub account.
 
 ### Pulling shared images (teammates)
 
@@ -355,7 +360,7 @@ the corpus), use `scripts/push_gdb_images.sh`. It retags every local
 # Refresh it once if your token doesn't have them:
 gh auth refresh -h github.com -s write:packages,read:packages,delete:packages
 
-# Push everything (defaults to ghcr.io/anikamehrotra):
+# Push everything (defaults to ghcr.io/sgarimel):
 scripts/push_gdb_images.sh
 
 # Push only specific projects:

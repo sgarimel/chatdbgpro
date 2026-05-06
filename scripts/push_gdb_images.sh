@@ -21,7 +21,7 @@
 #   script at one (REGISTRY=ghcr.io/<org>), set PUBLIC=1.
 set -euo pipefail
 
-REGISTRY="${REGISTRY:-ghcr.io/anikamehrotra}"
+REGISTRY="${REGISTRY:-ghcr.io/sgarimel}"
 DRY_RUN="${DRY_RUN:-0}"
 PUBLIC="${PUBLIC:-0}"  # off by default; only meaningful for org namespaces
 

@@ -84,10 +84,26 @@ Lifecycle differences (transparent to the model):
   | run command | `docker exec -w /work N bash -c '...'` | `apptainer exec --pwd /work instance://N ...` |
   | stop | `docker rm -f N` | `apptainer instance stop N` |
 
-Images are pulled from `ghcr.io/anikamehrotra/chatdbgpro-gdb-<project>:latest`
-on first use; apptainer caches the SIF in `~/.apptainer/cache/`. Override
-the registry namespace via `BENCH_APPTAINER_REGISTRY` if you've
-republished your own. See [pipeline2/README.md — Sharing built Docker
+Images are pulled from `ghcr.io/sgarimel/chatdbgpro-gdb-<project>:latest`
+on first use; apptainer caches the SIF in `~/.apptainer/cache/`. The
+images are publicly readable, so anonymous `docker pull` works without
+`docker login`. To prefetch every image the corpus references, run:
+
+```bash
+scripts/pull_gdb_images.sh                       # all 18 projects, docker
+scripts/pull_gdb_images.sh --runtime apptainer   # SIFs into ~/.apptainer/cache
+scripts/pull_gdb_images.sh berry exiv2           # only specific projects
+```
+
+The script reads `data/corpus.db` to learn the project list, pulls each
+`ghcr.io/sgarimel/chatdbgpro-gdb-<project>:latest` (with
+`--platform linux/amd64` on Apple Silicon), and retags it locally as
+`chatdbgpro/gdb-<project>:latest` — the name baked into the bench
+drivers and corpus.
+
+Override the registry namespace via `REGISTRY=ghcr.io/<your-ns>` if
+you've republished elsewhere, or via `BENCH_APPTAINER_REGISTRY` for the
+apptainer path. See [pipeline2/README.md — Sharing built Docker
 images](../pipeline2/README.md#sharing-built-docker-images) for how the
 images are published and how to bootstrap a new namespace.
 
