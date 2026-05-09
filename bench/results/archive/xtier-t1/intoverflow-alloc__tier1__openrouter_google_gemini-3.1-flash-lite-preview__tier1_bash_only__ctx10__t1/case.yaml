@@ -1,0 +1,53 @@
+id: intoverflow-alloc
+language: cpp
+source_file: program.cpp
+description: >
+  make_records multiplies a uint32_t count by sizeof(Record) in 32-bit
+  arithmetic. For sufficiently large counts the product overflows and
+  the allocation is drastically undersized; the subsequent memset and
+  indexed write blow past the buffer. AddressSanitizer reports a
+  heap-buffer-overflow on the memset or on `rs[n - 1].id = 42`.
+
+build:
+  compiler: clang++
+  flags: ["-g", "-O0", "-std=gnu++17", "-fno-omit-frame-pointer", "-fsanitize=address"]
+
+run:
+  args: []
+  stdin: ""
+  env: {}
+  expected_crash: true
+
+bug:
+  category: integer_overflow
+  error_type: allocation_size_overflow
+  root_cause_lines: [17]
+  related_lines: [18, 19]
+
+criteria:
+  root_cause: >
+    The response must identify that on line 17 the product
+    `count * sizeof(Record)` is computed in 32-bit because both operands
+    fit in 32-bit (count is uint32_t and sizeof(Record) is cast to
+    uint32_t). For n >= ~67M the product overflows uint32_t and yields a
+    small allocation while the code still believes it has the full
+    array. Simply noting "allocation too small" without the
+    32-bit-arithmetic explanation does not qualify as root cause.
+
+  local_fix: >
+    Widen the computation to size_t before multiplying, e.g.:
+      size_t bytes = (size_t)count * sizeof(Record);
+    Any variant that forces the multiplication into size_t arithmetic is
+    acceptable as a local fix.
+
+  global_fix: >
+    A root-cause fix additionally guards against the overflow itself
+    (widening alone is not enough for 64-bit platforms where size_t is
+    64-bit — a sufficiently large count still overflows). Acceptable:
+      (a) use a checked-multiply intrinsic, e.g.
+          `__builtin_mul_overflow(count, sizeof(Record), &bytes)`,
+      (b) use `calloc(count, sizeof(Record))`, which must (by the C
+          standard) detect overflow and return NULL, or
+      (c) switch to std::vector<Record> (or std::make_unique<Record[]>)
+          which will throw / report failure on overflow.
+    A bare `size_t` cast does NOT qualify as a global fix.

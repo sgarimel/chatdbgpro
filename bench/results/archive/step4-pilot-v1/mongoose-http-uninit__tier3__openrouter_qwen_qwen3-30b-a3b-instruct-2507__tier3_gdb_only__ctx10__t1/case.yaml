@@ -1,0 +1,73 @@
+id: mongoose-http-uninit
+language: c
+kind: injected_repo
+description: >
+  Mongoose's mg_http_parse() is the entry point for parsing an HTTP
+  request/response into a caller-supplied `struct mg_http_message`.
+  Upstream zeroes the struct on entry with memset, so fields the parser
+  never explicitly writes (optional headers, body length when there is
+  no body, query string, etc.) are deterministic zero. The injected
+  patch deletes that memset. On a simple request that leaves most
+  optional fields untouched, the caller then reads uninitialized stack
+  memory. MemorySanitizer reports `use-of-uninitialized-value` with
+  mg_http_parse in the stack above.
+
+repo:
+  url: https://github.com/cesanta/mongoose
+  sha: "7.15"
+  subdir: .
+
+build:
+  # MSan is Linux-only. On macOS arm64 the driver returns
+  # skipped_platform rather than attempting a compile that would fail.
+  platforms: ["linux"]
+  prepare: []
+  commands:
+    - "clang -g -O0 -fsanitize=memory -fno-omit-frame-pointer -fsanitize-memory-track-origins -o msan_http_parse test/msan_http_parse.c mongoose.c"
+  binary: msan_http_parse
+
+run:
+  repro: "./bench-repro.sh"
+  expected_crash: true
+  env: {MSAN_OPTIONS: "abort_on_error=1:halt_on_error=1:print_stats=0"}
+  clean_env: false
+
+bug:
+  patch_file: bug.patch
+  root_cause_file: mongoose.c
+  root_cause_lines_approx: [mg_http_parse_entry_memset]
+  related_lines_approx: [mg_http_parse_header_loop]
+  category: missing_init
+  error_type: uninit_read
+  expected_sanitizer: msan
+  expected_sanitizer_report_contains: "use-of-uninitialized-value"
+
+criteria:
+  root_cause: >
+    The response must identify that mg_http_parse() no longer zeroes the
+    caller's `struct mg_http_message` on entry, so fields that the parser
+    does not explicitly assign (e.g. `hm->body`, unused `hm->headers[i]`
+    slots, or `hm->query`) retain whatever stack garbage the caller left
+    there, and a later read of one of those fields is what MSan flags.
+    Generic "uninitialized memory somewhere in the HTTP path" does not
+    count — the fix site must be named.
+
+  local_fix: >
+    Restore the `memset(hm, 0, sizeof(*hm));` (or equivalent
+    `*hm = (struct mg_http_message){0};`) at the top of mg_http_parse.
+
+  global_fix: >
+    A root-cause fix removes the "caller must pre-zero this out-param"
+    footgun from the API. Acceptable options:
+      (a) change mg_http_parse's signature to return a `struct
+          mg_http_message` by value (zero-initialized locally) instead
+          of filling a caller-supplied pointer;
+      (b) introduce `mg_http_message_init(struct mg_http_message *)` and
+          require all parse entry points to call it, enforcing the
+          contract in one place;
+      (c) replace the fixed-size `headers[MG_MAX_HTTP_HEADERS]` array
+          with a length-prefixed view so "unread" slots are not even
+          addressable to downstream code.
+    Just re-adding the memset line does NOT qualify as a global fix.
+
+verified: false
