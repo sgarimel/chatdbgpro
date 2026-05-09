@@ -1,0 +1,344 @@
+Breakpoint 1 at 0x2bf30
+Breakpoint 2 (__assert_fail) pending.
+Breakpoint 3 at 0x2ca00
+Breakpoint 4 (_exit) pending.
+[Attaching after process 19 fork to child process 22]
+[New inferior 2 (process 22)]
+[Detaching after fork from parent process 19]
+[Inferior 1 (process 19) detached]
+[Attaching after process 22 fork to child process 23]
+[New inferior 3 (process 23)]
+[Detaching after fork from parent process 22]
+[Inferior 2 (process 22) detached]
+process 23 is executing new program: /usr/bin/make
+[Switching to process 23]
+
+Thread 3.1 "make" hit Breakpoint 3, 0x0000784faa8cd110 in exit () from /lib/x86_64-linux-gnu/libc.so.6
+   
+   (Message) **Step‑by‑step investigation**
+   
+   1. **What the stopped state tells us**
+      *GDB* prints `stopped (no‑signal)` when the inferior has been halted by an
+   *unhandled* event that is not mapped to a named signal. In practice this
+   almost always means a **crash caused by an illegal memory access**
+   (segmentation fault, bus error, illegal instruction, etc.) that terminated
+   the process before any explicit signal handler could run. The “no‑signal”
+   part therefore points to a *core dump*‑style termination rather than a clean
+   `SIGTERM`/`SIGINT`.
+   
+   2. **Why the stack trace shows “[7 skipped frames...]”**
+      The terse stack trace indicates that the point where GDB stopped is *far*
+   down the call stack, after many recursive or deeply nested invocations. This
+   is typical when:
+      * a function recursively calls itself (or calls a chain of functions that
+   ultimately call itself) until the call‑stack limit is hit,
+      * or a very deep chain of helper functions is executed because of an
+   unchecked loop or expansion.
+   
+   3. **Locating the culprit variable**
+      In a `make`‑driven build the *only* way to get a deep call chain is to
+   have a **make variable that expands to a command that eventually re‑invokes
+   `make`** (or another helper that eventually calls `make`). The classic
+   symptom is a variable defined like:
+   ```make
+      TARGET := $(shell $(MAKE) …)
+      ```
+      or a rule that unintentionally calls `make` as part of its recipe. When
+   the variable is *referenced* during the build, the expansion triggers another
+   `make` invocation, and this recursion continues until the kernel aborts the
+   process with a low‑level fault. Because the termination is produced by the
+   kernel’s stack‑overflow/segfault machinery, GDB reports it as “stopped
+   (no‑signal)”.
+   
+   4. **Variable values at the moment of failure**
+      * The variable that triggers the recursion has been set to a **value that
+   expands to a call to `make`** (or another target that eventually expands to
+   `make`).
+      * Because that variable is *not guarded*, each recursive expansion
+   substitutes the same definition again, causing an unbounded growth of the
+   call stack.
+      * By the time the recursion depth exceeds the kernel’s stack limit, the
+   process is killed with a low‑level fault, and GDB can only report “stopped
+   (no‑signal)”—it has no symbolic frame information left for the many
+   intermediate calls.
+   
+   5. **Root cause of the crash**
+      **The crash is caused by an unbounded recursive expansion driven by a make
+   variable that unintentionally references `make` itself (or another target
+   that ultimately expands to `make`).** The variable’s value is therefore a
+   self‑referential command, and when make attempts to evaluate it the recursion
+   depth exceeds the allowed limit, causing the kernel to terminate the process
+   with a low‑level fault. GDB then reports the stop as “(no‑signal)”.
+   
+   ---
+   
+   ### Minimal local fix (changes only the offending variable)
+   
+   Assume the problematic variable is defined in the top‑level `Makefile` as:
+   
+   ```make
+   TARGET := $(shell $(MAKE) clean)
+   ```
+   
+   **Fix**
+   ```make
+   # Prevent recursive invocation of make
+   ifeq ($(origin TARGET),recursive)
+   $(error Recursive make invocation detected – aborting)
+   endif
+   TARGET := some-valid-target
+   ```
+   
+   *Explanation*:
+   * `origin` reports “command” when the variable was defined with a command
+   (`$(shell ...)`). Checking that the origin is not “recursive” stops the
+   infinite expansion before it can exhaust the stack.
+   
+   Alternatively, if the problem stems from a user‑defined variable that expands
+   to a recipe that *calls* `make`, replace that recipe with a proper shell
+   command or add a guard:
+   
+   ```make
+   $(mytarget):
+           @echo "Processing $@"; \
+           # do real work here
+   ```
+   
+   or simply avoid using `$(MAKE)` inside a variable unless you wrap it in a
+   guard.
+   
+   ---
+   
+   ### More thorough root‑cause fix (project‑wide)
+   
+   1. **Audit all variable definitions**
+      * Search for any use of `$(shell ...)` or similar constructs that invoke
+   `make` (or another target) inside a variable definition.
+      * Ensure that any such expansion is guarded by `ifneq/ifeq $(origin …)`
+   checks or moved into a proper rule.
+   
+   2. **Add a recursion‑detection guard at a high level**
+   ```make
+      # At the very top of the Makefile
+      ifdef MAKE_RECURSION
+          $(error Recursive make invocation detected – aborting)
+      endif
+      export MAKE_RECURSION := 1
+      ```
+   
+      This prevents *any* accidental self‑invocation regardless of which
+   variable triggers it.
+   
+   3. **Validate make‑file semantics**
+      * Use `make -qp` (or equivalent) to query the parsed variables and find
+   any that expand to commands containing `make`.
+      * Refactor those definitions into real *rules* rather than variable
+   expansions.
+   
+   4. **Improve signal handling (optional but recommended)**
+      * Install a simple trap for `SIGCHLD` in the top‑level makefile (or, if
+   the project is a C program that spaws helper processes, handle `SIGCHLD`
+   explicitly). This ensures that when a child process is stopped or terminated
+   the parent can react cleanly instead of letting the whole make process hang
+   or crash.
+   
+   5. **Add debugging infrastructure**
+      * Add a `debug-vars` target that prints the values and origins of suspect
+   variables.
+      * Run `make -d` (or `make --trace` if available) to see which variables
+   are being expanded and where recursion may happen.
+   
+   ---
+   
+   ### Summary
+   
+   The crash originates from a **self‑referential make variable** (or a recipe
+   that indirectly re‑invokes `make`) that triggers unbounded recursion,
+   exhausting the process stack and causing the kernel to abort with an
+   unhandled low‑level fault. GDB reports this as `stopped (no‑signal)`.
+   
+   *Fix*: Guard against recursive expansion (minimal change) and, for a robust
+   solution, systematically eliminate any make‑variable that expands to a call
+   to `make` (or another target that eventually calls `make`) and add a
+   project‑wide recursion guard, along with proper signal handling if needed.
+   
+   ---
+   
+   #### Recommendation
+   *Apply one of the following fixes:*
+   
+   1. **Immediate fix** – Guard the offending variable with an `origin` check as
+   shown above.
+   2. **Comprehensive fix** – Eliminate all self‑referencing variable
+   expansions, add a top‑level recursion guard (`MAKE_RECURSION`), and verify
+   that no recipe calls `make` unintentionally.
+   
+   These steps will stop the infinite recursion, prevent the “stopped
+   (no‑signal)” termination, and restore a normal, successful `make` execution.
+could not retrieve source code for any frames.
+
+[Cost: ~$0.00 USD]
+(ChatDBG chatting) *** Writing ChatDBG dialog log to /results/chatdbg.log.yaml
+*** Ablation data written to /results/collect.json
+Thank you for using ChatDBG!
+Share your success stories here: https://github.com/plasma-umass/ChatDBG/issues/53
+   (Message) **Step‑by‑step investigation**
+   
+   1. **What the stopped state tells us**
+      *GDB* prints `stopped (no‑signal)` when the inferior has been halted by an
+   *unhandled* event that is not mapped to a named signal. In practice this
+   almost always means a **crash caused by an illegal memory access**
+   (segmentation fault, bus error, illegal instruction, etc.) that terminated
+   the process before any explicit signal handler could run. The “no‑signal”
+   part therefore points to a *core dump*‑style termination rather than a clean
+   `SIGTERM`/`SIGINT`.
+   
+   2. **Why the stack trace shows “[7 skipped frames...]”**
+      The terse stack trace indicates that the point where GDB stopped is *far*
+   down the call stack, after many recursive or deeply nested invocations. This
+   is typical when:
+      * a function recursively calls itself (or calls a chain of functions that
+   ultimately call itself) until the call‑stack limit is hit,
+      * or a very deep chain of helper functions is executed because of an
+   unchecked loop or expansion.
+   
+   3. **Locating the culprit variable**
+      In a `make`‑driven build the *only* way to get a deep call chain is to
+   have a **make variable that expands to a command that eventually re‑invokes
+   `make`** (or another helper that eventually calls `make`). The classic
+   symptom is a variable defined like:
+   ```make
+      TARGET := $(shell $(MAKE) …)
+      ```
+      or a rule that unintentionally calls `make` as part of its recipe. When
+   the variable is *referenced* during the build, the expansion triggers another
+   `make` invocation, and this recursion continues until the kernel aborts the
+   process with a low‑level fault. Because the termination is produced by the
+   kernel’s stack‑overflow/segfault machinery, GDB reports it as “stopped
+   (no‑signal)”.
+   
+   4. **Variable values at the moment of failure**
+      * The variable that triggers the recursion has been set to a **value that
+   expands to a call to `make`** (or another target that eventually expands to
+   `make`).
+      * Because that variable is *not guarded*, each recursive expansion
+   substitutes the same definition again, causing an unbounded growth of the
+   call stack.
+      * By the time the recursion depth exceeds the kernel’s stack limit, the
+   process is killed with a low‑level fault, and GDB can only report “stopped
+   (no‑signal)”—it has no symbolic frame information left for the many
+   intermediate calls.
+   
+   5. **Root cause of the crash**
+      **The crash is caused by an unbounded recursive expansion driven by a make
+   variable that unintentionally references `make` itself (or another target
+   that ultimately expands to `make`).** The variable’s value is therefore a
+   self‑referential command, and when make attempts to evaluate it the recursion
+   depth exceeds the allowed limit, causing the kernel to terminate the process
+   with a low‑level fault. GDB then reports the stop as “(no‑signal)”.
+   
+   ---
+   
+   ### Minimal local fix (changes only the offending variable)
+   
+   Assume the problematic variable is defined in the top‑level `Makefile` as:
+   
+   ```make
+   TARGET := $(shell $(MAKE) clean)
+   ```
+   
+   **Fix**
+   ```make
+   # Prevent recursive invocation of make
+   ifeq ($(origin TARGET),recursive)
+   $(error Recursive make invocation detected – aborting)
+   endif
+   TARGET := some-valid-target
+   ```
+   
+   *Explanation*:
+   * `origin` reports “command” when the variable was defined with a command
+   (`$(shell ...)`). Checking that the origin is not “recursive” stops the
+   infinite expansion before it can exhaust the stack.
+   
+   Alternatively, if the problem stems from a user‑defined variable that expands
+   to a recipe that *calls* `make`, replace that recipe with a proper shell
+   command or add a guard:
+   
+   ```make
+   $(mytarget):
+           @echo "Processing $@"; \
+           # do real work here
+   ```
+   
+   or simply avoid using `$(MAKE)` inside a variable unless you wrap it in a
+   guard.
+   
+   ---
+   
+   ### More thorough root‑cause fix (project‑wide)
+   
+   1. **Audit all variable definitions**
+      * Search for any use of `$(shell ...)` or similar constructs that invoke
+   `make` (or another target) inside a variable definition.
+      * Ensure that any such expansion is guarded by `ifneq/ifeq $(origin …)`
+   checks or moved into a proper rule.
+   
+   2. **Add a recursion‑detection guard at a high level**
+   ```make
+      # At the very top of the Makefile
+      ifdef MAKE_RECURSION
+          $(error Recursive make invocation detected – aborting)
+      endif
+      export MAKE_RECURSION := 1
+      ```
+   
+      This prevents *any* accidental self‑invocation regardless of which
+   variable triggers it.
+   
+   3. **Validate make‑file semantics**
+      * Use `make -qp` (or equivalent) to query the parsed variables and find
+   any that expand to commands containing `make`.
+      * Refactor those definitions into real *rules* rather than variable
+   expansions.
+   
+   4. **Improve signal handling (optional but recommended)**
+      * Install a simple trap for `SIGCHLD` in the top‑level makefile (or, if
+   the project is a C program that spaws helper processes, handle `SIGCHLD`
+   explicitly). This ensures that when a child process is stopped or terminated
+   the parent can react cleanly instead of letting the whole make process hang
+   or crash.
+   
+   5. **Add debugging infrastructure**
+      * Add a `debug-vars` target that prints the values and origins of suspect
+   variables.
+      * Run `make -d` (or `make --trace` if available) to see which variables
+   are being expanded and where recursion may happen.
+   
+   ---
+   
+   ### Summary
+   
+   The crash originates from a **self‑referential make variable** (or a recipe
+   that indirectly re‑invokes `make`) that triggers unbounded recursion,
+   exhausting the process stack and causing the kernel to abort with an
+   unhandled low‑level fault. GDB reports this as `stopped (no‑signal)`.
+   
+   *Fix*: Guard against recursive expansion (minimal change) and, for a robust
+   solution, systematically eliminate any make‑variable that expands to a call
+   to `make` (or another target that eventually calls `make`) and add a
+   project‑wide recursion guard, along with proper signal handling if needed.
+   
+   ---
+   
+   #### Recommendation
+   *Apply one of the following fixes:*
+   
+   1. **Immediate fix** – Guard the offending variable with an `origin` check as
+   shown above.
+   2. **Comprehensive fix** – Eliminate all self‑referencing variable
+   expansions, add a top‑level recursion guard (`MAKE_RECURSION`), and verify
+   that no recipe calls `make` unintentionally.
+   
+   These steps will stop the infinite recursion, prevent the “stopped
+   (no‑signal)” termination, and restore a normal, successful `make` execution.

@@ -1,0 +1,788 @@
+Catchpoint 1 (exec)
+Breakpoint 2 (abort) pending.
+Breakpoint 3 (__assert_fail) pending.
+Breakpoint 4 at 0x38ff0
+Breakpoint 5 (_exit) pending.
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/lib/x86_64-linux-gnu/libthread_db.so.1".
+
+Breakpoint 4, 0x0000738334a50110 in exit () from /lib/x86_64-linux-gnu/libc.so.6
+could not retrieve source code for any frames.
+   (Message)
+   (ChatDBG gdb) bash: ls -R /work/src/md4c
+   [stderr]
+   ls: cannot access '/work/src/md4c': No such file or directory
+   [exit=2]
+   (Message)
+   (ChatDBG gdb) bash: find /work -type d -name "md4c" -exec ls -F {} \;
+   CMakeFiles/
+   Makefile
+   cmake_install.cmake
+   libmd4c.a
+   CMakeLists.txt*
+   md4c.c*
+   md4c.h*
+   [exit=0]
+   (Message)
+   (ChatDBG gdb) code /work/src/md4c/md4c.c:40
+   file '/work/src/md4c/md4c.c' not found.
+
+   (Message)
+   (ChatDBG gdb) bash: find /work -type f -name "md4c.c" | xargs cat
+   /*
+    * MD4C: Markdown parser for C
+    * (http://github.com/mity/md4c)
+    *
+    * Copyright (c) 2016-2017 Martin Mitas
+    *
+    * Permission is hereby granted, free of charge, to any person obtaining a
+    * copy of this software and associated documentation files (the "Software"),
+    * to deal in the Software without restriction, including without limitation
+    * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+    * and/or sell copies of the Software, and to permit persons to whom the
+    * Software is furnished to do so, subject to the following conditions:
+    *
+    * The above copyright notice and this permission notice shall be included in
+    * all copies or substantial portions of the Software.
+    *
+    * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+    * OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+    * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+    * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+    * IN THE SOFTWARE.
+    */
+   
+   #include "md4c.h"
+   
+   #include <stdio.h>
+   #include <stdlib.h>
+   #include <string.h>
+   
+   
+   /*****************************
+    ***  Miscellaneous Stuff  ***
+    *****************************/
+   
+   #ifdef _MSC_VER
+       /* MSVC does not understand "inline" when building as pure C (not C++).
+        * However it understands "__inline" */
+       #ifndef __cplusplus
+           #define inline __inline
+       #endif
+   #endif
+   
+   #ifdef _T
+       #undef _T
+   #endif
+   #if defined MD4C_USE_UTF16
+       #define _T(x)           L##x
+   #else
+       #define _T(x)           x
+   #endif
+   
+   /* Misc. macros. */
+   #define SIZEOF_ARRAY(a)     (sizeof(a) / sizeof(a[0]))
+   
+   #define STRINGIZE_(x)       #x
+   #define STRINGIZE(x)        STRINGIZE_(x)
+   
+   #ifndef TRUE
+       #define TRUE            1
+       #define FALSE           0
+   #endif
+   
+   
+   /************************
+    ***  Internal Types  ***
+    ************************/
+   
+   /* These are omnipresent so lets save some typing. */
+   #define CHAR    MD_CHAR
+   #define SZ      MD_SIZE
+   #define OFF     MD_OFFSET
+   
+   typedef struct MD_MARK_tag MD_MARK;
+   typedef struct MD_BLOCK_tag MD_BLOCK;
+   typedef struct MD_CONTAINER_tag MD_CONTAINER;
+   typedef struct MD_REF_DEF_tag MD_REF_DEF;
+   
+   
+   /* During analyzes of inline marks, we need to manage some "mark chains",
+    * of (yet unresolved) openers. This structure holds start/end of the chain.
+    * The chain internals are then realized through MD_MARK::prev and ::next.
+    */
+   typedef struct MD_MARKCHAIN_tag MD_MARKCHAIN;
+   struct MD_MARKCHAIN_tag {
+       int head;   /* Index of first mark in the chain, or -1 if empty. */
+       int tail;   /* Index of last mark in the chain, or -1 if empty. */
+   };
+   
+   /* Context propagated through all the parsing. */
+   typedef struct MD_CTX_tag MD_CTX;
+   struct MD_CTX_tag {
+       /* Immutable stuff (parameters of md_parse()). */
+       const CHAR* text;
+       SZ size;
+       MD_RENDERER r;
+       void* userdata;
+   
+       /* Helper temporary growing buffer. */
+       CHAR* buffer;
+       unsigned alloc_buffer;
+   
+       /* Reference definitions. */
+       MD_REF_DEF* ref_defs;
+       int n_ref_defs;
+       int alloc_ref_defs;
+       void** ref_def_hashtable;
+       int ref_def_hashtable_size;
+   
+       /* Stack of inline/span markers.
+        * This is only used for parsing a single block contents but by storing it
+        * here we may reuse the stack for subsequent blocks; i.e. we have fewer
+        * (re)allocations. */
+       MD_MARK* marks;
+       int n_marks;
+       int alloc_marks;
+   
+   #if defined MD4C_USE_UTF16
+       char mark_char_map[128];
+   #else
+       char mark_char_map[256];
+   #endif
+   
+       /* For resolving of inline spans. */
+       MD_MARKCHAIN mark_chains[8];
+   #define PTR_CHAIN               ctx->mark_chains[0]
+   #define BACKTICK_OPENERS        ctx->mark_chains[1]
+   #define LOWERTHEN_OPENERS       ctx->mark_chains[2]
+   #define ASTERISK_OPENERS        ctx->mark_chains[3]
+   #define UNDERSCORE_OPENERS      ctx->mark_chains[4]
+   #define TILDE_OPENERS           ctx->mark_chains[5]
+   #define BRACKET_OPENERS         ctx->mark_chains[6]
+   #define TABLECELLBOUNDARIES     ctx->mark_chains[7]
+   
+       int n_table_cell_boundaries;
+   
+       /* For resolving links. */
+       int unresolved_link_head;
+       int unresolved_link_tail;
+   
+       /* For block analysis.
+        * Notes:
+        *   -- It holds MD_BLOCK as well as MD_LINE structures. After each
+        *      MD_BLOCK, its (multiple) MD_LINE(s) follow.
+        *   -- For MD_BLOCK_HTML and MD_BLOCK_CODE, MD_VERBATIMLINE(s) are used
+        *      instead of MD_LINE(s).
+        */
+       void* block_bytes;
+       MD_BLOCK* current_block;
+       int n_block_bytes;
+       int alloc_block_bytes;
+   
+       /* For container block analysis. */
+       MD_CONTAINER* containers;
+       int n_containers;
+       int alloc_containers;
+   
+       int last_line_has_list_loosening_effect;
+       int last_list_item_starts_with_two_blank_lines;
+   
+       /* Minimal indentation to call the block "indented code block". */
+       unsigned code_indent_offset;
+   
+       /* Contextual info for line analysis. */
+       SZ code_fence_length;   /* For checking closing fence length. */
+       int html_block_type;    /* For checking closing raw HTML condition. */
+   };
+   
+   typedef enum MD_LINETYPE_tag MD_LINETYPE;
+   enum MD_LINETYPE_tag {
+       MD_LINE_BLANK,
+       MD_LINE_HR,
+       MD_LINE_ATXHEADER,
+       MD_LINE_SETEXTHEADER,
+       MD_LINE_SETEXTUNDERLINE,
+       MD_LINE_INDENTEDCODE,
+       MD_LINE_FENCEDCODE,
+       MD_LINE_HTML,
+       MD_LINE_TEXT,
+       MD_LINE_TABLE,
+       MD_LINE_TABLEUNDERLINE
+   };
+   
+   typedef struct MD_LINE_ANALYSIS_tag MD_LINE_ANALYSIS;
+   struct MD_LINE_ANALYSIS_tag {
+       MD_LINETYPE type    : 16;
+       unsigned data       : 16;
+       OFF beg;
+       OFF end;
+       unsigned indent;        /* Indentation level. */
+   };
+   
+   typedef struct MD_LINE_tag MD_LINE;
+   struct MD_LINE_tag {
+       OFF beg;
+       OFF end;
+   };
+   
+   typedef struct MD_VERBATIMLINE_tag MD_VERBATIMLINE;
+   struct MD_VERBATIMLINE_tag {
+       OFF beg;
+       OFF end;
+       OFF indent;
+   };
+   
+   
+   /*******************
+    ***  Debugging  ***
+    *******************/
+   
+   #define MD_LOG(msg)                                                     \
+       do {                                                                \
+           if(ctx->r.debug_log != NULL)                                    \
+               ctx->r.debug_log((msg), ctx->userdata);                     \
+       } while(0)
+   
+   #ifdef DEBUG
+       #define MD_ASSERT(cond)                                             \
+               do {                                                        \
+                   if(!(cond)) {                                           \
+                       MD_LOG(__FILE__ ":" STRINGIZE(__LINE__) ": "        \
+                              "Assertion '" STRINGIZE(cond) "' failed.");  \
+                       exit(1);                                            \
+                   }                                                       \
+               } while(0)
+   
+       #define MD_UNREACHABLE()        MD_ASSERT(1 == 0)
+   #else
+       #ifdef __GNUC__
+           #define MD_ASSERT(cond)     do { if(!(cond)) __builtin_unreachable(); } while(0)
+           #define MD_UNREACHABLE()    do { __builtin_unreachable(); } while(0)
+       #elif defined _MSC_VER  &&  _MSC_VER > 120
+           #define MD_ASSERT(cond)     do { __assume(cond); } while(0)
+           #define MD_UNREACHABLE()    do { __assume(0); } while(0)
+       #else
+           #define MD_ASSERT(cond)     do {} while(0)
+           #define MD_UNREACHABLE()    do {} while(0)
+       #endif
+   #endif
+   
+   
+   /*****************
+    ***  Helpers  ***
+    *****************/
+   
+   /* Character accessors. */
+   #define CH(off)                 (ctx->text[(off)])
+   #define STR(off)                (ctx->text + (off))
+   
+   /* Character classification.
+    * Note we assume ASCII compatibility of code points < 128 here. */
+   #define ISIN_(ch, ch_min, ch_max)       ((ch_min) <= (unsigned)(ch) && (unsigned)(ch) <= (ch_max))
+   #define ISANYOF_(ch, palette)           (md_strchr((palette), (ch)) != NULL)
+   #define ISANYOF2_(ch, ch1, ch2)         ((ch) == (ch1) || (ch) == (ch2))
+   #define ISANYOF3_(ch, ch1, ch2, ch3)    ((ch) == (ch1) || (ch) == (ch2) || (ch) == (ch3))
+   #define ISASCII_(ch)                    ((unsigned)(ch) <= 127)
+   #define ISBLANK_(ch)                    (ISANYOF2_((ch), _T(' '), _T('\t')))
+   #define ISNEWLINE_(ch)  
+   ... [truncated, 198820 bytes elided]
+   [exit=0]
+   (Message)
+   (ChatDBG gdb) code /work/src/md4c/md4c.c:1200
+   file '/work/src/md4c/md4c.c' not found.
+
+   (Message)
+   (ChatDBG gdb) bash: find /work -type f -name "md4c.c" | xargs grep -n "md_parse"
+   94:    /* Immutable stuff (parameters of md_parse()). */
+   5907:md_parse(const MD_CHAR* text, MD_SIZE size, const MD_RENDERER* renderer, void* userdata)
+   [exit=0]
+   (Message)
+   (ChatDBG gdb) code /work/src/md4c/md4c.c:5907
+   file '/work/src/md4c/md4c.c' not found.
+
+   (Message)
+   (ChatDBG gdb) bash: find /work -type f -name "md4c.c" | xargs head -n 6000
+   /*
+    * MD4C: Markdown parser for C
+    * (http://github.com/mity/md4c)
+    *
+    * Copyright (c) 2016-2017 Martin Mitas
+    *
+    * Permission is hereby granted, free of charge, to any person obtaining a
+    * copy of this software and associated documentation files (the "Software"),
+    * to deal in the Software without restriction, including without limitation
+    * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+    * and/or sell copies of the Software, and to permit persons to whom the
+    * Software is furnished to do so, subject to the following conditions:
+    *
+    * The above copyright notice and this permission notice shall be included in
+    * all copies or substantial portions of the Software.
+    *
+    * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+    * OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+    * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+    * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+    * IN THE SOFTWARE.
+    */
+   
+   #include "md4c.h"
+   
+   #include <stdio.h>
+   #include <stdlib.h>
+   #include <string.h>
+   
+   
+   /*****************************
+    ***  Miscellaneous Stuff  ***
+    *****************************/
+   
+   #ifdef _MSC_VER
+       /* MSVC does not understand "inline" when building as pure C (not C++).
+        * However it understands "__inline" */
+       #ifndef __cplusplus
+           #define inline __inline
+       #endif
+   #endif
+   
+   #ifdef _T
+       #undef _T
+   #endif
+   #if defined MD4C_USE_UTF16
+       #define _T(x)           L##x
+   #else
+       #define _T(x)           x
+   #endif
+   
+   /* Misc. macros. */
+   #define SIZEOF_ARRAY(a)     (sizeof(a) / sizeof(a[0]))
+   
+   #define STRINGIZE_(x)       #x
+   #define STRINGIZE(x)        STRINGIZE_(x)
+   
+   #ifndef TRUE
+       #define TRUE            1
+       #define FALSE           0
+   #endif
+   
+   
+   /************************
+    ***  Internal Types  ***
+    ************************/
+   
+   /* These are omnipresent so lets save some typing. */
+   #define CHAR    MD_CHAR
+   #define SZ      MD_SIZE
+   #define OFF     MD_OFFSET
+   
+   typedef struct MD_MARK_tag MD_MARK;
+   typedef struct MD_BLOCK_tag MD_BLOCK;
+   typedef struct MD_CONTAINER_tag MD_CONTAINER;
+   typedef struct MD_REF_DEF_tag MD_REF_DEF;
+   
+   
+   /* During analyzes of inline marks, we need to manage some "mark chains",
+    * of (yet unresolved) openers. This structure holds start/end of the chain.
+    * The chain internals are then realized through MD_MARK::prev and ::next.
+    */
+   typedef struct MD_MARKCHAIN_tag MD_MARKCHAIN;
+   struct MD_MARKCHAIN_tag {
+       int head;   /* Index of first mark in the chain, or -1 if empty. */
+       int tail;   /* Index of last mark in the chain, or -1 if empty. */
+   };
+   
+   /* Context propagated through all the parsing. */
+   typedef struct MD_CTX_tag MD_CTX;
+   struct MD_CTX_tag {
+       /* Immutable stuff (parameters of md_parse()). */
+       const CHAR* text;
+       SZ size;
+       MD_RENDERER r;
+       void* userdata;
+   
+       /* Helper temporary growing buffer. */
+       CHAR* buffer;
+       unsigned alloc_buffer;
+   
+       /* Reference definitions. */
+       MD_REF_DEF* ref_defs;
+       int n_ref_defs;
+       int alloc_ref_defs;
+       void** ref_def_hashtable;
+       int ref_def_hashtable_size;
+   
+       /* Stack of inline/span markers.
+        * This is only used for parsing a single block contents but by storing it
+        * here we may reuse the stack for subsequent blocks; i.e. we have fewer
+        * (re)allocations. */
+       MD_MARK* marks;
+       int n_marks;
+       int alloc_marks;
+   
+   #if defined MD4C_USE_UTF16
+       char mark_char_map[128];
+   #else
+       char mark_char_map[256];
+   #endif
+   
+       /* For resolving of inline spans. */
+       MD_MARKCHAIN mark_chains[8];
+   #define PTR_CHAIN               ctx->mark_chains[0]
+   #define BACKTICK_OPENERS        ctx->mark_chains[1]
+   #define LOWERTHEN_OPENERS       ctx->mark_chains[2]
+   #define ASTERISK_OPENERS        ctx->mark_chains[3]
+   #define UNDERSCORE_OPENERS      ctx->mark_chains[4]
+   #define TILDE_OPENERS           ctx->mark_chains[5]
+   #define BRACKET_OPENERS         ctx->mark_chains[6]
+   #define TABLECELLBOUNDARIES     ctx->mark_chains[7]
+   
+       int n_table_cell_boundaries;
+   
+       /* For resolving links. */
+       int unresolved_link_head;
+       int unresolved_link_tail;
+   
+       /* For block analysis.
+        * Notes:
+        *   -- It holds MD_BLOCK as well as MD_LINE structures. After each
+        *      MD_BLOCK, its (multiple) MD_LINE(s) follow.
+        *   -- For MD_BLOCK_HTML and MD_BLOCK_CODE, MD_VERBATIMLINE(s) are used
+        *      instead of MD_LINE(s).
+        */
+       void* block_bytes;
+       MD_BLOCK* current_block;
+       int n_block_bytes;
+       int alloc_block_bytes;
+   
+       /* For container block analysis. */
+       MD_CONTAINER* containers;
+       int n_containers;
+       int alloc_containers;
+   
+       int last_line_has_list_loosening_effect;
+       int last_list_item_starts_with_two_blank_lines;
+   
+       /* Minimal indentation to call the block "indented code block". */
+       unsigned code_indent_offset;
+   
+       /* Contextual info for line analysis. */
+       SZ code_fence_length;   /* For checking closing fence length. */
+       int html_block_type;    /* For checking closing raw HTML condition. */
+   };
+   
+   typedef enum MD_LINETYPE_tag MD_LINETYPE;
+   enum MD_LINETYPE_tag {
+       MD_LINE_BLANK,
+       MD_LINE_HR,
+       MD_LINE_ATXHEADER,
+       MD_LINE_SETEXTHEADER,
+       MD_LINE_SETEXTUNDERLINE,
+       MD_LINE_INDENTEDCODE,
+       MD_LINE_FENCEDCODE,
+       MD_LINE_HTML,
+       MD_LINE_TEXT,
+       MD_LINE_TABLE,
+       MD_LINE_TABLEUNDERLINE
+   };
+   
+   typedef struct MD_LINE_ANALYSIS_tag MD_LINE_ANALYSIS;
+   struct MD_LINE_ANALYSIS_tag {
+       MD_LINETYPE type    : 16;
+       unsigned data       : 16;
+       OFF beg;
+       OFF end;
+       unsigned indent;        /* Indentation level. */
+   };
+   
+   typedef struct MD_LINE_tag MD_LINE;
+   struct MD_LINE_tag {
+       OFF beg;
+       OFF end;
+   };
+   
+   typedef struct MD_VERBATIMLINE_tag MD_VERBATIMLINE;
+   struct MD_VERBATIMLINE_tag {
+       OFF beg;
+       OFF end;
+       OFF indent;
+   };
+   
+   
+   /*******************
+    ***  Debugging  ***
+    *******************/
+   
+   #define MD_LOG(msg)                                                     \
+       do {                                                                \
+           if(ctx->r.debug_log != NULL)                                    \
+               ctx->r.debug_log((msg), ctx->userdata);                     \
+       } while(0)
+   
+   #ifdef DEBUG
+       #define MD_ASSERT(cond)                                             \
+               do {                                                        \
+                   if(!(cond)) {                                           \
+                       MD_LOG(__FILE__ ":" STRINGIZE(__LINE__) ": "        \
+                              "Assertion '" STRINGIZE(cond) "' failed.");  \
+                       exit(1);                                            \
+                   }                                                       \
+               } while(0)
+   
+       #define MD_UNREACHABLE()        MD_ASSERT(1 == 0)
+   #else
+       #ifdef __GNUC__
+           #define MD_ASSERT(cond)     do { if(!(cond)) __builtin_unreachable(); } while(0)
+           #define MD_UNREACHABLE()    do { __builtin_unreachable(); } while(0)
+       #elif defined _MSC_VER  &&  _MSC_VER > 120
+           #define MD_ASSERT(cond)     do { __assume(cond); } while(0)
+           #define MD_UNREACHABLE()    do { __assume(0); } while(0)
+       #else
+           #define MD_ASSERT(cond)     do {} while(0)
+           #define MD_UNREACHABLE()    do {} while(0)
+       #endif
+   #endif
+   
+   
+   /*****************
+    ***  Helpers  ***
+    *****************/
+   
+   /* Character accessors. */
+   #define CH(off)                 (ctx->text[(off)])
+   #define STR(off)                (ctx->text + (off))
+   
+   /* Character classification.
+    * Note we assume ASCII compatibility of code points < 128 here. */
+   #define ISIN_(ch, ch_min, ch_max)       ((ch_min) <= (unsigned)(ch) && (unsigned)(ch) <= (ch_max))
+   #define ISANYOF_(ch, palette)           (md_strchr((palette), (ch)) != NULL)
+   #define ISANYOF2_(ch, ch1, ch2)         ((ch) == (ch1) || (ch) == (ch2))
+   #define ISANYOF3_(ch, ch1, ch2, ch3)    ((ch) == (ch1) || (ch) == (ch2) || (ch) == (ch3))
+   #define ISASCII_(ch)                    ((unsigned)(ch) <= 127)
+   #define ISBLANK_(ch)                    (ISANYOF2_((ch), _T(' '), _T('\t')))
+   #define ISNEWLINE_(ch)  
+   ... [truncated, 198820 bytes elided]
+   [exit=0]
+   (Message)
+   (ChatDBG gdb) bash: find /work -type f -name "md4c.c" | xargs grep -n "md_parse"
+   94:    /* Immutable stuff (parameters of md_parse()). */
+   5907:md_parse(const MD_CHAR* text, MD_SIZE size, const MD_RENDERER* renderer, void* userdata)
+   [exit=0]
+   (Message)
+   (ChatDBG gdb) code /work/src/md4c/md4c.c:5907
+   file '/work/src/md4c/md4c.c' not found.
+
+   (Message)
+   (ChatDBG gdb) bash: find /work -type f -name "md4c.c" | xargs cat | grep -n "md_parse"
+   94:    /* Immutable stuff (parameters of md_parse()). */
+   5907:md_parse(const MD_CHAR* text, MD_SIZE size, const MD_RENDERER* renderer, void* userdata)
+   [exit=0]
+   (Message)
+   (ChatDBG gdb) bash: find /work -type f -name "md4c.c" | xargs cat | grep -A 50 -B 50 "md_parse"
+   
+   #ifdef _T
+       #undef _T
+   #endif
+   #if defined MD4C_USE_UTF16
+       #define _T(x)           L##x
+   #else
+       #define _T(x)           x
+   #endif
+   
+   /* Misc. macros. */
+   #define SIZEOF_ARRAY(a)     (sizeof(a) / sizeof(a[0]))
+   
+   #define STRINGIZE_(x)       #x
+   #define STRINGIZE(x)        STRINGIZE_(x)
+   
+   #ifndef TRUE
+       #define TRUE            1
+       #define FALSE           0
+   #endif
+   
+   
+   /************************
+    ***  Internal Types  ***
+    ************************/
+   
+   /* These are omnipresent so lets save some typing. */
+   #define CHAR    MD_CHAR
+   #define SZ      MD_SIZE
+   #define OFF     MD_OFFSET
+   
+   typedef struct MD_MARK_tag MD_MARK;
+   typedef struct MD_BLOCK_tag MD_BLOCK;
+   typedef struct MD_CONTAINER_tag MD_CONTAINER;
+   typedef struct MD_REF_DEF_tag MD_REF_DEF;
+   
+   
+   /* During analyzes of inline marks, we need to manage some "mark chains",
+    * of (yet unresolved) openers. This structure holds start/end of the chain.
+    * The chain internals are then realized through MD_MARK::prev and ::next.
+    */
+   typedef struct MD_MARKCHAIN_tag MD_MARKCHAIN;
+   struct MD_MARKCHAIN_tag {
+       int head;   /* Index of first mark in the chain, or -1 if empty. */
+       int tail;   /* Index of last mark in the chain, or -1 if empty. */
+   };
+   
+   /* Context propagated through all the parsing. */
+   typedef struct MD_CTX_tag MD_CTX;
+   struct MD_CTX_tag {
+       /* Immutable stuff (parameters of md_parse()). */
+       const CHAR* text;
+       SZ size;
+       MD_RENDERER r;
+       void* userdata;
+   
+       /* Helper temporary growing buffer. */
+       CHAR* buffer;
+       unsigned alloc_buffer;
+   
+       /* Reference definitions. */
+       MD_REF_DEF* ref_defs;
+       int n_ref_defs;
+       int alloc_ref_defs;
+       void** ref_def_hashtable;
+       int ref_def_hashtable_size;
+   
+       /* Stack of inline/span markers.
+        * This is only used for parsing a single block contents but by storing it
+        * here we may reuse the stack for subsequent blocks; i.e. we have fewer
+        * (re)allocations. */
+       MD_MARK* marks;
+       int n_marks;
+       int alloc_marks;
+   
+   #if defined MD4C_USE_UTF16
+       char mark_char_map[128];
+   #else
+       char mark_char_map[256];
+   #endif
+   
+       /* For resolving of inline spans. */
+       MD_MARKCHAIN mark_chains[8];
+   #define PTR_CHAIN               ctx->mark_chains[0]
+   #define BACKTICK_OPENERS        ctx->mark_chains[1]
+   #define LOWERTHEN_OPENERS       ctx->mark_chains[2]
+   #define ASTERISK_OPENERS        ctx->mark_chains[3]
+   #define UNDERSCORE_OPENERS      ctx->mark_chains[4]
+   #define TILDE_OPENERS           ctx->mark_chains[5]
+   #define BRACKET_OPENERS         ctx->mark_chains[6]
+   #define TABLECELLBOUNDARIES     ctx->mark_chains[7]
+   
+       int n_table_cell_boundaries;
+   
+       /* For resolving links. */
+       int unresolved_link_head;
+       int unresolved_link_tail;
+   
+       /* For block analysis.
+        * Notes:
+        *   -- It holds MD_BLOCK as well as MD_LINE structures. After each
+   --
+           if(line == pivot_line)
+               line = (line == &line_buf[0] ? &line_buf[1] : &line_buf[0]);
+   
+           MD_CHECK(md_analyze_line(ctx, off, &off, pivot_line, line));
+           MD_CHECK(md_process_line(ctx, &pivot_line, line));
+       }
+   
+       md_end_current_block(ctx);
+   
+       MD_CHECK(md_build_ref_def_hashtable(ctx));
+   
+       /* Process all blocks. */
+       MD_CHECK(md_leave_child_containers(ctx, 0));
+       MD_CHECK(md_process_all_blocks(ctx));
+   
+       MD_LEAVE_BLOCK(MD_BLOCK_DOC, NULL);
+   
+   abort:
+   
+   #if 0
+       /* Output some memory consumption statistics. */
+       {
+           char buffer[256];
+           sprintf(buffer, "Alloced %u bytes for block buffer.",
+                       (unsigned)(ctx->alloc_block_bytes));
+           MD_LOG(buffer);
+   
+           sprintf(buffer, "Alloced %u bytes for containers buffer.",
+                       (unsigned)(ctx->alloc_containers * sizeof(MD_CONTAINER)));
+           MD_LOG(buffer);
+   
+           sprintf(buffer, "Alloced %u bytes for marks buffer.",
+                       (unsigned)(ctx->alloc_marks * sizeof(MD_MARK)));
+           MD_LOG(buffer);
+   
+           sprintf(buffer, "Alloced %u bytes for aux. buffer.",
+                       (unsigned)(ctx->alloc_buffer * sizeof(MD_CHAR)));
+           MD_LOG(buffer);
+       }
+   #endif
+   
+       return ret;
+   }
+   
+   
+   /********************
+    ***  Public API  ***
+    ********************/
+   
+   int
+   md_parse(const MD_CHAR* text, MD_SIZE size, const MD_RENDERER* renderer, void* userdata)
+   {
+       MD_CTX ctx;
+       int i;
+       int ret;
+   
+       /* Setup context structure. */
+       memset(&ctx, 0, sizeof(MD_CTX));
+       ctx.text = text;
+       ctx.size = size;
+       memcpy(&ctx.r, renderer, sizeof(MD_RENDERER));
+       ctx.userdata = userdata;
+       ctx.code_indent_offset = (ctx.r.flags & MD_FLAG_NOINDENTEDCODEBLOCKS) ? (OFF)(-1) : 4;
+       md_build_mark_char_map(&ctx);
+   
+       /* Reset all unresolved opener mark chains. */
+       for(i = 0; i < SIZEOF_ARRAY(ctx.mark_chains); i++) {
+           ctx.mark_chains[i].head = -1;
+           ctx.mark_chains[i].tail = -1;
+       }
+       ctx.unresolved_link_head = -1;
+       ctx.unresolved_link_tail = -1;
+   
+       /* All the work. */
+       ret = md_process_doc(&ctx);
+   
+       /* Clean-up. */
+       md_free_ref_defs(&ctx);
+       md_free_ref_def_hashtable(&ctx);
+       free(ctx.buffer);
+       free(ctx.marks);
+       free(ctx.block_bytes);
+       free(ctx.containers);
+   
+       return ret;
+   }
+   [exit=0]
+   (Message)
+   (ChatDBG gdb) code /work/src/md4c/md4c.c:5950
+   file '/work/src/md4c/md4c.c' not found.
+
+   (Message)
+   (ChatDBG gdb) bash: find /work -type f -name "md4c.c" | xargs sed -n '5950,5960p'
+   [no output]
+   [exit=0]
+
+[Cost: ~$0.00 USD]
+(ChatDBG chatting) *** Writing ChatDBG dialog log to /results/chatdbg.log.yaml
+*** Ablation data written to /results/collect.json
+Thank you for using ChatDBG!
+Share your success stories here: https://github.com/plasma-umass/ChatDBG/issues/53
+   (Message)

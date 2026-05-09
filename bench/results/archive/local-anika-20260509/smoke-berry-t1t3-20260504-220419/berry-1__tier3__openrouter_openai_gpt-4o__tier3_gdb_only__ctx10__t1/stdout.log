@@ -1,0 +1,254 @@
+Catchpoint 1 (exec)
+Breakpoint 2 at 0x10620: file src/be_api.c, line 1020.
+Breakpoint 3 at 0xb4d0
+Breakpoint 4 at 0xb5e0
+Breakpoint 5 at 0xb830
+Breakpoint 6 (_exit) pending.
+
+Breakpoint 2, be_raise (vm=vm@entry=0x5555555912a0, except=except@entry=0x55555558128f "assert_failed", msg=0x555555581280 "assert failed!") at src/be_api.c:1020
+1020	{
+   (Message)
+   (ChatDBG gdb) info locals
+   No locals.
+
+   (ChatDBG gdb) code src/be_api.c:1020
+   1013 BERRY_API int be_pcall(bvm *vm, int argc)
+   1014 {
+   1015     bvalue *f = vm->top - argc - 1;
+   1016     return be_protectedcall(vm, f, argc);
+   1017 }
+   1018 
+   1019 BERRY_API void be_raise(bvm *vm, const char *except, const char *msg)
+   1020 {
+   1021     be_pushstring(vm, except);
+   1022     if (msg) {
+   1023         be_pushstring(vm, msg);
+
+   (ChatDBG gdb) code src/be_baselib.c:31
+   24     /* assertion fails when there is no argument
+   25      * or the first argument is nil or false. */
+   26     if (!argc || !be_tobool(vm, 1)) {
+   27         const char *msg = "assert failed!";
+   28         if (argc >= 2 && be_isstring(vm, 2)) {
+   29             msg = be_tostring(vm, 2);
+   30         }
+   31         be_raise(vm, "assert_failed", msg);
+   32     }
+   33     be_return_nil(vm);
+   34 }
+
+   (Message)
+   (ChatDBG gdb) code src/be_exec.c:113
+   106 int be_execprotected(bvm *vm, bpfunc f, void *data)
+   107 {
+   108     struct blongjmp jmp;
+   109     jmp.status = 0;
+   110     jmp.prev = vm->errjmp; /* save long jump position */
+   111     vm->errjmp = &jmp;
+   112     exec_try(vm->errjmp) {
+   113         f(vm, data);
+   114     }
+   115     vm->errjmp = jmp.prev; /* restore long jump position */
+   116     return jmp.status;
+
+   (ChatDBG gdb) code src/be_exec.c:308
+   301 {
+   302     int res;
+   303     struct pcall s;
+   304     struct vmstate state;
+   305     s.v = v;
+   306     s.argc = argc;
+   307     vm_state_save(vm, &state);
+   308     res = be_execprotected(vm, m_pcall, &s);
+   309     if (res) { /* restore call stack */
+   310         vm_state_restore(vm, &state, res);
+   311     }
+
+   (ChatDBG gdb) code src/be_api.c:1016
+   1009     bvalue *fval = vm->top - argc - 1;
+   1010     be_dofunc(vm, fval, argc);
+   1011 }
+   1012 
+   1013 BERRY_API int be_pcall(bvm *vm, int argc)
+   1014 {
+   1015     bvalue *f = vm->top - argc - 1;
+   1016     return be_protectedcall(vm, f, argc);
+   1017 }
+   1018 
+   1019 BERRY_API void be_raise(bvm *vm, const char *except, const char *msg)
+
+   
+   (Message) The program is failing because of an assertion that is raising an
+   exception, which is then captured within a protected call mechanism. Here is
+   the walk-through and root cause analysis of the failure:
+   
+   ### Program Walk-through
+   1. **Frame #9 (`argv` in `default/berry.c:365`) through Frame #8
+   (`analysis_args` in `default/berry.c:337`)**:
+      - These primarily deal with loading and analyzing the script arguments.
+   They likely parse command-line arguments and prepare the script for
+   execution.
+   
+   2. **Frame #7 (`load_script` in `default/berry.c:223`) & Frame #6 (`doscript`
+   in `default/berry.c:207`)**:
+      - These frames would handle the actual loading and initiation of the
+   script's execution.
+   
+   3. **Frame #5 (`argc` in `src/be_api.c:1016`)**:
+      - This frame leads to initiating a protected call with `be_protectedcall`,
+   where the script begins executing functions, and stack frames start being set
+   up.
+   
+   4. **Frame #4 (`argc` in `src/be_exec.c:308`)**:
+      - Protected call and exception mechanisms are in play. The script function
+   `m_pcall` is executed here.
+   
+   5. **Frame #3 (`data` in `src/be_exec.c:113`)**:
+      - Execution enters the protected call region where exceptions are captured
+   within an execution framework.
+   
+   6. **Frame #2 (`l_assert` in `src/be_baselib.c:31`)**:
+      - This is the location of the assertion mechanism. The `l_assert` function
+   checks its arguments. If there are none or the first argument evaluates to
+   false, it raises an "assert_failed" exception. It seems that this condition
+   has been met, causing the program to raise the exception.
+   
+   7. **Frame #1 (`msg` in `src/be_api.c:1020`)**:
+      - This frame corresponds to the actual raising of the exception
+   (`be_raise`). It pushes the exception name and message onto the virtual
+   machine's environment for handling.
+   
+   ### State Details
+   - The execution path indicates the exception arises due to the first argument
+   for the `assert` function either being `nil`, `false`, or completely missing,
+   which is interpreted as the assertion condition not being satisfied.
+   
+   ### Root Cause
+   The root cause of the failure seems to be in the logic of the `l_assert`
+   function which raises an exception when no true-like first argument is
+   provided. In a correct scenario, the script should be providing a meaningful
+   assertion condition as the first argument to this `assert` function.
+   
+   ### Fixing the Issue
+   We'll provide a local fix and a global fix concerning both the code that
+   raised the exception and the overall robustness.
+   
+   - **ROOT CAUSE**: `src/be_baselib.c:31` - The function `l_assert` raises an
+   exception if its first argument is `nil`, `false`, or absent—causing the
+   current crash during the test execution of `tests/bitwise.be`.
+   
+   - **LOCAL FIX**:
+     To mitigate against raising exceptions due to missing or false assertion
+   conditions, the calling scripts (like `tests/bitwise.be`) should ensure valid
+   conditions are passed. Here's a potential fix if we assume the `assert` call
+   shouldn't unexpectedly fail due to a missing valid argument:
+   ```c
+     if (!argc) {
+         be_raise(vm, "assert_failed", "missing assertion condition");
+     } else if (!be_tobool(vm, 1)) {
+         const char *msg = argc >= 2 && be_isstring(vm, 2) ? be_tostring(vm, 2) : "assert failed!";
+         be_raise(vm, "assert_failed", msg);
+     }
+     ```
+   
+   - **GLOBAL FIX**:
+     To reduce the risk of similar assertions failing unexpectedly,
+     - **Design Approach**: Use a mandatory assertion condition in your source
+   code checks, which means scripts should include a basic level of exception
+   handling when calling functions like `assert`.
+     - **Framework Improvement**: Frameworks or language runtime functions
+   should document and enforce conditions more strictly, potentially offering
+   default assertion checks.
+     - **Developer's Transparency**: More transparency about what the assertion
+   condition should be (as a best practice and script template guidance) to
+   prevent misuse.
+
+[Cost: ~$0.04 USD]
+(ChatDBG chatting) *** Writing ChatDBG dialog log to /results/chatdbg.log.yaml
+*** Ablation data written to /results/collect.json
+Thank you for using ChatDBG!
+Share your success stories here: https://github.com/plasma-umass/ChatDBG/issues/53
+   (Message) The program is failing because of an assertion that is raising an
+   exception, which is then captured within a protected call mechanism. Here is
+   the walk-through and root cause analysis of the failure:
+   
+   ### Program Walk-through
+   1. **Frame #9 (`argv` in `default/berry.c:365`) through Frame #8
+   (`analysis_args` in `default/berry.c:337`)**:
+      - These primarily deal with loading and analyzing the script arguments.
+   They likely parse command-line arguments and prepare the script for
+   execution.
+   
+   2. **Frame #7 (`load_script` in `default/berry.c:223`) & Frame #6 (`doscript`
+   in `default/berry.c:207`)**:
+      - These frames would handle the actual loading and initiation of the
+   script's execution.
+   
+   3. **Frame #5 (`argc` in `src/be_api.c:1016`)**:
+      - This frame leads to initiating a protected call with `be_protectedcall`,
+   where the script begins executing functions, and stack frames start being set
+   up.
+   
+   4. **Frame #4 (`argc` in `src/be_exec.c:308`)**:
+      - Protected call and exception mechanisms are in play. The script function
+   `m_pcall` is executed here.
+   
+   5. **Frame #3 (`data` in `src/be_exec.c:113`)**:
+      - Execution enters the protected call region where exceptions are captured
+   within an execution framework.
+   
+   6. **Frame #2 (`l_assert` in `src/be_baselib.c:31`)**:
+      - This is the location of the assertion mechanism. The `l_assert` function
+   checks its arguments. If there are none or the first argument evaluates to
+   false, it raises an "assert_failed" exception. It seems that this condition
+   has been met, causing the program to raise the exception.
+   
+   7. **Frame #1 (`msg` in `src/be_api.c:1020`)**:
+      - This frame corresponds to the actual raising of the exception
+   (`be_raise`). It pushes the exception name and message onto the virtual
+   machine's environment for handling.
+   
+   ### State Details
+   - The execution path indicates the exception arises due to the first argument
+   for the `assert` function either being `nil`, `false`, or completely missing,
+   which is interpreted as the assertion condition not being satisfied.
+   
+   ### Root Cause
+   The root cause of the failure seems to be in the logic of the `l_assert`
+   function which raises an exception when no true-like first argument is
+   provided. In a correct scenario, the script should be providing a meaningful
+   assertion condition as the first argument to this `assert` function.
+   
+   ### Fixing the Issue
+   We'll provide a local fix and a global fix concerning both the code that
+   raised the exception and the overall robustness.
+   
+   - **ROOT CAUSE**: `src/be_baselib.c:31` - The function `l_assert` raises an
+   exception if its first argument is `nil`, `false`, or absent—causing the
+   current crash during the test execution of `tests/bitwise.be`.
+   
+   - **LOCAL FIX**:
+     To mitigate against raising exceptions due to missing or false assertion
+   conditions, the calling scripts (like `tests/bitwise.be`) should ensure valid
+   conditions are passed. Here's a potential fix if we assume the `assert` call
+   shouldn't unexpectedly fail due to a missing valid argument:
+   ```c
+     if (!argc) {
+         be_raise(vm, "assert_failed", "missing assertion condition");
+     } else if (!be_tobool(vm, 1)) {
+         const char *msg = argc >= 2 && be_isstring(vm, 2) ? be_tostring(vm, 2) : "assert failed!";
+         be_raise(vm, "assert_failed", msg);
+     }
+     ```
+   
+   - **GLOBAL FIX**:
+     To reduce the risk of similar assertions failing unexpectedly,
+     - **Design Approach**: Use a mandatory assertion condition in your source
+   code checks, which means scripts should include a basic level of exception
+   handling when calling functions like `assert`.
+     - **Framework Improvement**: Frameworks or language runtime functions
+   should document and enforce conditions more strictly, potentially offering
+   default assertion checks.
+     - **Developer's Transparency**: More transparency about what the assertion
+   condition should be (as a best practice and script template guidance) to
+   prevent misuse.

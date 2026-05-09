@@ -1,0 +1,547 @@
+Breakpoint 1 at 0x2bf30
+Breakpoint 2 (__assert_fail) pending.
+Breakpoint 3 at 0x2ca00
+Breakpoint 4 (_exit) pending.
+[Attaching after process 19 fork to child process 22]
+[New inferior 2 (process 22)]
+[Detaching after fork from parent process 19]
+[Inferior 1 (process 19) detached]
+process 22 is executing new program: /bin/bash
+[Switching to process 22]
+
+Thread 2.1 "bash" hit Breakpoint 3, 0x00007b2503033110 in exit () from /lib/x86_64-linux-gnu/libc.so.6
+could not retrieve source code for any frames.
+   (Message)
+   (ChatDBG gdb) bash: find /work -type f -name "*.cpp" -o -name "*.cxx" -o -name "*.cc" -o -name "*.c" | head -20
+   /work/addons/test/cert-test.c
+   /work/addons/test/cert-test.cpp
+   /work/addons/test/misc-test.cpp
+   /work/addons/test/misra/misra-suppressions1-test.c
+   /work/addons/test/misra/misra-suppressions2-test.c
+   /work/addons/test/misra/misra-test.c
+   /work/addons/test/misra/misra-test.cpp
+   /work/addons/test/namingng_test.c
+   /work/addons/test/naming_test.c
+   /work/addons/test/naming_test.cpp
+   /work/addons/test/path1/misra-suppressions1-test.c
+   /work/addons/test/path1/misra-suppressions2-test.c
+   /work/addons/test/y2038/y2038-test-1-bad-time-bits.c
+   /work/addons/test/y2038/y2038-test-2-no-time-bits.c
+   /work/addons/test/y2038/y2038-test-3-no-use-time-bits.c
+   /work/addons/test/y2038/y2038-test-4-good.c
+   /work/addons/test/y2038/y2038-test-5-good-no-time-used.c
+   /work/build/CMakeFiles/3.25.2/CompilerIdC/CMakeCCompilerId.c
+   /work/build/CMakeFiles/3.25.2/CompilerIdCXX/CMakeCXXCompilerId.cpp
+   /work/cli/cmdlineparser.cpp
+   [exit=0]
+   (Message)
+   (ChatDBG gdb) bash: grep -R "exit(" /work --include="*.cpp" --include="*.c" --include="*.h" --include="*.hpp" | grep -v test | head -20
+   /work/cli/threadexecutor.cpp:        std::exit(0);
+   /work/cli/threadexecutor.cpp:        std::exit(0);
+   /work/cli/threadexecutor.cpp:        std::exit(0);
+   /work/cli/threadexecutor.cpp:                std::exit(EXIT_FAILURE);
+   /work/cli/threadexecutor.cpp:                std::exit(EXIT_FAILURE);
+   /work/cli/threadexecutor.cpp:                std::exit(EXIT_FAILURE);
+   /work/cli/threadexecutor.cpp:                std::exit(EXIT_FAILURE);
+   /work/cli/threadexecutor.cpp:                std::exit(0);
+   /work/cli/threadexecutor.cpp:        std::exit(0);
+   /work/cli/threadexecutor.cpp:            exit(EXIT_FAILURE);
+   /work/cli/threadexecutor.cpp:            exit(EXIT_FAILURE);
+   /work/cli/threadexecutor.cpp:            exit(EXIT_FAILURE);
+   /work/cli/threadexecutor.cpp:            exit(EXIT_FAILURE);
+   /work/cli/threadexecutor.cpp:            exit(EXIT_FAILURE);
+   [exit=0]
+   (Message)
+*** Exception in function call: 'str_replace_editor'
+   (Message)
+*** Exception in function call: 'str_replace_editor'
+   (Message)
+   (ChatDBG gdb) bash: cat /work/cli/threadexecutor.cpp
+   /*
+    * Cppcheck - A tool for static C/C++ code analysis
+    * Copyright (C) 2007-2020 Cppcheck team.
+    *
+    * This program is free software: you can redistribute it and/or modify
+    * it under the terms of the GNU General Public License as published by
+    * the Free Software Foundation, either version 3 of the License, or
+    * (at your option) any later version.
+    *
+    * This program is distributed in the hope that it will be useful,
+    * but WITHOUT ANY WARRANTY; without even the implied warranty of
+    * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    * GNU General Public License for more details.
+    *
+    * You should have received a copy of the GNU General Public License
+    * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+    */
+   
+   #include "threadexecutor.h"
+   
+   #include "config.h"
+   #include "cppcheck.h"
+   #include "cppcheckexecutor.h"
+   #include "importproject.h"
+   #include "settings.h"
+   #include "suppressions.h"
+   
+   #include <algorithm>
+   #include <cerrno>
+   #include <cstdlib>
+   #include <cstring>
+   #include <iostream>
+   #include <utility>
+   
+   #ifdef __SVR4  // Solaris
+   #include <sys/loadavg.h>
+   #endif
+   #ifdef THREADING_MODEL_FORK
+   #if defined(__linux__)
+   #include <sys/prctl.h>
+   #endif
+   #include <sys/select.h>
+   #include <sys/wait.h>
+   #include <fcntl.h>
+   #include <unistd.h>
+   #endif
+   #ifdef THREADING_MODEL_WIN
+   #include <process.h>
+   #include <windows.h>
+   #endif
+   
+   // required for FD_ZERO
+   using std::memset;
+   
+   ThreadExecutor::ThreadExecutor(const std::map<std::string, std::size_t> &files, Settings &settings, ErrorLogger &errorLogger)
+       : mFiles(files), mSettings(settings), mErrorLogger(errorLogger), mFileCount(0)
+         // Not initialized mFileSync, mErrorSync, mReportSync
+   {
+   #if defined(THREADING_MODEL_FORK)
+       mWpipe = 0;
+   #elif defined(THREADING_MODEL_WIN)
+       mProcessedFiles = 0;
+       mTotalFiles = 0;
+       mProcessedSize = 0;
+       mTotalFileSize = 0;
+   #endif
+   }
+   
+   ThreadExecutor::~ThreadExecutor()
+   {
+       //dtor
+   }
+   
+   
+   ///////////////////////////////////////////////////////////////////////////////
+   ////// This code is for platforms that support fork() only ////////////////////
+   ///////////////////////////////////////////////////////////////////////////////
+   
+   #if defined(THREADING_MODEL_FORK)
+   
+   void ThreadExecutor::addFileContent(const std::string &path, const std::string &content)
+   {
+       mFileContents[ path ] = content;
+   }
+   
+   int ThreadExecutor::handleRead(int rpipe, unsigned int &result)
+   {
+       char type = 0;
+       if (read(rpipe, &type, 1) <= 0) {
+           if (errno == EAGAIN)
+               return 0;
+   
+           return -1;
+       }
+   
+       if (type != REPORT_OUT && type != REPORT_ERROR && type != REPORT_INFO && type != CHILD_END) {
+           std::cerr << "#### ThreadExecutor::handleRead error, type was:" << type << std::endl;
+           std::exit(0);
+       }
+   
+       unsigned int len = 0;
+       if (read(rpipe, &len, sizeof(len)) <= 0) {
+           std::cerr << "#### ThreadExecutor::handleRead error, type was:" << type << std::endl;
+           std::exit(0);
+       }
+   
+       // Don't rely on incoming data being null-terminated.
+       // Allocate +1 element and null-terminate the buffer.
+       char *buf = new char[len + 1];
+       const ssize_t readIntoBuf = read(rpipe, buf, len);
+       if (readIntoBuf <= 0) {
+           std::cerr << "#### ThreadExecutor::handleRead error, type was:" << type << std::endl;
+           std::exit(0);
+       }
+       buf[readIntoBuf] = 0;
+   
+       if (type == REPORT_OUT) {
+           mErrorLogger.reportOut(buf);
+       } else if (type == REPORT_ERROR || type == REPORT_INFO) {
+           ErrorMessage msg;
+           msg.deserialize(buf);
+   
+           if (!mSettings.nomsg.isSuppressed(msg.toSuppressionsErrorMessage())) {
+               // Alert only about unique errors
+               std::string errmsg = msg.toString(mSettings.verbose);
+               if (std::find(mErrorList.begin(), mErrorList.end(), errmsg) == mErrorList.end()) {
+                   mErrorList.emplace_back(errmsg);
+                   if (type == REPORT_ERROR)
+                       mErrorLogger.reportErr(msg);
+                   else
+                       mErrorLogger.reportInfo(msg);
+               }
+           }
+       } else if (type == CHILD_END) {
+           std::istringstream iss(buf);
+           unsigned int fileResult = 0;
+           iss >> fileResult;
+           result += fileResult;
+           delete [] buf;
+           return -1;
+       }
+   
+       delete [] buf;
+       return 1;
+   }
+   
+   bool ThreadExecutor::checkLoadAverage(size_t nchildren)
+   {
+   #if defined(__CYGWIN__) || defined(__QNX__)  // getloadavg() is unsupported on Cygwin, Qnx.
+       return true;
+   #else
+       if (!nchildren || !mSettings.loadAverage) {
+           return true;
+       }
+   
+       double sample(0);
+       if (getloadavg(&sample, 1) != 1) {
+           // disable load average checking on getloadavg error
+           return true;
+       } else if (sample < mSettings.loadAverage) {
+           return true;
+       }
+       return false;
+   #endif
+   }
+   
+   unsigned int ThreadExecutor::check()
+   {
+       mFileCount = 0;
+       unsigned int result = 0;
+   
+       std::size_t totalfilesize = 0;
+       for (std::map<std::string, std::size_t>::const_iterator i = mFiles.begin(); i != mFiles.end(); ++i) {
+           totalfilesize += i->second;
+       }
+   
+       std::list<int> rpipes;
+       std::map<pid_t, std::string> childFile;
+       std::map<int, std::string> pipeFile;
+       std::size_t processedsize = 0;
+       std::map<std::string, std::size_t>::const_iterator iFile = mFiles.begin();
+       std::list<ImportProject::FileSettings>::const_iterator iFileSettings = mSettings.project.fileSettings.begin();
+       for (;;) {
+           // Start a new child
+           size_t nchildren = rpipes.size();
+           if ((iFile != mFiles.end() || iFileSettings != mSettings.project.fileSettings.end()) && nchildren < mSettings.jobs && checkLoadAverage(nchildren)) {
+               int pipes[2];
+               if (pipe(pipes) == -1) {
+                   std::cerr << "#### ThreadExecutor::check, pipe() failed: "<< std::strerror(errno) << std::endl;
+                   std::exit(EXIT_FAILURE);
+               }
+   
+               int flags = 0;
+               if ((flags = fcntl(pipes[0], F_GETFL, 0)) < 0) {
+                   std::cerr << "#### ThreadExecutor::check, fcntl(F_GETFL) failed: "<< std::strerror(errno) << std::endl;
+                   std::exit(EXIT_FAILURE);
+               }
+   
+               if (fcntl(pipes[0], F_SETFL, flags | O_NONBLOCK) < 0) {
+                   std::cerr << "#### ThreadExecutor::check, fcntl(F_SETFL) failed: "<< std::strerror(errno) << std::endl;
+                   std::exit(EXIT_FAILURE);
+               }
+   
+               pid_t pid = fork();
+               if (pid < 0) {
+                   // Error
+                   std::cerr << "#### ThreadExecutor::check, Failed to create child process: "<< std::strerror(errno) << std::endl;
+                   std::exit(EXIT_FAILURE);
+               } else if (pid == 0) {
+   #if defined(__linux__)
+                   prctl(PR_SET_PDEATHSIG, SIGHUP);
+   #endif
+                   close(pipes[0]);
+                   mWpipe = pipes[1];
+   
+                   CppCheck fileChecker(*this, false, CppCheckExecutor::executeCommand);
+                   fileChecker.settings() = mSettings;
+                   unsigned int resultOfCheck = 0;
+   
+                   if (iFileSettings != mSettings.project.fileSettings.end()) {
+                       resultOfCheck = fileChecker.check(*iFileSettings);
+                   } else if (!mFileContents.empty() && mFileContents.find(iFile->first) != mFileContents.end()) {
+                       // File content was given as a string
+                       resultOfCheck = fileChecker.check(iFile->first, mFileContents[ iFile->first ]);
+                   } else {
+                       // Read file from a file
+                       resultOfCheck = fileChecker.check(iFile->first);
+                   }
+   
+                   std::ostringstream oss;
+                   oss << resultOfCheck;
+                   writeToPipe(CHILD_END, oss.str());
+                   std::exit(0);
+               }
+   
+               close(pipes[1]);
+               rpipes.push_back(pipes[0]);
+               if (iFileSettings != mSettings.project.fileSettings.end()) {
+                   childFile[pid] = iFileSettings->filename + ' ' + iFileSettings->cfg;
+                   pipeFile[pipes[0]] = iFileSettings->filename + ' ' + iFileSettings->cfg;
+                   ++iFileSettings;
+               } else {
+                   childFile[pid] = iFile->first;
+                   pipeFile[pipes[0]]
+   ... [truncated, 10939 bytes elided]
+   [exit=0]
+   (Message)
+   (ChatDBG gdb) bash: grep -R "exit(8)" /work --include="*.cpp" --include="*.c" --include="*.h" --include="*.hpp"
+   [no output]
+   [exit=1]
+   (Message)
+   (ChatDBG gdb) bash: grep -R "exit(8)" /work --include="*.cpp" --include="*.c" --include="*.h" --include="*.hpp"
+   [no output]
+   [exit=1]
+   (Message)
+   (ChatDBG gdb) bash: grep -r "bugscpp" /work
+   [no output]
+   [exit=1]
+   (Message)
+   (ChatDBG gdb) bash: grep -rn "exit_shell" /work
+   [no output]
+   [exit=1]
+   (Message)
+   (ChatDBG gdb) bash: grep -r "exit_shell" /work
+   [no output]
+   [exit=1]
+   (Message)
+   (ChatDBG gdb) bash: find /work -name "*.cpp" -exec grep -l "\bexit\b" {} \; | head -10
+   /work/cli/cppcheckexecutor.cpp
+   /work/cli/threadexecutor.cpp
+   /work/gui/mainwindow.cpp
+   /work/gui/test/data/benchmark/simple.cpp
+   /work/lib/astutils.cpp
+   /work/lib/checkcondition.cpp
+   /work/lib/checkother.cpp
+   /work/lib/library.cpp
+   /work/lib/tokenize.cpp
+   /work/test/cfg/std.cpp
+   [stderr]
+   find: grep terminated by signal 13
+   find: grep terminated by signal 13
+   find: grep terminated by signal 13
+   find: grep terminated by signal 13
+   find: grep terminated by signal 13
+   find: grep terminated by signal 13
+   find: grep terminated by signal 13
+   find: grep terminated by signal 13
+   find: grep terminated by signal 13
+   find: grep terminated by signal 13
+   [exit=0]
+   (Message)
+   (ChatDBG gdb) bash: grep -rn "exit(8)" /work
+   [no output]
+   [exit=1]
+   (Message)
+   (ChatDBG gdb) bash: grep -n "exit(" /work/cli/threadexecutor.cpp
+   98:        std::exit(0);
+   104:        std::exit(0);
+   113:        std::exit(0);
+   190:                std::exit(EXIT_FAILURE);
+   196:                std::exit(EXIT_FAILURE);
+   201:                std::exit(EXIT_FAILURE);
+   208:                std::exit(EXIT_FAILURE);
+   233:                std::exit(0);
+   336:        std::exit(0);
+   392:            exit(EXIT_FAILURE);
+   400:            exit(EXIT_FAILURE);
+   403:            exit(EXIT_FAILURE);
+   413:            exit(EXIT_FAILURE);
+   420:            exit(EXIT_FAILURE);
+   [exit=0]
+   (Message)
+   (ChatDBG gdb) bash: grep -rn "exit_shell" /work
+   [no output]
+   [exit=1]
+   (Message)
+   (ChatDBG gdb) bash: find /work -name "*bugs*" -type d
+   [no output]
+   [exit=0]
+   (Message)
+   (ChatDBG gdb) bash: grep -rn "8" /work/cli/threadexecutor.cpp
+   [no output]
+   [exit=1]
+   (Message)
+   (ChatDBG gdb) bash: grep -rn "return 8" /work
+   /work/addons/misra.py:660:        return 8
+   Binary file /work/build/bin/testrunner matches
+   Binary file /work/build/test/CMakeFiles/testrunner.dir/testunusedprivfunc.cpp.o matches
+   /work/test/testunusedprivfunc.cpp:592:              "    int internalGetVal() const { return 8000; }\n"
+   [exit=0]
+   (Message)
+   (ChatDBG gdb) bash: grep -rn "return 8" /work
+   /work/addons/misra.py:660:        return 8
+   Binary file /work/build/bin/testrunner matches
+   Binary file /work/build/test/CMakeFiles/testrunner.dir/testunusedprivfunc.cpp.o matches
+   /work/test/testunusedprivfunc.cpp:592:              "    int internalGetVal() const { return 8000; }\n"
+   [exit=0]
+   (Message)
+   (ChatDBG gdb) bash: grep -rn "bugscpp" /work
+   [no output]
+   [exit=1]
+   (Message)
+   (ChatDBG gdb) bash: grep -rn "exit(8)" /work --include="*.cpp" --include="*.c" --include="*.h" --include="*.hpp"
+   [no output]
+   [exit=1]
+   (Message)
+   (ChatDBG gdb) bash: grep -rn "shell" /work/cli/ | head -20
+   /work/cli/cppcheckexecutor.cpp:1168: * Execute a shell command and read the output from it. Returns true if command terminated successfully.
+   /work/cli/cppcheckexecutor.h:112:     * Execute a shell command and read the output from it. Returns true if command terminated successfully.
+   [exit=0]
+   (Message)
+   (ChatDBG gdb) bash: grep -rn "exit.*8" /work
+   /work/addons/test/misra/misra-test.c:1085:  exit(-1); // 21.8
+   [exit=0]
+   (Message)
+   (ChatDBG gdb) bash: grep -rn "bugscpp" /work/*
+   [no output]
+   [exit=1]
+   (Message)
+   (ChatDBG gdb) bash: grep -rn "exit(8)" /work /work/**/*.cpp /work/**/*.c /work/**/*.h /work/**/*.hpp
+   [stderr]
+   grep: /work/**/*.hpp: No such file or directory
+   [exit=2]
+   (Message)
+   (ChatDBG gdb) bash: grep -rn "exit(" /work | grep -v std::exit | head -30
+   /work/addons/cert.py:399:        sys.exit(0)
+   /work/addons/cert.py:437:                    sys.exit(1)
+   /work/addons/cert.py:441:                    sys.exit(1)
+   /work/addons/misc.py:161:                sys.exit(1)
+   /work/addons/misc.py:165:                sys.exit(1)
+   /work/addons/misra.py:3043:        sys.exit(0)
+   /work/addons/misra.py:3050:            sys.exit(1)
+   /work/addons/misra.py:3054:            sys.exit(0)
+   /work/addons/misra.py:3058:        sys.exit(1)
+   /work/addons/misra.py:3069:        sys.exit(0)
+   /work/addons/misra.py:3096:                sys.exit(exitCode)
+   /work/addons/misra.py:3131:    sys.exit(exitCode)
+   /work/addons/naming.py:20:        exit(1)
+   /work/addons/namingng.py:234:            sys.exit(1)
+   /work/addons/namingng.py:245:            sys.exit(1)
+   /work/addons/namingng.py:247:        sys.exit(0)
+   /work/addons/namingng.py:251:        sys.exit(1)
+   /work/addons/namingng.py:252:    sys.exit(0)
+   /work/addons/test/misra/misra-test.c:1061:    _exit(1); // no warning
+   /work/addons/test/misra/misra-test.c:1085:  exit(-1); // 21.8
+   /work/addons/y2038.py:243:        sys.exit(0)
+   /work/addons/y2038.py:248:            sys.exit(127)
+   /work/addons/y2038.py:251:            sys.exit(13)
+   /work/addons/y2038.py:259:    sys.exit(exit_code)
+   /work/build/bin/cfg/gnu.cfg:192:  <!-- void xexit(int status); -->
+   /work/build/bin/cfg/gtk.cfg:8303:    <warn severity="style" alternatives="exit" reason="Obsolete">gtk_exit is deprecated and should not be used in newly-written code. Use the standard exit() function instead.</warn>
+   /work/build/bin/cfg/posix.cfg:751:  <!-- void _exit(int status); -->
+   /work/build/bin/cfg/std.cfg:873:  <!-- int atexit(void (*func)(void)); -->
+   /work/build/bin/cfg/std.cfg:1235:  <!-- void exit(int status); -->
+   /work/build/bin/cfg/std.cfg:1465:  <!-- void quick_exit(int exit_code); -->
+   [exit=0]
+   (Message)
+   (ChatDBG gdb) bash: grep -rn "exit(8)" /work
+   [no output]
+   [exit=1]
+   (Message)
+   (ChatDBG gdb) bash: head -50 /work/cli/threadexecutor.cpp
+   /*
+    * Cppcheck - A tool for static C/C++ code analysis
+    * Copyright (C) 2007-2020 Cppcheck team.
+    *
+    * This program is free software: you can redistribute it and/or modify
+    * it under the terms of the GNU General Public License as published by
+    * the Free Software Foundation, either version 3 of the License, or
+    * (at your option) any later version.
+    *
+    * This program is distributed in the hope that it will be useful,
+    * but WITHOUT ANY WARRANTY; without even the implied warranty of
+    * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    * GNU General Public License for more details.
+    *
+    * You should have received a copy of the GNU General Public License
+    * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+    */
+   
+   #include "threadexecutor.h"
+   
+   #include "config.h"
+   #include "cppcheck.h"
+   #include "cppcheckexecutor.h"
+   #include "importproject.h"
+   #include "settings.h"
+   #include "suppressions.h"
+   
+   #include <algorithm>
+   #include <cerrno>
+   #include <cstdlib>
+   #include <cstring>
+   #include <iostream>
+   #include <utility>
+   
+   #ifdef __SVR4  // Solaris
+   #include <sys/loadavg.h>
+   #endif
+   #ifdef THREADING_MODEL_FORK
+   #if defined(__linux__)
+   #include <sys/prctl.h>
+   #endif
+   #include <sys/select.h>
+   #include <sys/wait.h>
+   #include <fcntl.h>
+   #include <unistd.h>
+   #endif
+   #ifdef THREADING_MODEL_WIN
+   #include <process.h>
+   #include <windows.h>
+   #endif
+   [exit=0]
+   (Message)
+   (ChatDBG gdb) bash: grep -rn "exit_shell" /work -o -P "(?<=.*?)\b\w+\b"
+   [stderr]
+   grep: (?<=.*?)\b\w+\b: No such file or directory
+   [exit=2]
+   (Message)
+   (ChatDBG gdb) bash: [['space:]]*8\x08', 'work']]
+   [stderr]
+   /bin/sh: 1: [[space:]]*8\x08,: not found
+   [exit=127]
+   (Message)
+   (ChatDBG gdb) bash: grep -rn "exit_shell" /work -A 3 -B 3
+   [no output]
+   [exit=1]
+   (Message)
+   (ChatDBG gdb) bash: grep -n "exit(" /work/cli/threadexecutor.cpp
+   98:        std::exit(0);
+   104:        std::exit(0);
+   113:        std::exit(0);
+   190:                std::exit(EXIT_FAILURE);
+   196:                std::exit(EXIT_FAILURE);
+   201:                std::exit(EXIT_FAILURE);
+   208:                std::exit(EXIT_FAILURE);
+   233:                std::exit(0);
+   336:        std::exit(0);
+   392:            exit(EXIT_FAILURE);
+   400:            exit(EXIT_FAILURE);
+   403:            exit(EXIT_FAILURE);
+   413:            exit(EXIT_FAILURE);
+   420:            exit(EXIT_FAILURE);
+   [exit=0]
+   (Message)
+   (ChatDBG gdb) bash: find /work -type f -name "*.py" -exec grep -l "bugscpp" {} \;
+   [no output]
+   [exit=0]

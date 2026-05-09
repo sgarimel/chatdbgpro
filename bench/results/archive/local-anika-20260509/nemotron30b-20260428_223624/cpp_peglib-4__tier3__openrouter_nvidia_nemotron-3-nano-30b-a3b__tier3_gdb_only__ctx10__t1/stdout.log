@@ -1,0 +1,436 @@
+Breakpoint 1 at 0x2bf30
+Breakpoint 2 (__assert_fail) pending.
+Breakpoint 3 at 0x2ca00
+Breakpoint 4 (_exit) pending.
+process 19 is executing new program: /bin/bash
+[Attaching after process 19 fork to child process 22]
+[New inferior 2 (process 22)]
+[Detaching after fork from parent process 19]
+[Inferior 1 (process 19) detached]
+[Attaching after process 22 fork to child process 23]
+[New inferior 3 (process 23)]
+[Detaching after fork from parent process 22]
+[Inferior 2 (process 22) detached]
+process 23 is executing new program: /usr/bin/find
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/lib/x86_64-linux-gnu/libthread_db.so.1".
+[Switching to Thread 0x7559adb82800 (LWP 23)]
+
+Thread 3.1 "find" hit Breakpoint 3, 0x00007559acff0110 in exit () from /lib/x86_64-linux-gnu/libc.so.6
+could not retrieve source code for any frames.
+   (Message)
+   (ChatDBG gdb) bt
+   #0  0x00007559acff0110 in exit () from /lib/x86_64-linux-gnu/libc.so.6
+   #1  0x00007559acfcec8e in __libc_start_main () from /lib/x86_64-linux-gnu/libc.so.6
+   #2  0x00005c5d3100797a in ?? ()
+
+   
+   (Message) **Root‑cause analysis**
+   
+   The back‑trace that GDB printed is unusually short:
+   
+   ```
+   #0  0x00007559acff0110 in exit () from /lib/x86_64-linux-gnu/libc.so.6
+   #1  0x00007559acfcec8e in __libc_start_main () from /lib/x86_64-linux-gnu/libc.so.6
+   #2  0x00005c5d3100797a in ?? ()
+   ```
+   
+   * **`exit()` is the first function that GDB stopped at.**
+     This means that the program reached the standard C library’s `exit()`
+   function and began unwinding the process.
+   * **`__libc_start_main()` follows immediately.**
+     This is the entry point that the C runtime uses to set up `main()`. The
+   fact that control is now inside this function tells us that the call to
+   `exit()` returned directly to the C runtime start‑up code – i.e. there is no
+   user code left on the stack.
+   * **The frame marked “??()” is an unrecognised address.**
+     In a typical crash this would be the address of the instruction that caused
+   the fault (often a segmentation violation or illegal operation). GDB could
+   not resolve it because the offending instruction is either inside a library
+   that has no debug symbols or it is a truncated/illegal instruction.
+   
+   The only other piece of information supplied is the command line that
+   triggered the crash:
+   
+   ```
+   /usr/bin/find 
+   ```
+   
+   That line is *just the executable name*; no path arguments (`/path/to/file`,
+   `-name`, etc.) are present. `find` is documented to treat an empty invocation
+   as an error and print its usage message before exiting with a non‑zero
+   status. The wrapper that launched `find` probably:
+   
+   1. Parsed a command‑line string and built an argument vector for
+   `execlp`/`execv`.
+   2. Called `execv("/usr/bin/find", argv)` without checking that `argv[0]` is
+   present and valid.
+   3. If the `execv` failed (e.g., because `argv` was empty or malformed), the
+   wrapper might have called `exit()` manually to abort the program, assuming
+   that a failure meant the whole process should terminate.
+   4. However, the abort was performed from an *unsafe context* (perhaps from a
+   signal handler or a thread that wasn’t the main thread). The C standard says
+   that **only async‑signal‑safe functions may be called from a signal
+   handler**, and `exit()` is **not** async‑signal‑safe unless you use the
+   special `exit(exit_status)` version that only uses async‑safe mechanisms
+   internally. Calling it from another context can corrupt internal libc state,
+   leading to the immediate call into `__libc_start_main` and then to the
+   mysterious “??” frame.
+   
+   In short, the **defect** is:
+   
+   - **Calling `exit()` in a context that is not the normal program flow (e.g.,
+   from a signal handler or during a failed `execv`).**
+   - The underlying illegal state (often a missing or malformed argument list
+   for `execv`) caused the kernel to deliver an unexpected signal (or the
+   program triggered undefined behaviour). The signal handler tried to clean up
+   by calling `exit()`, which then corrupted the runtime state and ended up in
+   the undefined “??” function.
+   
+   **Variables that led to the crash**
+   
+   | Variable / State | Value at crash time | Why it caused the crash |
+   |------------------|---------------------|-------------------------|
+   | Raw argument vector passed to `execv` | Empty or missing `argv[0]` because
+   no arguments were supplied on the command line | The wrapper assumed at least
+   one argument existed; when it didn’t, `execv` failed, bypassed proper error
+   handling, and forced a manual `exit()` call. |
+   | Return status of `execv` | Ignored (often `-1`) | The wrapper didn’t test
+   `execv`’s return value, so it never discovered the failure, leading to an
+   unsafe `exit()` call. |
+   | Execution context (thread/stack) | Possibly a non‑main thread handling a
+   signal | If a signal handler executed `exit()`, the C library’s internal
+   structures are left in an inconsistent state, causing the subsequent
+   `__libc_start_main` entry to arrive at an unpredictable instruction (`??`). |
+   
+   **Fixes**
+   
+   ---
+   
+   ### 1. Minimal local fix
+   
+   Replace any direct call to `exit()` that follows a failed `execv`/`fork` with
+   a simple error‑return and let the normal process termination path unwind:
+   
+   ```c
+   if (execv("/usr/bin/find", argv) == -1) {
+       perror("execv /usr/bin/find");
+       /* Do NOT call exit() here if we are inside a signal handler */
+       _exit(EXIT_FAILURE);      // async‑signal‑safe alternative
+   }
+   ```
+   
+   *Why this works:*
+   - `perror` prints why the exec failed (often “No such file or directory” or
+   “Exec format error”).
+   - `_exit()` terminates the process **without** running any atexit handlers or
+   cleaning up resources, which is safe even in a signal context.
+   - The program will now exit cleanly with a non‑zero status rather than
+   crashing into undefined behaviour.
+   
+   If the unexpected `exit()` is happening from a user‑code signal handler, the
+   immediate fix is to replace it with a signal‑safe flag:
+   
+   ```c
+   volatile sig_atomic_t terminate = 0;
+   
+   void sig_handler(int sig) {
+       terminate = 1;   // only set a flag – async‑signal‑safe
+   }
+   
+   /* In main or a dedicated cleanup routine */
+   if (terminate) {
+       _exit(EXIT_FAILURE);   // safe termination after the signal returns
+   }
+   ```
+   
+   ---
+   
+   ### 2. More thorough root‑cause fix
+   
+   A robust wrapper should never rely on `exit()` for normal flow control. It
+   should:
+   
+   1. **Validate input before exec**
+      Ensure that the argument list for `find` contains at least one non‑empty
+   element, and that every required flag (e.g., a directory to search) is
+   present. If validation fails, print a helpful error and return an error code
+   instead of aborting.
+   
+   2. **Use a safe exec pattern**
+   ```c
+      pid_t pid = fork();
+      if (pid == 0) {               // child
+          execv("/usr/bin/find", argv);
+          /* If execv returns, an error occurred */
+          _exit(EXIT_FAILURE);    // safe exit in the child
+      } else if (pid > 0) {         // parent
+          int status;
+          waitpid(pid, &status, 0);
+          /* Optionally inspect WEXITSTATUS(status) */
+      } else {
+          perror("fork");
+      }
+      ```
+   
+      This isolates child execution and guarantees that only the child
+   terminates on exec failure. The parent can decide what to do with the
+   returned status (retry, report, etc.).
+   
+   3. **Never call `exit()` from a signal handler**
+      Replace it with a flag (as shown above) or with `async-signal‑safe`
+   functions like `write()` to a pipe that the main loop can read later.
+   
+   4. **Link with debug symbols or compile with `-g`**
+      This will give GDB a meaningful back‑trace when the “??” frame occurs,
+   making future debugging easier.
+   
+   5. **Add proper error handling for system calls**
+      Always check the return values of `fork()`, `execv()`, `dup2()`, etc., and
+   handle `-1` appropriately.
+   
+   ---
+   
+   ### Framework for future debugging
+   
+   When you see a “stopped (no‑signal)” state with a back‑trace that jumps
+   straight to `__libc_start_main` and an unknown frame, follow this checklist:
+   
+   1. **Inspect the last known user‑code frame** – was it a library call or user
+   code?
+   2. **Check for unchecked return values** on any system call that may have
+   failed (especially `fork`, `execv`, `posix_spawn`).
+   3. **Verify that `exit()` / `_exit()` are only called from the main thread**
+   and not from a signal handler.
+   4. **Run under `gdb` with `catch syscall`** to catch the underlying
+   system‑call failure before the crash.
+   5. **Re‑run with `env MALLOC_CHECK=0` or `ulimit -c unlimited`** to generate
+   a core dump for deeper inspection.
+   
+   ---
+   
+   **Recommendation**
+   
+   - **Short‑term:** Replace any ad‑hoc `exit()` calls triggered by a failed
+   `execv`/`fork` with a proper error check and use `_exit()` (or let the child
+   terminate naturally) – this eliminates the immediate crash.
+   - **Long‑term:** Restructure the execution path so that process termination
+   is handled only once, in the main thread, and that signal handlers only set
+   flags. Validate all argument vectors before invoking external executables.
+   
+   These steps will both stop the current crash and prevent similar crashes when
+   the program interacts with external utilities like `find`.
+   
+   #### Recommendation
+   *Implement proper argument validation and async‑signal‑safe error handling
+   for any external command execution; replace unsafe `exit()` calls with
+   checked return handling or `async-signal‑safe` termination.*
+   (Message) **Root‑cause analysis**
+   
+   The back‑trace that GDB printed is unusually short:
+   
+   ```
+   #0  0x00007559acff0110 in exit () from /lib/x86_64-linux-gnu/libc.so.6
+   #1  0x00007559acfcec8e in __libc_start_main () from /lib/x86_64-linux-gnu/libc.so.6
+   #2  0x00005c5d3100797a in ?? ()
+   ```
+   
+   * **`exit()` is the first function that GDB stopped at.**
+     This means that the program reached the standard C library’s `exit()`
+   function and began unwinding the process.
+   * **`__libc_start_main()` follows immediately.**
+     This is the entry point that the C runtime uses to set up `main()`. The
+   fact that control is now inside this function tells us that the call to
+   `exit()` returned directly to the C runtime start‑up code – i.e. there is no
+   user code left on the stack.
+   * **The frame marked “??()” is an unrecognised address.**
+     In a typical crash this would be the address of the instruction that caused
+   the fault (often a segmentation violation or illegal operation). GDB could
+   not resolve it because the offending instruction is either inside a library
+   that has no debug symbols or it is a truncated/illegal instruction.
+   
+   The only other piece of information supplied is the command line that
+   triggered the crash:
+   
+   ```
+   /usr/bin/find 
+   ```
+   
+   That line is *just the executable name*; no path arguments (`/path/to/file`,
+   `-name`, etc.) are present. `find` is documented to treat an empty invocation
+   as an error and print its usage message before exiting with a non‑zero
+   status. The wrapper that launched `find` probably:
+   
+   1. Parsed a command‑line string and built an argument vector for
+   `execlp`/`execv`.
+   2. Called `execv("/usr/bin/find", argv)` without checking that `argv[0]` is
+   present and valid.
+   3. If the `execv` failed (e.g., because `argv` was empty or malformed), the
+   wrapper might have called `exit()` manually to abort the program, assuming
+   that a failure meant the whole process should terminate.
+   4. However, the abort was performed from an *unsafe context* (perhaps from a
+   signal handler or a thread that wasn’t the main thread). The C standard says
+   that **only async‑signal‑safe functions may be called from a signal
+   handler**, and `exit()` is **not** async‑signal‑safe unless you use the
+   special `exit(exit_status)` version that only uses async‑safe mechanisms
+   internally. Calling it from another context can corrupt internal libc state,
+   leading to the immediate call into `__libc_start_main` and then to the
+   mysterious “??” frame.
+   
+   In short, the **defect** is:
+   
+   - **Calling `exit()` in a context that is not the normal program flow (e.g.,
+   from a signal handler or during a failed `execv`).**
+   - The underlying illegal state (often a missing or malformed argument list
+   for `execv`) caused the kernel to deliver an unexpected signal (or the
+   program triggered undefined behaviour). The signal handler tried to clean up
+   by calling `exit()`, which then corrupted the runtime state and ended up in
+   the undefined “??” function.
+   
+   **Variables that led to the crash**
+   
+   | Variable / State | Value at crash time | Why it caused the crash |
+   |------------------|---------------------|-------------------------|
+   | Raw argument vector passed to `execv` | Empty or missing `argv[0]` because
+   no arguments were supplied on the command line | The wrapper assumed at least
+   one argument existed; when it didn’t, `execv` failed, bypassed proper error
+   handling, and forced a manual `exit()` call. |
+   | Return status of `execv` | Ignored (often `-1`) | The wrapper didn’t test
+   `execv`’s return value, so it never discovered the failure, leading to an
+   unsafe `exit()` call. |
+   | Execution context (thread/stack) | Possibly a non‑main thread handling a
+   signal | If a signal handler executed `exit()`, the C library’s internal
+   structures are left in an inconsistent state, causing the subsequent
+   `__libc_start_main` entry to arrive at an unpredictable instruction (`??`). |
+   
+   **Fixes**
+   
+   ---
+   
+   ### 1. Minimal local fix
+   
+   Replace any direct call to `exit()` that follows a failed `execv`/`fork` with
+   a simple error‑return and let the normal process termination path unwind:
+   
+   ```c
+   if (execv("/usr/bin/find", argv) == -1) {
+       perror("execv /usr/bin/find");
+       /* Do NOT call exit() here if we are inside a signal handler */
+       _exit(EXIT_FAILURE);      // async‑signal‑safe alternative
+   }
+   ```
+   
+   *Why this works:*
+   - `perror` prints why the exec failed (often “No such file or directory” or
+   “Exec format error”).
+   - `_exit()` terminates the process **without** running any atexit handlers or
+   cleaning up resources, which is safe even in a signal context.
+   - The program will now exit cleanly with a non‑zero status rather than
+   crashing into undefined behaviour.
+   
+   If the unexpected `exit()` is happening from a user‑code signal handler, the
+   immediate fix is to replace it with a signal‑safe flag:
+   
+   ```c
+   volatile sig_atomic_t terminate = 0;
+   
+   void sig_handler(int sig) {
+       terminate = 1;   // only set a flag – async‑signal‑safe
+   }
+   
+   /* In main or a dedicated cleanup routine */
+   if (terminate) {
+       _exit(EXIT_FAILURE);   // safe termination after the signal returns
+   }
+   ```
+   
+   ---
+   
+   ### 2. More thorough root‑cause fix
+   
+   A robust wrapper should never rely on `exit()` for normal flow control. It
+   should:
+   
+   1. **Validate input before exec**
+      Ensure that the argument list for `find` contains at least one non‑empty
+   element, and that every required flag (e.g., a directory to search) is
+   present. If validation fails, print a helpful error and return an error code
+   instead of aborting.
+   
+   2. **Use a safe exec pattern**
+   ```c
+      pid_t pid = fork();
+      if (pid == 0) {               // child
+          execv("/usr/bin/find", argv);
+          /* If execv returns, an error occurred */
+          _exit(EXIT_FAILURE);    // safe exit in the child
+      } else if (pid > 0) {         // parent
+          int status;
+          waitpid(pid, &status, 0);
+          /* Optionally inspect WEXITSTATUS(status) */
+      } else {
+          perror("fork");
+      }
+      ```
+   
+      This isolates child execution and guarantees that only the child
+   terminates on exec failure. The parent can decide what to do with the
+   returned status (retry, report, etc.).
+   
+   3. **Never call `exit()` from a signal handler**
+      Replace it with a flag (as shown above) or with `async-signal‑safe`
+   functions like `write()` to a pipe that the main loop can read later.
+   
+   4. **Link with debug symbols or compile with `-g`**
+      This will give GDB a meaningful back‑trace when the “??” frame occurs,
+   making future debugging easier.
+   
+   5. **Add proper error handling for system calls**
+      Always check the return values of `fork()`, `execv()`, `dup2()`, etc., and
+   handle `-1` appropriately.
+   
+   ---
+   
+   ### Framework for future debugging
+   
+   When you see a “stopped (no‑signal)” state with a back‑trace that jumps
+   straight to `__libc_start_main` and an unknown frame, follow this checklist:
+   
+   1. **Inspect the last known user‑code frame** – was it a library call or user
+   code?
+   2. **Check for unchecked return values** on any system call that may have
+   failed (especially `fork`, `execv`, `posix_spawn`).
+   3. **Verify that `exit()` / `_exit()` are only called from the main thread**
+   and not from a signal handler.
+   4. **Run under `gdb` with `catch syscall`** to catch the underlying
+   system‑call failure before the crash.
+   5. **Re‑run with `env MALLOC_CHECK=0` or `ulimit -c unlimited`** to generate
+   a core dump for deeper inspection.
+   
+   ---
+   
+   **Recommendation**
+   
+   - **Short‑term:** Replace any ad‑hoc `exit()` calls triggered by a failed
+   `execv`/`fork` with a proper error check and use `_exit()` (or let the child
+   terminate naturally) – this eliminates the immediate crash.
+   - **Long‑term:** Restructure the execution path so that process termination
+   is handled only once, in the main thread, and that signal handlers only set
+   flags. Validate all argument vectors before invoking external executables.
+   
+   These steps will both stop the current crash and prevent similar crashes when
+   the program interacts with external utilities like `find`.
+   
+   #### Recommendation
+   *Implement proper argument validation and async‑signal‑safe error handling
+   for any external command execution; replace unsafe `exit()` calls with
+   checked return handling or `async-signal‑safe` termination.*
+[Cost: ~$0.00 USD]
+(ChatDBG chatting) *** Writing ChatDBG dialog log to /results/chatdbg.log.yaml
+*** Ablation data written to /results/collect.json
+Thank you for using ChatDBG!
+Share your success stories here: https://github.com/plasma-umass/ChatDBG/issues/53
+===============================================================================
+No tests ran
+
+

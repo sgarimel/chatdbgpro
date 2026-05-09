@@ -1,0 +1,610 @@
+Catchpoint 1 (exec)
+Breakpoint 2 (abort) pending.
+Breakpoint 3 (__assert_fail) pending.
+Breakpoint 4 at 0x12c0
+Breakpoint 5 (_exit) pending.
+
+Breakpoint 4, 0x000073c3700fea40 in exit () from /lib/x86_64-linux-gnu/libc.so.6
+   (Message)
+   (ChatDBG gdb) bash: find . -type f -name "test_basic.c" | xargs grep -n "exit ("
+   52:                     exit (EXIT_FAILURE);
+   72:                     exit (-errno);
+   100:                    exit (-errno);
+   [exit=0]
+   
+   (Message) The error occurs at line 100 in `tests/test_basic.c` where the
+   program calls `exit(-errno)`. The test expects a successful run (exit code
+   0), but the program exits with code 2. Since `errno` is typically set by
+   system calls or library functions when an error occurs, `exit(-errno)`
+   implies that `errno` was set to a non-zero value earlier, triggering a non-
+   zero exit code.
+   
+   Let’s analyze the context. The call to `exit(-errno)` happens in the `argv`
+   function after attempting to open a file output (`fname_out`) with `fopen`.
+   If `fopen` fails, `out` becomes `NULL`, and `exit(-errno)` is invoked.
+   However, `errno` is not necessarily preserved across calls. If `fopen` fails,
+   `errno` is set by the system to a specific error code (e.g., `ENOENT`,
+   `EACCES`, etc.), but `exit(-errno)` is incorrect in this context.
+   
+   But here’s the core issue: the test expects the program to succeed, but it's
+   exiting with code 2. Since `exit(-errno)` is used and the exit code is 2,
+   `errno` must have been set to 2. That means `fopen` failed with `errno == 2`,
+   which corresponds to `ENOENT` (file not found). However, `fname_out` is
+   passed as a command-line argument (in this case, `../tests/basic.out`). This
+   file may not exist, or the directory may not be writable.
+   
+   But the deeper issue is this: the program should **not exit with
+   `exit(-errno)`** when `fopen` fails. The test expects the program to handle
+   such failure gracefully — either by failing gracefully with an appropriate
+   exit code `>= 1` (like `EXIT_FAILURE`), but not necessarily `2` — or in some
+   cases, the test might expect the program to continue if `fname_out` is `NULL`
+   and use `stdout`. But here, `fname_out` is not `NULL` (it is
+   `../tests/basic.out`), so `fopen` is attempted.
+   
+   Now, let’s locate the actual source of the error.
+   
+   We need to check the function `ucl_parser_add_chunk` and
+   `ucl_parser_get_error`, but more critically, check **why** `fopen` fails. But
+   wait — maybe the test itself is incorrect? No: the bug is in the program, and
+   the oracle expects it to **not** exit with code 2.
+   
+   Let’s go back to line 100:
+   
+   ```c
+   exit (-errno);
+   ```
+   
+   This is **wrong**. The `errno` value is only meaningful when a system call
+   fails. But `fopen` sets `errno` only if it failed due to a system-level error
+   (like permissions, not found, etc.). However, using `exit(-errno)` is not
+   idiomatic. The correct way is to use `exit(EXIT_FAILURE)` or `exit(errno)` if
+   you intend to propagate the error code. But `exit(-errno)` is problematic
+   because:
+   
+   - `errno` is typically positive (e.g., 2 for ENOENT), so `-errno` would be
+   negative.
+   - On most systems, `exit()` takes an `int` exit code in the range 0–255.
+   Negative values are not standard and may be interpreted inconsistently (e.g.,
+   `exit(-2)` may lead to unexpected behavior or be truncated).
+   - In this case, `exit(-2)` returns `2` (because 256 - 2 ≈ 254, but actually,
+   it's implementation-defined). However, many systems interpret negative exit
+   codes as "abnormal termination" and may map them via `abs()` or truncate. But
+   for portability, **do not use negative exit codes**.
+   
+   So, `exit(-errno)` at line 100 is **buggy**.
+   
+   Moreover, the test expects a passing run (exit code 0), which implies that
+   **the program should not exit here at all** — but it does, and it exits with
+   a non-zero code. But `errno` is `2`, so `exit(-2)` — which causes the test to
+   fail with “expected exit 0, got 2”.
+   
+   But why is `errno` `2`? Let’s assume `fopen(fname_out, "w")` fails because
+   the file or directory doesn’t exist. That could be expected.
+   
+   Yet the real issue is not that `fopen` fails — it’s that the program **should
+   not exit** with `exit(-errno)` in this context. The program should handle
+   such errors correctly or possibly not expect `fname_out` to exist.
+   
+   But the test runs:
+   ```
+   /work/tests/.libs/test_basic ../tests/basic/11.in ../tests/basic.out
+   ```
+   
+   This means `fname_out = "../tests/basic.out"`. The file `../tests/basic.out`
+   likely doesn't exist at runtime, so `fopen` fails, `errno` is set to `ENOENT`
+   (2), and `exit(-errno)` is called, resulting in exit code 2.
+   
+   But the test expects the program to **succeed** and produce output. So
+   perhaps the program should create the file, not fail on its absence?
+   
+   Let’s check the logic in `test_basic.c`. Earlier, it uses `fclose(in)` after
+   reading `inbuf`, and then opens `out`. But the only reason `fopen` would fail
+   is if the directory is not writable.
+   
+   But here's the catch: the test expects the program to pass — meaning that
+   **the file should be created or written to**, but the program exits early.
+   
+   So why does `fopen` fail? Probably because the directory `../tests/` is not
+   writable, or `basic.out` is protected.
+   
+   But the program should not exit with `exit(-errno)` on failure to open output
+   file. This is a **bad error handling pattern**.
+   
+   We must look at the full code around this section. Let’s get the code
+   surrounding line 100.
+   
+   
+   (Message) The error occurs at line 100 in `tests/test_basic.c` where the
+   program calls `exit(-errno)`. The test expects a successful run (exit code
+   0), but the program exits with code 2. Since `errno` is typically set by
+   system calls or library functions when an error occurs, `exit(-errno)`
+   implies that `errno` was set to a non-zero value earlier, triggering a non-
+   zero exit code.
+   
+   Let’s analyze the context. The call to `exit(-errno)` happens in the `argv`
+   function after attempting to open a file output (`fname_out`) with `fopen`.
+   If `fopen` fails, `out` becomes `NULL`, and `exit(-errno)` is invoked.
+   However, `errno` is not necessarily preserved across calls. If `fopen` fails,
+   `errno` is set by the system to a specific error code (e.g., `ENOENT`,
+   `EACCES`, etc.), but `exit(-errno)` is incorrect in this context.
+   
+   But here’s the core issue: the test expects the program to succeed, but it's
+   exiting with code 2. Since `exit(-errno)` is used and the exit code is 2,
+   `errno` must have been set to 2. That means `fopen` failed with `errno == 2`,
+   which corresponds to `ENOENT` (file not found). However, `fname_out` is
+   passed as a command-line argument (in this case, `../tests/basic.out`). This
+   file may not exist, or the directory may not be writable.
+   
+   But the deeper issue is this: the program should **not exit with
+   `exit(-errno)`** when `fopen` fails. The test expects the program to handle
+   such failure gracefully — either by failing gracefully with an appropriate
+   exit code `>= 1` (like `EXIT_FAILURE`), but not necessarily `2` — or in some
+   cases, the test might expect the program to continue if `fname_out` is `NULL`
+   and use `stdout`. But here, `fname_out` is not `NULL` (it is
+   `../tests/basic.out`), so `fopen` is attempted.
+   
+   Now, let’s locate the actual source of the error.
+   
+   We need to check the function `ucl_parser_add_chunk` and
+   `ucl_parser_get_error`, but more critically, check **why** `fopen` fails. But
+   wait — maybe the test itself is incorrect? No: the bug is in the program, and
+   the oracle expects it to **not** exit with code 2.
+   
+   Let’s go back to line 100:
+   
+   ```c
+   exit (-errno);
+   ```
+   
+   This is **wrong**. The `errno` value is only meaningful when a system call
+   fails. But `fopen` sets `errno` only if it failed due to a system-level error
+   (like permissions, not found, etc.). However, using `exit(-errno)` is not
+   idiomatic. The correct way is to use `exit(EXIT_FAILURE)` or `exit(errno)` if
+   you intend to propagate the error code. But `exit(-errno)` is problematic
+   because:
+   
+   - `errno` is typically positive (e.g., 2 for ENOENT), so `-errno` would be
+   negative.
+   - On most systems, `exit()` takes an `int` exit code in the range 0–255.
+   Negative values are not standard and may be interpreted inconsistently (e.g.,
+   `exit(-2)` may lead to unexpected behavior or be truncated).
+   - In this case, `exit(-2)` returns `2` (because 256 - 2 ≈ 254, but actually,
+   it's implementation-defined). However, many systems interpret negative exit
+   codes as "abnormal termination" and may map them via `abs()` or truncate. But
+   for portability, **do not use negative exit codes**.
+   
+   So, `exit(-errno)` at line 100 is **buggy**.
+   
+   Moreover, the test expects a passing run (exit code 0), which implies that
+   **the program should not exit here at all** — but it does, and it exits with
+   a non-zero code. But `errno` is `2`, so `exit(-2)` — which causes the test to
+   fail with “expected exit 0, got 2”.
+   
+   But why is `errno` `2`? Let’s assume `fopen(fname_out, "w")` fails because
+   the file or directory doesn’t exist. That could be expected.
+   
+   Yet the real issue is not that `fopen` fails — it’s that the program **should
+   not exit** with `exit(-errno)` in this context. The program should handle
+   such errors correctly or possibly not expect `fname_out` to exist.
+   
+   But the test runs:
+   ```
+   /work/tests/.libs/test_basic ../tests/basic/11.in ../tests/basic.out
+   ```
+   
+   This means `fname_out = "../tests/basic.out"`. The file `../tests/basic.out`
+   likely doesn't exist at runtime, so `fopen` fails, `errno` is set to `ENOENT`
+   (2), and `exit(-errno)` is called, resulting in exit code 2.
+   
+   But the test expects the program to **succeed** and produce output. So
+   perhaps the program should create the file, not fail on its absence?
+   
+   Let’s check the logic in `test_basic.c`. Earlier, it uses `fclose(in)` after
+   reading `inbuf`, and then opens `out`. But the only reason `fopen` would fail
+   is if the directory is not writable.
+   
+   But here's the catch: the test expects the program to pass — meaning that
+   **the file should be created or written to**, but the program exits early.
+   
+   So why does `fopen` fail? Probably because the directory `../tests/` is not
+   writable, or `basic.out` is protected.
+   
+   But the program should not exit with `exit(-errno)` on failure to open output
+   file. This is a **bad error handling pattern**.
+   
+   We must look at the full code around this section. Let’s get the code
+   surrounding line 100.
+   
+
+   (ChatDBG gdb) code tests/test_basic.c:100
+    93             ucl_parser_add_chunk (parser, test_in, inlen);
+    94     }
+    95     fclose (in);
+    96 
+    97     if (fname_out != NULL) {
+    98             out = fopen (fname_out, "w");
+    99             if (out == NULL) {
+   100                     exit (-errno);
+   101             }
+   102     }
+   103     else {
+
+   
+   (Message) The code shows that when `fopen(fname_out, "w")` fails, the program
+   calls `exit(-errno)`, which is the source of the failure. Let's verify the
+   actual value of `errno` when `fopen` fails.
+   
+   We can simulate the test case by running the program with the given input and
+   checking the behavior. But we’re not allowed to run it directly. Instead, use
+   the facts:
+   
+   - `errno` is set to `2` (ENOENT) because the file `../tests/basic.out`
+   doesn’t exist or the directory is not accessible.
+   - `exit(-errno)` becomes `exit(-2)` → returns exit code 2 (negative exit
+   codes may be truncated in some systems, but `exit(2)` is equivalent to 2 in
+   many POSIX systems).
+   - The test expects exit code 0, so it fails.
+   
+   But more importantly: `exit(-errno)` is **incorrect**. The `exit()` function
+   expects an **unsigned** exit status (0 to 255). Using negative values is
+   **undefined behavior** or non-portable. The correct way to handle errors is
+   to use `exit(EXIT_FAILURE)` (typically 1) or `exit(errno)` (when you want to
+   propagate the error code, but only if you're sure it's not negative).
+   
+   However, in this case, the program should **not exit** with `exit(-errno)` —
+   it should either:
+   - Fail gracefully with `exit(EXIT_FAILURE)` or
+   - Attempt to create the file and continue
+   - Reuse `stdout` if `fname_out` is not provided
+   
+   But `fname_out` **is** provided. So why does the test expect it to succeed?
+   Probably because the test expects the program to **create**
+   `../tests/basic.out`, not fail on its absence.
+   
+   But `fopen` with mode `"w"` will **create** the file if it doesn't exist —
+   **unless** the directory is not writable.
+   
+   So, if `fopen` fails with `ENOENT`, it's because the directory `../tests` is
+   not writable. That’s a permission issue. But the program should not exit — it
+   should instead handle such failures with a meaningful message and exit with a
+   known code.
+   
+   Therefore, the bug is:
+   > The program exits with `exit(-errno)` on `fopen` failure, which leads to
+   exit code 2 (due to `errno=2`) and causes the test to fail. But the program
+   should not exit at this point — it should either:
+   > - Use `stdout` as a fallback if file cannot be written
+   > - Report an error to `stderr` and exit with `EXIT_FAILURE`
+   > - Or, more appropriately, **not exit** if the failure is recoverable
+   
+   But the test expects the program to **pass**, so even though `fopen` fails,
+   the program must continue? That doesn't make sense — it can’t write output
+   without a file.
+   
+   Unless the test is not failing due to `fopen` but due to a **different
+   error**.
+   
+   Wait. Let's go back.
+   
+   The stack trace is:
+   ```
+   0: argv((int) argc = <optimized out>, (char **) argv = <optimized out>) at tests/test_basic.c:100
+   ```
+   
+   And the program exits with code 2. The only place it calls `exit` is at line
+   100.
+   
+   But we see earlier:
+   ```c
+   if (ucl_parser_get_error (parser) != NULL) {
+       fprintf (out, "Error occurred: %s\n", ucl_parser_get_error(parser));
+       ret = 1;
+       goto end;
+   }
+   ```
+   
+   So `ret` is set to 1 if the parser has an error, but the program later
+   returns `ret`. So the exit at line 100 is **the only** source of non-zero
+   exit code.
+   
+   Therefore, `fopen` **must have failed**, and `exit(-errno)` is called.
+   
+   But why does the test expect success?
+   
+   Let’s check the **actual file**. The test passes `../tests/basic/11.in` as
+   input and expects output to `../tests/basic.out`.
+   
+   Maybe `../tests/basic.out` is meant to be created. But `fopen` fails with
+   `errno=2`. But that means the parent directory doesn't exist or is
+   unwritable.
+   
+   But this is a test, so `../tests/` should be writable?
+   
+   Alternatively, perhaps the output file is not meant to be created — maybe the
+   program should output to `stdout` if `fname_out` is invalid?
+   
+   But that's not what the code does.
+   
+   There’s a deeper issue: the program does **not** check the return value of
+   `ucl_parser_add_chunk`, or `ucl_parser_get_error`. But we saw that
+   `ucl_parser_get_error` is checked after.
+   
+   But let's consider: maybe the `ucl_parser_add_chunk` call failed, causing
+   `ucl_parser_get_error` to be non-NULL, and the error is printed to `out`, and
+   `ret = 1`, and `goto end` — so exit code should be 1.
+   
+   But the test says exit code 2.
+   
+   So the **only** way to get exit code 2 is `exit(-errno)` with `errno=2`.
+   
+   So the error is **not** in the parser.
+   
+   So the only explanation is that `fopen` failed with `errno=2`, so
+   `exit(-errno)` returns 2.
+   
+   Now, the user says: “the program exited with code 2 but the test oracle
+   expected a passing run.”
+   
+   So the test expects **no exit with code 2**, implying that `fopen` should
+   **not fail** — or should not cause the program to exit.
+   
+   But the code **should** exit if `fopen` fails? Or should it continue?
+   
+   The test is designed to pass, so it expects the program to succeed.
+   
+   Therefore, **the real issue is that the code should not exit with
+   `exit(-errno)`** — it should use `exit(EXIT_FAILURE)` or `exit(1)`, or, more
+   likely, **fail gracefully if the output file cannot be opened**, but not
+   necessarily exit.
+   
+   But even then, `errno=2` is not a valid reason to return 2 — it's a
+   filesystem error.
+   
+   But the test sees exit code 2 as a failure, so the **root cause** is that
+   `exit(-errno)` is **incorrect**.
+   
+   ### Conclusion
+   
+   The **root cause** is that `exit(-errno)` is used in a context where `errno`
+   is positive (`2`), leading to a negative exit code. On most systems, this is
+   interpreted as `2`, which is non-zero and causes the test to fail. However,
+   `exit(-errno)` is **not** a valid idiom — `exit()` expects an exit status in
+   the range `0` to `255`. Negative values are undefined or system-dependent.
+   
+   ### Fix
+   
+   Replace:
+   ```c
+   exit (-errno);
+   ```
+   with:
+   ```c
+   exit (EXIT_FAILURE);
+   ```
+   
+   This ensures a non-zero exit code (typically 1) that indicates failure, but
+   consistently and portably.
+   
+   Alternatively, if the test expects the program to succeed **even if** the
+   output file cannot be written, then the program should not exit at all — but
+   that would contradict the logic. Given that the test expects success, it’s
+   more likely that the **file should be creatable** — so the program should not
+   exit with code 2. But the code is written to exit on `fopen` failure.
+   
+   But `ucl_parser_get_error` already sets `ret=1` and exits via `goto end`. So
+   the `fopen` failure path is **independent**.
+   
+   However, the test expects a passing run — so perhaps the program should
+   **not** exit on `fopen` failure? Or the file should be created?
+   
+   But `fopen` with `"w"` should create the file if the directory is writable.
+   
+   So the **real issue** is that `fopen` fails because the directory `../tests`
+   is not writable — but that’s not the program’s fault.
+   
+   Therefore, the **program should not exit** on `fopen` failure. Instead, it
+   should:
+   - Try to write to `stdout` if `fname_out` is specified but `fopen` fails.
+   - Or, report an error to `stderr` and exit with `EXIT_FAILURE`.
+   
+   But the code currently **does not** do that.
+   
+   So the **better fix** is to log the error to `stderr` and exit with
+   `EXIT_FAILURE`, instead of `exit(-errno)`.
+   
+   ##### Recommendation
+   1. Change the line at `tests/test_basic.c:100` from `exit(-errno);` to
+   `exit(EXIT_FAILURE);` to avoid negative exit codes and ensure portable error
+   reporting.
+
+[Cost: ~$0.00 USD]
+(ChatDBG chatting) *** Writing ChatDBG dialog log to /results/chatdbg.log.yaml
+*** Ablation data written to /results/collect.json
+Thank you for using ChatDBG!
+Share your success stories here: https://github.com/plasma-umass/ChatDBG/issues/53
+   (Message) The code shows that when `fopen(fname_out, "w")` fails, the program
+   calls `exit(-errno)`, which is the source of the failure. Let's verify the
+   actual value of `errno` when `fopen` fails.
+   
+   We can simulate the test case by running the program with the given input and
+   checking the behavior. But we’re not allowed to run it directly. Instead, use
+   the facts:
+   
+   - `errno` is set to `2` (ENOENT) because the file `../tests/basic.out`
+   doesn’t exist or the directory is not accessible.
+   - `exit(-errno)` becomes `exit(-2)` → returns exit code 2 (negative exit
+   codes may be truncated in some systems, but `exit(2)` is equivalent to 2 in
+   many POSIX systems).
+   - The test expects exit code 0, so it fails.
+   
+   But more importantly: `exit(-errno)` is **incorrect**. The `exit()` function
+   expects an **unsigned** exit status (0 to 255). Using negative values is
+   **undefined behavior** or non-portable. The correct way to handle errors is
+   to use `exit(EXIT_FAILURE)` (typically 1) or `exit(errno)` (when you want to
+   propagate the error code, but only if you're sure it's not negative).
+   
+   However, in this case, the program should **not exit** with `exit(-errno)` —
+   it should either:
+   - Fail gracefully with `exit(EXIT_FAILURE)` or
+   - Attempt to create the file and continue
+   - Reuse `stdout` if `fname_out` is not provided
+   
+   But `fname_out` **is** provided. So why does the test expect it to succeed?
+   Probably because the test expects the program to **create**
+   `../tests/basic.out`, not fail on its absence.
+   
+   But `fopen` with mode `"w"` will **create** the file if it doesn't exist —
+   **unless** the directory is not writable.
+   
+   So, if `fopen` fails with `ENOENT`, it's because the directory `../tests` is
+   not writable. That’s a permission issue. But the program should not exit — it
+   should instead handle such failures with a meaningful message and exit with a
+   known code.
+   
+   Therefore, the bug is:
+   > The program exits with `exit(-errno)` on `fopen` failure, which leads to
+   exit code 2 (due to `errno=2`) and causes the test to fail. But the program
+   should not exit at this point — it should either:
+   > - Use `stdout` as a fallback if file cannot be written
+   > - Report an error to `stderr` and exit with `EXIT_FAILURE`
+   > - Or, more appropriately, **not exit** if the failure is recoverable
+   
+   But the test expects the program to **pass**, so even though `fopen` fails,
+   the program must continue? That doesn't make sense — it can’t write output
+   without a file.
+   
+   Unless the test is not failing due to `fopen` but due to a **different
+   error**.
+   
+   Wait. Let's go back.
+   
+   The stack trace is:
+   ```
+   0: argv((int) argc = <optimized out>, (char **) argv = <optimized out>) at tests/test_basic.c:100
+   ```
+   
+   And the program exits with code 2. The only place it calls `exit` is at line
+   100.
+   
+   But we see earlier:
+   ```c
+   if (ucl_parser_get_error (parser) != NULL) {
+       fprintf (out, "Error occurred: %s\n", ucl_parser_get_error(parser));
+       ret = 1;
+       goto end;
+   }
+   ```
+   
+   So `ret` is set to 1 if the parser has an error, but the program later
+   returns `ret`. So the exit at line 100 is **the only** source of non-zero
+   exit code.
+   
+   Therefore, `fopen` **must have failed**, and `exit(-errno)` is called.
+   
+   But why does the test expect success?
+   
+   Let’s check the **actual file**. The test passes `../tests/basic/11.in` as
+   input and expects output to `../tests/basic.out`.
+   
+   Maybe `../tests/basic.out` is meant to be created. But `fopen` fails with
+   `errno=2`. But that means the parent directory doesn't exist or is
+   unwritable.
+   
+   But this is a test, so `../tests/` should be writable?
+   
+   Alternatively, perhaps the output file is not meant to be created — maybe the
+   program should output to `stdout` if `fname_out` is invalid?
+   
+   But that's not what the code does.
+   
+   There’s a deeper issue: the program does **not** check the return value of
+   `ucl_parser_add_chunk`, or `ucl_parser_get_error`. But we saw that
+   `ucl_parser_get_error` is checked after.
+   
+   But let's consider: maybe the `ucl_parser_add_chunk` call failed, causing
+   `ucl_parser_get_error` to be non-NULL, and the error is printed to `out`, and
+   `ret = 1`, and `goto end` — so exit code should be 1.
+   
+   But the test says exit code 2.
+   
+   So the **only** way to get exit code 2 is `exit(-errno)` with `errno=2`.
+   
+   So the error is **not** in the parser.
+   
+   So the only explanation is that `fopen` failed with `errno=2`, so
+   `exit(-errno)` returns 2.
+   
+   Now, the user says: “the program exited with code 2 but the test oracle
+   expected a passing run.”
+   
+   So the test expects **no exit with code 2**, implying that `fopen` should
+   **not fail** — or should not cause the program to exit.
+   
+   But the code **should** exit if `fopen` fails? Or should it continue?
+   
+   The test is designed to pass, so it expects the program to succeed.
+   
+   Therefore, **the real issue is that the code should not exit with
+   `exit(-errno)`** — it should use `exit(EXIT_FAILURE)` or `exit(1)`, or, more
+   likely, **fail gracefully if the output file cannot be opened**, but not
+   necessarily exit.
+   
+   But even then, `errno=2` is not a valid reason to return 2 — it's a
+   filesystem error.
+   
+   But the test sees exit code 2 as a failure, so the **root cause** is that
+   `exit(-errno)` is **incorrect**.
+   
+   ### Conclusion
+   
+   The **root cause** is that `exit(-errno)` is used in a context where `errno`
+   is positive (`2`), leading to a negative exit code. On most systems, this is
+   interpreted as `2`, which is non-zero and causes the test to fail. However,
+   `exit(-errno)` is **not** a valid idiom — `exit()` expects an exit status in
+   the range `0` to `255`. Negative values are undefined or system-dependent.
+   
+   ### Fix
+   
+   Replace:
+   ```c
+   exit (-errno);
+   ```
+   with:
+   ```c
+   exit (EXIT_FAILURE);
+   ```
+   
+   This ensures a non-zero exit code (typically 1) that indicates failure, but
+   consistently and portably.
+   
+   Alternatively, if the test expects the program to succeed **even if** the
+   output file cannot be written, then the program should not exit at all — but
+   that would contradict the logic. Given that the test expects success, it’s
+   more likely that the **file should be creatable** — so the program should not
+   exit with code 2. But the code is written to exit on `fopen` failure.
+   
+   But `ucl_parser_get_error` already sets `ret=1` and exits via `goto end`. So
+   the `fopen` failure path is **independent**.
+   
+   However, the test expects a passing run — so perhaps the program should
+   **not** exit on `fopen` failure? Or the file should be created?
+   
+   But `fopen` with `"w"` should create the file if the directory is writable.
+   
+   So the **real issue** is that `fopen` fails because the directory `../tests`
+   is not writable — but that’s not the program’s fault.
+   
+   Therefore, the **program should not exit** on `fopen` failure. Instead, it
+   should:
+   - Try to write to `stdout` if `fname_out` is specified but `fopen` fails.
+   - Or, report an error to `stderr` and exit with `EXIT_FAILURE`.
+   
+   But the code currently **does not** do that.
+   
+   So the **better fix** is to log the error to `stderr` and exit with
+   `EXIT_FAILURE`, instead of `exit(-errno)`.
+   
+   ##### Recommendation
+   1. Change the line at `tests/test_basic.c:100` from `exit(-errno);` to
+   `exit(EXIT_FAILURE);` to avoid negative exit codes and ensure portable error
+   reporting.
