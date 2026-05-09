@@ -1,0 +1,159 @@
+% This must be in the first 5 lines to tell arXiv to use pdfLaTeX, which is strongly recommended.
+\pdfoutput=1
+% In particular, the hyperref package requires pdfLaTeX in order to break URLs across lines.
+
+\documentclass[11pt]{article}
+
+% Remove the "review" option to generate the final version.
+\usepackage[review]{ACL2023}
+
+% Standard package includes
+\usepackage{times}
+\usepackage{latexsym}
+\usepackage{booktabs}
+
+% For proper rendering and hyphenation of words containing Latin characters (including in bib files)
+\usepackage[T1]{fontenc}
+% This assumes your files are encoded as UTF8
+\usepackage[utf8]{inputenc}
+
+% Layout / typography niceties
+\usepackage{microtype}
+\usepackage{inconsolata}
+
+\title{ChatDBG Pro: Disentangling Model Scale from Tool Surface in LLM-Driven Debugging}
+
+\author{First Author \\
+  Affiliation / Address line 1 \\
+  Affiliation / Address line 2 \\
+  Affiliation / Address line 3 \\
+  \texttt{email@domain} \\\And
+  Second Author \\
+  Affiliation / Address line 1 \\
+  Affiliation / Address line 2 \\
+  Affiliation / Address line 3 \\
+  \texttt{email@domain} \\}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Large language models are increasingly being used as debugging assistants, but it remains unclear how much debugging capability is attributable to model capabilities versus information access (tool calling and context retrieval). We extend ChatDBG, a debugger interface that pairs LLM capabilities with GDB tool calls, by evaluating whether smaller, cost-efficient models can match frontier performance when given appropriate tool access. We evaluate four models---GPT-4, Llama-3.1-8B, Nemotron 30B, and Qwen 30B---across synthetic and original paper-derived crash-debugging scenarios scored on root cause identification and fix accuracy. We find that model scale is not the primary determinant of debugging success, and that iterative investigation can allow smaller models to debug at the level of or even beat frontier models. We further evaluate all four models on 156 real-world C/C++ bugs from BugsCPP under a GDB-only tool configuration and find that every model, including GPT-4, scores near 0\% when only given GDB access, while configurations expanding tool access significantly improve debugging capability.
+\end{abstract}
+
+\section{Introduction}
+\label{sec:intro}
+
+Debugging consumes a significant fraction of programmer time, and recent work has tried to reduce that cost by integrating large language models into the debugger itself. The clearest example is \textbf{ChatDBG}~\cite{levin2024chatdbg}, which embeds a chat interface inside Pdb, LLDB, and GDB so that a developer can ask plain-English questions while a program is paused at a crash. The system has been downloaded more than 75{,}000 times and is, to our knowledge, the only published debugger plugin in which the model can autonomously issue debugger commands. On 22 unpublished Python programs, ChatDBG produced an actionable diagnosis 67\% of the time on a single targeted query and 85\% with one follow-up; on 8 C/C++ programs from BugBench and BugsC\texttt{++}, it identified the root cause in 36\% of cases and the proximate cause in another 55\%. Every reported number used \texttt{gpt-4-1106-preview}, at roughly \$0.12 per Python session and \$0.06 per C/C++ session.
+
+These results establish that the interface works, but they leave the underlying science underspecified. Four limitations narrow the conclusions one can draw. First, the benchmark is small (30 bugs total), single-file, and dominated by memory errors, so it cannot distinguish bugs that are easy from bugs that are hard, and it provides no signal about multi-file projects of the kind covered by SWE-bench~\cite{jimenez2024swebench}. Second, only one model is evaluated; there is no smaller-model or open-weights baseline, even though much of a debugger's work (printing variables, walking frames, following pointers) is mechanical and may not require a frontier model. Third, the evaluation is human-in-the-loop: a person types the prompt, refines it when the first answer is weak, and judges whether a fix is ``actionable,'' which makes the success rates difficult to compare against autonomous agents. Fourth, the system explains but never executes; the model neither verifies its proposed fix nor falls back on a code interpreter when computation would be cheaper than reasoning.
+
+A separate observation sharpens the question. Mini-swe-agent~\cite{yang2024sweagent} resolves over 74\% of SWE-bench Verified using only a bash shell with no structured tool API. If a generic shell suffices for repository-level bug fixing, it is not obvious that a structured GDB surface contributes anything on top. Combined with the limitations above, this suggests that the interface, the model, the debugger surface, and the human in the loop are entangled in the original evaluation, and that disentangling them requires a larger and more controlled benchmark.
+
+\medskip
+\noindent
+\textbf{Contributions and research questions.} We rebuild the ChatDBG harness, scale its evaluation corpus to over 100 multi-file C/C++ bugs drawn from BugsC\texttt{++} and YARA, and run four ablations:
+
+\begin{itemize}
+    \item \textbf{RQ1: Tool surface.} Does a GDB-only harness produce different outcomes than a bash-only harness on identical bugs?
+    \item \textbf{RQ2: Model scale.} Can open-weights models in the 30B--120B range (Mamba-3, Nemotron Nano, Qwen 30B, Nemotron Super) match GPT-4 on this task, and on which steps does the gap appear?
+    \item \textbf{RQ3: Difficulty.} How does tool-use behavior change as bugs move from single-file memory errors to multi-file logical bugs?
+    \item \textbf{RQ4: Interface extensions.} What is the marginal effect of richer stack-trace context, chain-of-prompt self-querying, frontier-as-a-tool delegation, in-loop code execution, and a streaming Mamba policy that maintains hidden state across turns?
+\end{itemize}
+
+\noindent
+The remainder of the paper describes our reproduction harness (\S\ref{sec:methods}), the benchmark corpus (\S\ref{sec:methods:corpus}), the four ablation studies, and what those studies imply about where compute should be spent in an LLM-driven debugger.
+
+\section{Methods}
+\label{sec:methods}
+
+The original ChatDBG result of 67\% actionable-fix rate \citep{levin2024chatdbg} fixes a single configuration: GPT-4 driving a sanitized gdb interface across nine single-file C/C++ crashes. Two of the three relevant variables, the model and the tool surface, are not independently controlled, so the result does not separate model capability from interface design. We address this with a factorial sweep over three axes: the buggy program ($\sim$30 cases), the tool surface (four tiers), and the model (five under test), evaluated end-to-end by an automated three-axis rubric. The sweep yields $\sim$30 $\times$ 4 $\times$ 5 $\approx$ 600 graded runs, plus targeted ablations on context length, gdb sandbox policy, and prompt enrichment.
+
+\subsection{Test Corpus}
+\label{sec:methods:corpus}
+
+Cases must crash deterministically, expose the bug to runtime inspection, and have a known ground-truth fix; correctness or performance bugs that do not crash are out of scope. All cases are C or C++, both for direct comparability with ChatDBG's original evaluation and because manual memory management is the regime that exercises an interactive debugger.
+
+The corpus contains $\sim$30 cases in the headline matrix and $\sim$50 in the extended sweep, drawn from six sources: nine direct ports of ChatDBG's original synthetic suite (\texttt{bench/cases/paper/}); ten additional hand-authored synthetic crashes covering bug classes underrepresented in the original (signed/unsigned loops, integer-overflow allocation, double-free on error paths, vector-iterator invalidation); four BugBench programs \citep{lu2005bugbench}; eleven external-benchmark cases comprising six from CrashBench \citep{ortega2024crashbench} and five from the Juliet test suite \citep{juliet2017} covering CWE-121, 122, 126, 415, and 416; five injected-repo cases derived by reverting known patches in pinned versions of cJSON, Lua, Mongoose, the SQLite shell, and zlib, in the spirit of the repository-level reversion methodology of SWE-bench \citep{jimenez2024swebench}; and five BugsCPP libtiff cases \citep{an2023bugscpp}.
+
+This expansion is motivated by two considerations. First, the original nine-case suite has been on GitHub since 2023 and is plausibly in the pretraining mix of every model evaluated; one memorized fix shifts a nine-case score by 11 points. Second, with five models and four tiers, a nine-case corpus produces noise wider than the effects of interest. Hand-authored cases were written in 2026 and remain unpublished, postdating every model's training cutoff. The injected-repo cases reuse bugs whose public patches predate cutoffs, but their failing input, crash signature, and exact repository state are novel; pattern recognition is plausible while verbatim retrieval is not.
+
+Each case is described by a \texttt{case.yaml} specifying language, source, build flags, run arguments, expected-crash flag, ground-truth bug metadata, and a \texttt{criteria} block carrying three pre-registered scoring rubrics (\S\ref{sec:methods:rubric}). The criteria are visible to the judge but not to the model under test.
+
+\subsection{Tool-Surface Tiers}
+\label{sec:methods:tiers}
+
+A \emph{tier} fixes a tool surface; the model, prompt scaffolding, context window, and sandbox image are held constant across tiers, so any tier-vs-tier difference is attributable to the interactive surface alone.
+
+\paragraph{Tier 1 (bash only).} A \texttt{mini-swe-agent} harness \citep{minisweagent2025} exposing a single \texttt{bash} tool. The model has no debugger and must reproduce or instrument via the shell. Tier 1 is the no-debugger baseline.
+
+\paragraph{Tier 2 (bash + persistent gdb).} The same \texttt{mini-swe-agent} harness with an added \texttt{gdb} tool dispatched to a long-lived gdb subprocess (\texttt{LocalGdbBashEnvironment}). State persists across calls. Tier 2 minus Tier 1 isolates the marginal value of an interactive debugger over a generic shell.
+
+\paragraph{Tier 3 (ChatDBG native).} ChatDBG's original surface: a sanitized \texttt{debug} tool, \texttt{get\_code\_surrounding}, and \texttt{find\_definition}; no shell. This is the closest replication of the paper. As an ablation we run \emph{Tier 3-unfenced}, in which \texttt{CHATDBG\_UNSAFE=1} lifts the gdb command allow-list (\texttt{break}, \texttt{run}, \texttt{continue}, \texttt{disassemble}, \texttt{x}, \texttt{set}, \texttt{call}, full \texttt{backtrace}), measuring the cost of ChatDBG's safety sanitizer.
+
+\paragraph{Tier 4 (Claude Code CLI).} The Claude Code CLI run with \texttt{--bare}, providing bash, file read, and file edit. Tier 4 has strictly more tools than the others and is reported as a frontier-agent ceiling, not a controlled comparison.
+
+All tiers run inside Docker containers (\texttt{synthetic-runner} for synthetic cases, \texttt{gdb-<project>} for BugsCPP and injected-repo cases). Patch git history is stripped at workspace prep to prevent agents from recovering the developer fix via \texttt{git log}, a leak path identified during pilot runs. Tier configurations are declarative JSON files under \texttt{bench/configs/}.
+
+\subsection{Models}
+\label{sec:methods:models}
+
+To test whether frontier scale is necessary for tool-mediated debugging, the model lineup spans the cost-and-scale spectrum rather than concentrating at the frontier. We evaluate two frontier closed models, one frontier-small closed model, and two open-weights $\sim$30B mixture-of-experts models (Table~\ref{tab:models}). All models are accessed through LiteLLM at temperature 0 (or the provider minimum), with a tier-calibrated max-tokens cap, so prompt and response handling is uniform across providers. GPT-4o is held back as the judge (\S\ref{sec:methods:judge}) and never appears under test.
+
+\begin{table}[t]
+    \centering
+    \small
+    \begin{tabular}{@{}llll@{}}
+        \toprule
+        Model (provider) & Role & Active params & Cutoff \\
+        \midrule
+        \texttt{gpt-5.5} (OpenAI) & frontier & undisclosed & 2026 \\
+        \texttt{claude-sonnet-4.5} (Anthropic) & frontier & undisclosed & 2025 \\
+        \texttt{gemini-3.1-flash-lite} (Google) & frontier-small & undisclosed & 2025 \\
+        \texttt{nemotron-3-nano-30b-a3b} (NVIDIA) & open MoE & 3B / 30B & 2025 \\
+        \texttt{qwen3-30b-a3b-instruct} (Qwen) & open MoE & 3B / 30B & 2025 \\
+        \bottomrule
+    \end{tabular}
+    \caption{Models under evaluation. All cutoffs predate or coincide with the hand-authored cases in \S\ref{sec:methods:corpus}.}
+    \label{tab:models}
+\end{table}
+
+\subsection{Run Procedure}
+\label{sec:methods:loop}
+
+A run is identified by the tuple $(\text{case}, \text{tier}, \text{model}, \text{context\_lines}, \text{seed})$, hashed into a deterministic \texttt{run\_id} so re-execution is a cache hit and partially completed sweeps resume safely. Each run compiles the case in a clean Docker workspace (with bug patch applied and git history stripped, for injected-repo cases), runs the binary to crash to capture sanitizer output and backtrace, then enters the agent loop until a final response is emitted or a step, cost, or wall-clock budget is exceeded.
+
+The system prompt (\texttt{instructions/default.txt}) provides generic debugging instructions and descriptions of the active tier's tools; the bug category, ground-truth lines, and scoring criteria are withheld. The user prompt (\texttt{build\_initial\_prompt}) supplies six fields: case metadata, an enriched stack trace (top three frames with $\pm$\texttt{context\_lines} of source, default 10), the sanitizer or crash message, the invocation command line and stdin, the debugger command history, and a fixed question, \emph{``What is the root cause of this crash? Walk through the program state, identify the defect, and propose a fix in code.''} The enriched stack trace is delivered identically on every tier, so tier-vs-tier differences isolate the interactive surface and the \texttt{context\_lines} ablation isolates static context.
+
+\subsection{Scoring Rubric}
+\label{sec:methods:rubric}
+
+The original paper grades a single binary axis: did the model identify the root cause? This collapses three distinct outcomes (understanding, symptom-level patching, and structural fix) and obscures the failure mode most relevant to the small-model debugging hypothesis, in which a model localizes correctly but proposes the wrong kind of fix. We score every response on three independent 0/1 axes:
+
+\begin{enumerate}
+    \item \textbf{Root cause}: the response correctly diagnoses the defect (right line, variable, and invariant).
+    \item \textbf{Local fix}: the proposed change resolves the proximate symptom at the crash site.
+    \item \textbf{Global fix}: the proposed change addresses the bug class structurally (API, type, or invariant), not just the crashing line.
+\end{enumerate}
+
+The axes are independent; local without global is the most common outcome, and global without local is rare. The criteria block is pre-registered per case and visible only to the judge. One limitation: the rubric scores the model's final response as text, without compiling and re-running an extracted patch. Strict patch execution would penalize prose explanations that are correct but not in a directly-applicable format; the cost is that scores reward articulated correctness rather than verified correctness.
+
+\subsection{LLM Judge}
+\label{sec:methods:judge}
+
+Manual grading does not scale to $\sim$600 responses, and pattern-matching is too brittle (line numbers shift; correct rationales use synonyms). We use an LLM judge, following the methodology of \citet{zheng2023judging}, which characterizes the three biases relevant here: position, verbosity, and self-preference.
+
+The judge (\texttt{bench/judge.py}) loads each run's \texttt{case.yaml}, \texttt{result.json}, and buggy source, then issues a strict-mode prompt (\texttt{prompts/judge\_system.txt}) requiring 0/1 scores with no partial credit and a two-sentence rationale per axis. The source is truncated at 20{,}000 characters and the response at 40{,}000. The judge returns a single JSON object \texttt{\{root\_cause, local\_fix, global\_fix, rationale\}}, written to a sibling \texttt{score.json} with judge token counts for cost auditing.
+
+We use GPT-4o as the judge for four reasons. Its October 2023 training cutoff predates every model under test, removing recency-driven self-preference. It is not in the model-under-test set, removing direct self-preference. It follows JSON-schema constraints reliably (parse-failure rates near zero in pilot). Its biases are documented in the calibration literature \citep{zheng2023judging,gu2024llmjudgesurvey}, so they can be partially corrected. Bias mitigations follow from the taxonomy: the judge sees only the model's final response, never the debugger transcript, removing transcript-length bias; the strict 0/1 protocol with bounded rationales discourages hedging; and we hand-grade $\sim$10\% of responses with a target judge--human Cohen's $\kappa \geq 0.7$ before relying on the headline numbers.
+
+\section*{Limitations}
+
+\section*{Ethics Statement}
+
+\section*{Acknowledgements}
+
+\bibliography{ref}
+\bibliographystyle{acl_natbib}
+
+\end{document}
