@@ -1,0 +1,50 @@
+id: double-free-errpath
+language: c
+source_file: program.c
+description: >
+  On the recoverable-error path, load_blob frees b->name but leaves the
+  pointer dangling inside the returned blob. destroy_blob then frees it
+  a second time, tripping AddressSanitizer's double-free detector.
+
+build:
+  compiler: clang
+  flags: ["-g", "-O0", "-fno-omit-frame-pointer", "-fsanitize=address"]
+
+run:
+  args: []
+  stdin: ""
+  env: {}
+  expected_crash: true
+
+bug:
+  category: double_free
+  error_type: dangling_member
+  root_cause_lines: [23]
+  related_lines: [33]
+
+criteria:
+  root_cause: >
+    The response must identify that load_blob's recoverable-error path
+    at line 23 frees `b->name` but does not NULL the pointer nor change
+    ownership; since the blob is still returned to the caller, the
+    caller's destroy_blob at line 33 frees the same pointer a second
+    time. The diagnosis must explain both halves (the orphaned free in
+    load_blob *and* destroy_blob's subsequent free), not just "double
+    free in destroy_blob".
+
+  local_fix: >
+    Set `b->name = NULL;` immediately after the free on line 23. This
+    prevents the second free because `free(NULL)` is a no-op.
+
+  global_fix: >
+    A root-cause fix removes the shared-ownership ambiguity. Acceptable:
+      (a) make the error path fully destroy the blob and return NULL,
+          so there is no dangling state for the caller to inherit; the
+          caller then doesn't call destroy_blob when it gets NULL,
+      (b) introduce a clear ownership discipline (e.g. wrap blob_t in a
+          constructor that always yields a fully-owned object, and make
+          the "recoverable error" case produce a sentinel/empty blob
+          with name == NULL by construction), or
+      (c) adopt RAII / unique_ptr semantics if this were C++.
+    A bare `b->name = NULL` on the error path is a local fix, not a
+    global one.

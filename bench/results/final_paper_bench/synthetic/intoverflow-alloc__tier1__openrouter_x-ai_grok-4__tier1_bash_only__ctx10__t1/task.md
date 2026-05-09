@@ -1,0 +1,7 @@
+You're debugging a C/C++ bug. The buggy binary is at `./build/prog` and the source file is `program.cpp` in the current directory.
+
+Run command: `./build/prog`
+
+Expected behavior: crashes when run (likely a sanitizer report or signal).
+
+Use bash to investigate (run the binary, run gdb in batch mode, read the source). Identify the root cause and propose both a local fix and a structural global fix.
