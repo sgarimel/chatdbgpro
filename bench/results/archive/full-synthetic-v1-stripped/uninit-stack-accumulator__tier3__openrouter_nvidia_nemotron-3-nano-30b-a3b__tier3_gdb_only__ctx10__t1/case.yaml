@@ -1,0 +1,49 @@
+id: uninit-stack-accumulator
+language: c
+source_file: program.c
+description: >
+  mean_of_args sums into a stack double `sum` that is never initialised
+  to 0.0. With MSan (or under certain optimisation levels) this manifests
+  as a bogus mean that trips the caller's range assertion and aborts.
+
+build:
+  compiler: clang
+  # MemorySanitizer reveals the use of uninitialized bits deterministically.
+  # NOTE: MSan is only supported on Linux x86_64 / aarch64. On macOS
+  # arm64 this case will compile-fail and the orchestrator will mark the
+  # run as `compile_failed` — re-run it on a Linux host.
+  flags: ["-g", "-O1", "-fno-omit-frame-pointer", "-fsanitize=memory", "-fsanitize-memory-track-origins"]
+  platforms: ["linux"]
+
+run:
+  args: ["10", "20", "30"]
+  stdin: ""
+  env: {}
+  expected_crash: true
+
+bug:
+  category: uninitialized_memory
+  error_type: uninit_read
+  root_cause_lines: [6]
+  related_lines: [8]
+
+criteria:
+  root_cause: >
+    The response must identify that `sum` is declared on line 6 without
+    an initialiser and is then read-modified-written inside the loop on
+    line 8. Naming "uninitialized variable" in the abstract is not
+    sufficient unless it is tied to `sum` in mean_of_args.
+
+  local_fix: >
+    Initialise `sum` to 0.0 at the declaration (`double sum = 0.0;`).
+    An equivalent early assignment before the loop is also acceptable.
+
+  global_fix: >
+    A root-cause fix additionally either:
+      (a) handles the `n == 0` case explicitly to avoid dividing by zero
+          when the caller passes no arguments, or
+      (b) returns an `expected<double, error>`-style result rather than
+          a bare double so the caller cannot ignore bad input, or
+      (c) validates that each atof() succeeds (atof returns 0 silently
+          on malformed input), e.g. by using strtod with endptr checking.
+    A local initialiser alone does not qualify.

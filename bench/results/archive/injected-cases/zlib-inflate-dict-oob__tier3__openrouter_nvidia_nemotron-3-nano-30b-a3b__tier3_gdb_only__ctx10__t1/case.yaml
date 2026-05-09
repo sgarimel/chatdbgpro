@@ -1,0 +1,68 @@
+id: zlib-inflate-dict-oob
+language: c
+kind: injected_repo
+description: >
+  inflate.c's inflate_table() builds Huffman decoding tables. The
+  injected patch flips a `<` to `<=` in the inner root-code loop so the
+  table's `used` counter can step one slot past the end of the work[]
+  array. AddressSanitizer reports a stack- or heap-buffer-overflow
+  WRITE inside inflate_table the first time decompression builds a
+  non-trivial code table — any gzipped file large enough to need
+  dynamic Huffman will trip it.
+
+repo:
+  url: https://github.com/madler/zlib
+  sha: v1.3.1
+  subdir: .
+
+build:
+  prepare: []
+  commands:
+    - "./configure --static"
+    - "make CFLAGS='-g -O0 -fsanitize=address -fno-omit-frame-pointer' LDFLAGS='-fsanitize=address' minigzip"
+  binary: minigzip
+
+run:
+  repro: "./bench-repro.sh"
+  expected_crash: true
+  env: {}
+  clean_env: false
+
+bug:
+  patch_file: bug.patch
+  root_cause_file: inftrees.c
+  root_cause_lines_approx: [inflate_table_inner_loop_bound]
+  related_lines_approx: [inflate_table_used_counter_update]
+  category: off_by_one
+  error_type: buffer_overread
+  expected_sanitizer: asan
+  expected_sanitizer_report_contains: "buffer-overflow"
+
+criteria:
+  root_cause: >
+    The response must identify that inflate_table's guard on `used`
+    (the number of table slots consumed so far) was weakened from
+    `<` to `<=`, allowing the loop to write one entry past the end of
+    the work[] / table[] array. Pointing at the comparison in the
+    root-code loop of inflate_table and explaining that the `used`
+    counter now equals the size limit instead of being strictly below
+    it counts; merely saying "zlib buffer overflow" does not.
+
+  local_fix: >
+    Restore the strict inequality on the `used` counter in
+    inflate_table, e.g. change `used <= ENOUGH_LENS` back to
+    `used < ENOUGH_LENS` (and the matching ENOUGH_DISTS branch).
+
+  global_fix: >
+    A root-cause fix removes the hand-maintained invariant that lets
+    this class of off-by-one recur. Acceptable options:
+      (a) express the table as a C++-style span and let the compiler
+          bounds-check via a checked index type,
+      (b) introduce a `table_slot_t *alloc_slot(table_t *t)` helper
+          that returns NULL when exhausted, so the code path cannot
+          silently step past the end,
+      (c) move the `used` counter + capacity into a struct whose
+          reserve()/push() methods enforce the invariant internally.
+    Just flipping `<=` back to `<` does NOT qualify as a global fix.
+
+verified: false

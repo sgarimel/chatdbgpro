@@ -1,0 +1,84 @@
+{
+  "meta": {
+    "uid": "double-free-errpath__tier1__openrouter_qwen_qwen3-30b-a3b-instruct-2507__tier1_bash_only__ctx10__t1",
+    "time": "2026-05-02T14:38:17",
+    "model": "openrouter/qwen/qwen3-30b-a3b-instruct-2507",
+    "tool_config": "tier1_bash_only.json",
+    "enabled_tools": [
+      "bash"
+    ],
+    "agent": "mini-swe-agent",
+    "agent_version": "2.2.8",
+    "mini_model_class": "minisweagent.models.litellm_model.LitellmModel",
+    "mini_model_kwargs": {
+      "drop_params": true,
+      "temperature": 0.0,
+      "parallel_tool_calls": true
+    },
+    "prompt_mode": "toolcalling"
+  },
+  "instructions": "You are an expert software engineer debugging C/C++ programs. You\ninteract with a Unix shell to investigate bugs and produce diagnoses.\n",
+  "queries": [
+    {
+      "user_text": "You're debugging a C/C++ bug. The buggy binary is at `./build/prog` and the source file is `program.c` in the current directory.\n\nRun command: `./build/prog`\n\nExpected behavior: crashes when run (likely a sanitizer report or signal).\n\nUse bash to investigate (run the binary, run gdb in batch mode, read the source). Identify the root cause and propose both a local fix and a structural global fix.\n",
+      "prompt": "You're debugging a C/C++ bug. The buggy binary is at `./build/prog` and the source file is `program.c` in the current directory.\n\nRun command: `./build/prog`\n\nExpected behavior: crashes when run (likely a sanitizer report or signal).\n\nUse bash to investigate (run the binary, run gdb in batch mode, read the source). Identify the root cause and propose both a local fix and a structural global fix.\n",
+      "thinking": null,
+      "response": "THOUGHT: The program crashes with an AddressSanitizer double-free error. The sanitizer report shows that `free(b->name)` is called twice: once in `load_blob` when `strlen(name) > 4`, and again in `destroy_blob`. The issue arises because `load_blob` returns a partially initialized `blob_t` where `b->name` is already freed, but the caller still owns the `blob_t` struct and later calls `destroy_blob`, which attempts to free `b->name` again. This is a classic double-free due to inconsistent ownership semantics.\n\nThe root cause is that `load_blob` frees `b->name` on the error path but still returns the `blob_t*` to the caller, who assumes ownership of both `name` and `size`. However, the `name` field is already freed, so `destroy_blob` will double-free it. The function's contract is ambiguous: it returns a pointer that may have a freed `name` field, but the caller is expected to call `destroy_blob` unconditionally.\n\nROOT CAUSE: In `program.c`, `load_blob` frees `b->name` on the recoverable error path (when `strlen(name) > 4`) but still returns the `blob_t*` to the caller. The caller then calls `destroy_blob`, which attempts to free `b->name` again, causing a double-free. The function returns a partially initialized struct with a freed `name` field, violating the invariant that `destroy_blob` should only be called on valid, owned `blob_t` instances.\n\nLOCAL FIX: Modify `load_blob` to return `NULL` on error instead of a partially initialized struct. This ensures that `destroy_blob` is never called on a struct with a freed `name` field.\n\n```c\nstatic blob_t *load_blob(const char *name) {\n    blob_t *b = (blob_t *)malloc(sizeof(*b));\n    if (!b) return NULL;\n    b->name = strdup(name);\n    b->size = 0;\n    if (!b->name) {\n        free(b);\n        return NULL;\n    }\n    if (strlen(name) > 4) {\n        free(b->name);\n        free(b);  // Free the struct itself\n        return NULL;  // Return NULL to indicate failure\n    }\n    b->size = strlen(b->name);\n    return b;\n}\n```\n\nGLOBAL FIX: Redesign the API to use a result type (e.g., `struct blob_result`) that explicitly encodes success/failure and ownership. This prevents the caller from accidentally calling `destroy_blob` on invalid or partially initialized data. Use a tagged union or a struct with a status field to enforce correct usage at compile time.\n\n```c\ntypedef enum {\n    BLOB_OK,\n    BLOB_ERROR\n} blob_status_t;\n\ntypedef struct {\n    blob_status_t status;\n    blob_t *blob;\n} blob_result_t;\n\nstatic blob_result_t load_blob(const char *name) {\n    blob_result_t result = { .status = BLOB_ERROR, .blob = NULL };\n    blob_t *b = (blob_t *)malloc(sizeof(*b));\n    if (!b) return result;\n    b->name = strdup(name);\n    b->size = 0;\n    if (!b->name) {\n        free(b);\n        return result;\n    }\n    if (strlen(name) > 4) {\n        free(b->name);\n        free(b);\n        return result;\n    }\n    b->size = strlen(b->name);\n    result.status = BLOB_OK;\n    result.blob = b;\n    return result;\n}\n\nstatic void destroy_blob(blob_t *b) {\n    if (!b) return;\n    free(b->name);\n    free(b);\n}\n```\n\nNow, the caller must check `result.status` before calling `destroy_blob`, preventing misuse.",
+      "code_blocks": [],
+      "total_code_length": 0,
+      "num_tool_calls": 5,
+      "tool_calls": [
+        {
+          "tool_name": "bash",
+          "verb": "ls",
+          "call": "ls -la",
+          "result_length": 611
+        },
+        {
+          "tool_name": "bash",
+          "verb": "cat",
+          "call": "cat program.c",
+          "result_length": 1222
+        },
+        {
+          "tool_name": "bash",
+          "verb": "prog",
+          "call": "./build/prog",
+          "result_length": 1233
+        },
+        {
+          "tool_name": "bash",
+          "verb": "gdb",
+          "call": "gdb -batch -ex 'run' -ex 'bt' --args ./build/prog",
+          "result_length": 431
+        },
+        {
+          "tool_name": "bash",
+          "verb": "echo",
+          "call": "echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT",
+          "result_length": 0
+        }
+      ],
+      "tool_frequency": {
+        "ls": 1,
+        "cat": 1,
+        "prog": 1,
+        "gdb": 1,
+        "echo": 1
+      },
+      "stats": {
+        "completed": true,
+        "model": "openrouter/qwen/qwen3-30b-a3b-instruct-2507",
+        "cost": 0.0,
+        "time": 11.716592788696289,
+        "tokens": 10097,
+        "prompt_tokens": 9157,
+        "completion_tokens": 940,
+        "exit_status": "Submitted",
+        "submission": "",
+        "cost_estimated_usd": 0.001106,
+        "cost_source": "openrouter"
+      }
+    }
+  ]
+}
