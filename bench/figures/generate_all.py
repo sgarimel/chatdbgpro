@@ -34,6 +34,9 @@ SYNTH_DIR    = ROOT / "results" / "synth-8model-sweep"
 T3UNF_DIR    = ROOT / "results" / "synth-t3-unfenced"
 CMW_DIR      = ROOT / "results" / "synth-t3-unfenced-cmw"
 T4_DIR       = ROOT / "results" / "synth-t4-sweep"
+CTX_DIRS     = {5: ROOT / "results" / "synth-ctx5",
+                20: ROOT / "results" / "synth-ctx20",
+                999: ROOT / "results" / "synth-ctx999"}
 BB_DIRS      = {t: ROOT / "results" / f"bugbench-t{t}" for t in [1, 2, 3]}
 FIGS         = Path(__file__).resolve().parent
 FIGS.mkdir(exist_ok=True)
@@ -92,10 +95,12 @@ def load_scored_runs(results_dir: Path, *, use_collect=True) -> list[dict]:
             continue
 
         model = short_model(model_raw)
-        sc = {}
-        if sp.exists():
-            score = json.loads(sp.read_text())
-            sc = score.get("scores", {})
+        if not sp.exists():
+            continue
+        score = json.loads(sp.read_text())
+        if score.get("status") not in ("ok", "no_prose_synthesis"):
+            continue
+        sc = score.get("scores", {})
 
         tc, tf = 0, {}
         cp = sd / "collect.json"
@@ -522,7 +527,7 @@ def generate_synth():
                 ax.annotate(f"{delta:+.2f}", xy=(i + width/2, c + 0.05),
                             fontsize=8, ha="center", color=color, fontweight="bold")
         ax.set_ylabel("Mean Total Score (0–3)")
-        ax.set_title("Synthetic: One-Shot vs Check-My-Work (T3 unfenced)")
+        ax.set_title("Synthetic: One-Shot vs Check-My-Work")
         ax.set_xticks(x); ax.set_xticklabels(models, fontsize=9)
         ax.legend(fontsize=9); ax.set_ylim(0, 3.5)
         plt.tight_layout()
@@ -602,11 +607,156 @@ def generate_tools_only():
 
 
 # ══════════════════════════════════════════════════════════════════════
+#  CONTEXT-LINE ABLATION
+# ══════════════════════════════════════════════════════════════════════
+
+def generate_context_ablation():
+    print("\n── Context-Line Ablation Figures ──")
+
+    # Shared synthetic cases (intersection of baseline and ablations)
+    shared_cases = set()
+    baseline_dir = T3UNF_DIR
+    for sd in baseline_dir.iterdir():
+        rp = sd / "result.json"
+        if not rp.exists(): continue
+        r = json.loads(rp.read_text())
+        if r.get("status") == "ok":
+            shared_cases.add(r.get("case_id", "?"))
+
+    # Only these 4 models ran fully across ablations
+    ctx_models = ["Gemini-FL", "Qwen-30B", "Nemotron-30B", "Llama-8B"]
+    ctx_levels = [5, 10, 20, 999]
+    ctx_labels = {5: "5", 10: "10", 20: "20", 999: "max"}
+    ctx_colors = {"Gemini-FL": "#EA4335", "Qwen-30B": "#4285F4",
+                  "Nemotron-30B": "#FBBC05", "Llama-8B": "#34A853"}
+
+    # Load data per context level
+    ctx_data = {}  # ctx -> list of dicts
+
+    # ctx=10 baseline from synth-t3-unfenced
+    baseline = load_scored_runs(baseline_dir)
+    baseline = [d for d in baseline if d["model"] in ctx_models and d["case"] in shared_cases]
+    ctx_data[10] = baseline
+
+    for ctx, cdir in CTX_DIRS.items():
+        if not cdir.exists():
+            print(f"  Warning: {cdir} not found")
+            continue
+        runs = load_scored_runs(cdir)
+        runs = [d for d in runs if d["model"] in ctx_models and d["case"] in shared_cases]
+        ctx_data[ctx] = runs
+
+    # Check coverage
+    min_scored = float("inf")
+    for ctx in ctx_levels:
+        runs = ctx_data.get(ctx, [])
+        scored = [d for d in runs if d["total"] is not None]
+        print(f"  ctx={ctx_labels.get(ctx, ctx)}: {len(scored)} scored runs "
+              f"({len(set(d['model'] for d in scored))} models)")
+        min_scored = min(min_scored, len(scored))
+
+    if min_scored < 10:
+        print(f"  WARNING: Some context levels have very few scored runs ({min_scored}).")
+        print(f"  Figures may be unreliable. Run judge first.")
+
+    # ── Figure A: Line chart — mean score by context level, one line per model ──
+    fig, ax = plt.subplots(figsize=(10, 6))
+    for m in ctx_models:
+        xs, ys, ns = [], [], []
+        for ctx in ctx_levels:
+            runs = [d for d in ctx_data.get(ctx, []) if d["model"] == m]
+            if runs:
+                xs.append(ctx)
+                ys.append(np.mean([d["total"] for d in runs]))
+                ns.append(len(runs))
+        if xs:
+            ax.plot(xs, ys, "o-", label=m, color=ctx_colors.get(m, "gray"),
+                    linewidth=2.5, markersize=8)
+            # Annotate n at each point
+            for x, y, n in zip(xs, ys, ns):
+                ax.annotate(f"n={n}", (x, y), textcoords="offset points",
+                            xytext=(0, 10), fontsize=7, ha="center", color="gray")
+
+    ax.set_xlabel("Context lines around each stack frame", fontsize=12)
+    ax.set_ylabel("Mean Total Score (0–3)", fontsize=12)
+    ax.set_title("Context-Line Ablation: Score vs Source Context Size\n"
+                 "(T3 ChatDBG, synthetic cases, 4 models)", fontsize=13)
+    ax.set_xticks(ctx_levels)
+    ax.set_xticklabels([ctx_labels.get(c, str(c)) for c in ctx_levels])
+    ax.set_ylim(0, 3.3)
+    ax.axhline(y=3, color="gray", ls="--", lw=0.5, alpha=0.5)
+    ax.legend(fontsize=10, loc="best")
+    ax.grid(axis="y", alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(FIGS / "context_ablation_by_model.png", dpi=150)
+    print(f"  Saved: context_ablation_by_model.png")
+    plt.close()
+
+    # ── Figure B: Grouped bar — all models combined mean at each context level ──
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ctx_means, ctx_counts = [], []
+    for ctx in ctx_levels:
+        runs = ctx_data.get(ctx, [])
+        if runs:
+            ctx_means.append(np.mean([d["total"] for d in runs]))
+            ctx_counts.append(len(runs))
+        else:
+            ctx_means.append(0)
+            ctx_counts.append(0)
+
+    bars = ax.bar(range(len(ctx_levels)), ctx_means, color=["#e76f51", "#2a9d8f", "#264653", "#e9c46a"],
+                  width=0.6, edgecolor="black", linewidth=0.5)
+    ax.set_xticks(range(len(ctx_levels)))
+    ax.set_xticklabels([f"ctx={ctx_labels[c]}\n(n={ctx_counts[i]})" for i, c in enumerate(ctx_levels)])
+    ax.set_ylabel("Mean Total Score (0–3)")
+    ax.set_title("Context-Line Ablation: Overall Mean Score")
+    ax.set_ylim(0, 3.3)
+    for bar, val in zip(bars, ctx_means):
+        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.05,
+                f"{val:.2f}", ha="center", va="bottom", fontsize=11, fontweight="bold")
+    plt.tight_layout()
+    plt.savefig(FIGS / "context_ablation_overall.png", dpi=150)
+    print(f"  Saved: context_ablation_overall.png")
+    plt.close()
+
+    # ── Figure C: Grouped bar — per model × context level ──
+    fig, ax = plt.subplots(figsize=(12, 5.5))
+    x = np.arange(len(ctx_models))
+    width = 0.18
+    ctx_bar_colors = {5: "#e76f51", 10: "#2a9d8f", 20: "#264653", 999: "#e9c46a"}
+
+    for ci, ctx in enumerate(ctx_levels):
+        avgs = []
+        for m in ctx_models:
+            runs = [d for d in ctx_data.get(ctx, []) if d["model"] == m]
+            avgs.append(np.mean([d["total"] for d in runs]) if runs else 0)
+        bars = ax.bar(x + ci * width, avgs, width,
+                      label=f"ctx={ctx_labels[ctx]}",
+                      color=ctx_bar_colors[ctx], alpha=0.85)
+        for bar, val in zip(bars, avgs):
+            if val > 0:
+                ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.03,
+                        f"{val:.2f}", ha="center", va="bottom", fontsize=7)
+
+    ax.set_ylabel("Mean Total Score (0–3)")
+    ax.set_title("Context-Line Ablation: Score by Model × Context Size")
+    ax.set_xticks(x + width * 1.5)
+    ax.set_xticklabels(ctx_models, fontsize=11)
+    ax.legend(fontsize=9, loc="upper right")
+    ax.set_ylim(0, 3.5)
+    ax.axhline(y=3, color="gray", ls="--", lw=0.5, alpha=0.5)
+    plt.tight_layout()
+    plt.savefig(FIGS / "context_ablation_per_model.png", dpi=150)
+    print(f"  Saved: context_ablation_per_model.png")
+    plt.close()
+
+
+# ══════════════════════════════════════════════════════════════════════
 
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--only", choices=["synth", "bugbench", "tools"],
+    p.add_argument("--only", choices=["synth", "bugbench", "tools", "context"],
                    help="Generate only a subset of figures")
     args = p.parse_args()
 
@@ -616,9 +766,12 @@ def main():
         generate_bugbench()
     elif args.only == "tools":
         generate_tools_only()
+    elif args.only == "context":
+        generate_context_ablation()
     else:
         generate_synth()
         generate_bugbench()
+        generate_context_ablation()
 
     print(f"\nAll figures saved to: {FIGS}/")
 
