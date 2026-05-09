@@ -1,0 +1,188 @@
+   (Message)
+   (ChatDBG gdb) run
+   /root/chatdbgpro/.venv/lib/python3.12/site-packages/pydantic/main.py:475: UserWarning: Pydantic serializer warnings:
+     PydanticSerializationUnexpectedValue(Expected 5 fields but got 4: Expected `Message` - serialized value may not be as expected [field_name='choices', input_value=Message(content='', role=...')], function_call=None), input_type=Message])
+     PydanticSerializationUnexpectedValue(Expected `StreamingChoices` - serialized value may not be as expected [field_name='choices', input_value=Choices(finish_reason='to...)], function_call=None)), input_type=Choices])
+     return self.__pydantic_serializer__.to_python(
+   /root/chatdbgpro/.venv/lib/python3.12/site-packages/pydantic/main.py:475: UserWarning: Pydantic serializer warnings:
+     PydanticSerializationUnexpectedValue(Expected 5 fields but got 4: Expected `Message` - serialized value may not be as expected [field_name='choices', input_value=Message(content='', role=...')], function_call=None), input_type=Message])
+     PydanticSerializationUnexpectedValue(Expected `StreamingChoices` - serialized value may not be as expected [field_name='choices', input_value=Choices(finish_reason='st...)], function_call=None)), input_type=Choices])
+     return self.__pydantic_serializer__.to_python(
+   [Thread debugging using libthread_db enabled]
+   Using host libthread_db library "/lib/x86_64-linux-gnu/libthread_db.so.1".
+   [Detaching after fork from child process 49090]
+
+   (Message)
+   (ChatDBG gdb) code program.c:1
+   1 /* TEMPLATE GENERATED TESTCASE FILE
+   2 Filename: CWE415_Double_Free__malloc_free_char_01.c
+   3 Label Definition File: CWE415_Double_Free__malloc_free.label.xml
+   4 Template File: sources-sinks-01.tmpl.c
+
+   (Message)
+   (ChatDBG gdb) code program.c:10
+    3 Label Definition File: CWE415_Double_Free__malloc_free.label.xml
+    4 Template File: sources-sinks-01.tmpl.c
+    5 */
+    6 /*
+    7  * @description
+    8  * CWE: 415 Double Free
+    9  * BadSource:  Allocate data using malloc() and Deallocate data using free()
+   10  * GoodSource: Allocate data using malloc()
+   11  * Sinks:
+   12  *    GoodSink: do nothing
+   13  *    BadSink : Deallocate data using free()
+
+   (Message)
+   (ChatDBG gdb) bt
+   No stack.
+   (Message)
+   (ChatDBG gdb) code program.c:20
+   13  *    BadSink : Deallocate data using free()
+   14  * Flow Variant: 01 Baseline
+   15  *
+   16  * */
+   17 
+   18 #include "std_testcase.h"
+   19 
+   20 #include <wchar.h>
+   21 
+   22 #ifndef OMITBAD
+
+   (Message)
+   (ChatDBG gdb) code program.c:30
+   24 void CWE415_Double_Free__malloc_free_char_01_bad()
+   25 {
+   26     char * data;
+   27     /* Initialize data */
+   28     data = NULL;
+   29     data = (char *)malloc(100*sizeof(char));
+   30     if (data == NULL) {exit(-1);}
+   31     /* POTENTIAL FLAW: Free data in the source - the bad sink frees data as well */
+   32     free(data);
+   33     /* POTENTIAL FLAW: Possibly freeing memory twice */
+
+   (Message)
+   (ChatDBG gdb) code program.c:40
+   33     /* POTENTIAL FLAW: Possibly freeing memory twice */
+   34     free(data);
+   35 }
+   36 
+   37 #endif /* OMITBAD */
+   38 
+   39 #ifndef OMITGOOD
+   40 
+   41 /* goodG2B uses the GoodSource with the BadSink */
+   42 static void goodG2B()
+   43 {
+
+   (Message)
+   (ChatDBG gdb) code program.c:35
+   28     data = NULL;
+   29     data = (char *)malloc(100*sizeof(char));
+   30     if (data == NULL) {exit(-1);}
+   31     /* POTENTIAL FLAW: Free data in the source - the bad sink frees data as well */
+   32     free(data);
+   33     /* POTENTIAL FLAW: Possibly freeing memory twice */
+   34     free(data);
+   35 }
+   36 
+   37 #endif /* OMITBAD */
+
+   
+   (Message) **ROOT CAUSE:**
+   `program.c:34` contains a **double `free(data)`**. After allocating `data`
+   with `malloc`, the code frees it once (line 32) and then calls `free(data)`
+   again unconditionally (line 34). This second free operates on a pointer that
+   is no longer valid, invoking undefined behavior. In practice the allocator
+   detects the corruption or the freed block’s metadata is reused, causing the
+   process to abort (often with a signal‑less termination that appears to GDB as
+   “stopped (no‑signal)”). The symptom matches classic CWE‑415 double‑free.
+   
+   **LOCAL FIX:**
+   Remove or guard the second `free`. The smallest change that stops the
+   immediate crash is to delete the duplicate call (or make `free` idempotent):
+   
+   ```diff
+   -  free(data);               /* line 32 */
+   -  /* POTENTIAL FLAW: Possibly freeing memory twice */
+   -  free(data);              /* line 34 */
+   +  free(data);               /* free once */
+   +  data = NULL;              /* make subsequent frees safe */
+   ```
+   
+   *or* simply comment out the second `free`:
+   
+   ```c
+   /* free(data);   // <-- remove this duplicate free */
+   ```
+   
+   After this change the program terminates cleanly without crashing.
+   
+   **GLOBAL FIX:**
+   Adopt **ownership‑based memory management** throughout the codebase to
+   guarantee that a buffer is freed exactly once. Recommended measures:
+   
+   1. **Null‑out pointers after free** – always set `data = NULL;` after each
+   `free`. This allows safe repeated calls to `free`.
+   2. **RAII wrappers / smart pointers** – replace raw `malloc`/`free` with C++
+   `std::unique_ptr<char[]>` or a small wrapper class that calls `free` in its
+   destructor, ensuring deterministic single free.
+   3. **Static analysis / sanitizers** – enable compiler flags such as
+   `-fsanitize=address,undefined` and run tools like **Clang-Tidy** or
+   **Cppcheck** to catch double‑free patterns automatically.
+   4. **Centralized free macro** – wrap deallocation in a macro or inline
+   function that does `if (ptr) { free(ptr); ptr = NULL; }`, making deallocation
+   idempotent and centralizing the logic.
+   
+   These changes prevent the entire class of double‑free bugs, not just this
+   particular instance, by enforcing a single source of truth for allocation and
+   deallocation.
+   (Message) **ROOT CAUSE:**
+   `program.c:34` contains a **double `free(data)`**. After allocating `data`
+   with `malloc`, the code frees it once (line 32) and then calls `free(data)`
+   again unconditionally (line 34). This second free operates on a pointer that
+   is no longer valid, invoking undefined behavior. In practice the allocator
+   detects the corruption or the freed block’s metadata is reused, causing the
+   process to abort (often with a signal‑less termination that appears to GDB as
+   “stopped (no‑signal)”). The symptom matches classic CWE‑415 double‑free.
+   
+   **LOCAL FIX:**
+   Remove or guard the second `free`. The smallest change that stops the
+   immediate crash is to delete the duplicate call (or make `free` idempotent):
+   
+   ```diff
+   -  free(data);               /* line 32 */
+   -  /* POTENTIAL FLAW: Possibly freeing memory twice */
+   -  free(data);              /* line 34 */
+   +  free(data);               /* free once */
+   +  data = NULL;              /* make subsequent frees safe */
+   ```
+   
+   *or* simply comment out the second `free`:
+   
+   ```c
+   /* free(data);   // <-- remove this duplicate free */
+   ```
+   
+   After this change the program terminates cleanly without crashing.
+   
+   **GLOBAL FIX:**
+   Adopt **ownership‑based memory management** throughout the codebase to
+   guarantee that a buffer is freed exactly once. Recommended measures:
+   
+   1. **Null‑out pointers after free** – always set `data = NULL;` after each
+   `free`. This allows safe repeated calls to `free`.
+   2. **RAII wrappers / smart pointers** – replace raw `malloc`/`free` with C++
+   `std::unique_ptr<char[]>` or a small wrapper class that calls `free` in its
+   destructor, ensuring deterministic single free.
+   3. **Static analysis / sanitizers** – enable compiler flags such as
+   `-fsanitize=address,undefined` and run tools like **Clang-Tidy** or
+   **Cppcheck** to catch double‑free patterns automatically.
+   4. **Centralized free macro** – wrap deallocation in a macro or inline
+   function that does `if (ptr) { free(ptr); ptr = NULL; }`, making deallocation
+   idempotent and centralizing the logic.
+   
+   These changes prevent the entire class of double‑free bugs, not just this
+   particular instance, by enforcing a single source of truth for allocation and
+   deallocation.
