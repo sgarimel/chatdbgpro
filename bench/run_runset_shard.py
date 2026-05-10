@@ -108,6 +108,11 @@ def main() -> int:
             "--timeout", str(args.timeout),
             "--workers", str(args.workers),
         ]
+        if args.panel == "synthetic":
+            # Synthetic case ids are case.yaml manifests under bench/cases/,
+            # not rows in corpus.db. Force the orchestrator's on-disk
+            # --cases path; --runtime is ignored downstream in this mode.
+            cmd.append("--no-docker")
         if args.dry_run:
             cmd.append("--dry-run")
         print(f"[shard] >>> T{tier} {model}: {len(cases_sorted)} cases -> sweep={sweep}",

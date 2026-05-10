@@ -77,21 +77,29 @@ def run_one(
     timeout: int,
     trials: int,
     dry: bool,
+    no_docker: bool = False,
 ) -> str:
-    """Worker: run a single (bug, tier, model) via bench.orchestrator."""
+    """Worker: run a single (bug, tier, model) via bench.orchestrator.
+
+    When ``no_docker`` is True the cell is dispatched through the on-disk
+    case-discovery path (``--cases`` against ``bench/cases``), which is
+    required for the synthetic panel because those case ids do not exist
+    in ``corpus.db``.
+    """
     cmd = [
         sys.executable, "-m", "bench.orchestrator",
         "--models", model,
         "--tool-configs", str(TIER_CONFIG[tier]),
         "--tiers", str(tier),
-        "--docker",
-        "--bug-ids", bug_id,
         "--trials", str(trials),
         "--timeout", str(timeout),
         "--name", name,
-        "--runtime", runtime,
         "--skip-existing",
     ]
+    if no_docker:
+        cmd += ["--cases", bug_id]
+    else:
+        cmd += ["--docker", "--bug-ids", bug_id, "--runtime", runtime]
     label = f"{bug_id}/T{tier}/{model.split('/')[-1]}"
     if dry:
         return f"[DRY] {label}: {' '.join(cmd)}"
@@ -119,6 +127,10 @@ def main() -> None:
     p.add_argument("--trials", type=int, default=1)
     p.add_argument("--workers", type=int, default=8,
                    help="Max concurrent orchestrator processes")
+    p.add_argument("--no-docker", action="store_true",
+                   help="Dispatch through orchestrator's on-disk --cases "
+                        "path. Required for the synthetic panel because those "
+                        "case ids are not in corpus.db.")
     p.add_argument("--dry-run", action="store_true")
     args = p.parse_args()
 
@@ -141,6 +153,7 @@ def main() -> None:
             pool.submit(
                 run_one, b, t, m, args.name,
                 args.runtime, args.timeout, args.trials, args.dry_run,
+                args.no_docker,
             ): (b, t, m)
             for b, t, m in specs
         }

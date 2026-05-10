@@ -1,5 +1,25 @@
 # Anika — synthetic panel runner handoff
 
+> **2026-05-10 — partially superseded.** Steps 1–4 below were executed
+> and key parts deviated from this doc:
+>
+> 1. Synthetic case ids aren't in `corpus.db`, so the `--docker --bug-ids`
+>    path through `parallel_run.py` returns nothing. Patched: when
+>    `--panel synthetic`, `run_runset_shard.py` now passes `--no-docker`
+>    to `parallel_run.py`, which routes orchestrator through `--cases`
+>    (on-disk discovery). No Docker needed for synthetic at all.
+> 2. Native Windows lacks a C compiler and the bash sandbox mini-swe-agent
+>    expects, so the runs happen inside **WSL2 Ubuntu** instead.
+> 3. `mini-swe-agent>=2.2.8` requires `litellm>=1.75.5`, conflicting
+>    with chatdbg's `litellm==1.55.9` pin. Two venvs are used:
+>    `$HOME/.venvs/chatdbg-bench` (orch) + `$HOME/.venvs/chatdbg-mini`
+>    (mini-swe-agent runner), bridged by `CHATDBG_MINI_PY`.
+> 4. Build via `bench/setup_wsl_venv.sh`; run via
+>    `bench/run_synthetic_with_venv.sh`.
+>
+> The full reproducible record (commands, outputs, failure→fix chain) is
+> in **`bench/SETUP_LOG_anika_synthetic.md`** — read that first.
+
 This file is the entry point for any Claude Code session running on Anika's
 machine. Read this end-to-end first, then start at "Step-by-step run".
 
