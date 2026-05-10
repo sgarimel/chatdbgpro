@@ -17,16 +17,22 @@
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-VENV="${CHATDBG_VENV:-$HOME/.venvs/chatdbg-bench}"
+# Two venvs (see bench/setup_wsl_venv.sh and bench/SETUP_LOG_anika_synthetic.md):
+#   ORCH = chatdbg core (litellm 1.55.9)        — runs the orchestrator.
+#   MINI = mini-swe-agent runner (litellm 1.83) — bridged via $CHATDBG_MINI_PY.
+VENV_ORCH="${CHATDBG_VENV:-$HOME/.venvs/chatdbg-bench}"
+VENV_MINI="${CHATDBG_MINI_VENV:-$HOME/.venvs/chatdbg-mini}"
 
-if [ ! -x "$VENV/bin/python3" ]; then
-    echo "[run] venv not found at $VENV. Run bench/setup_wsl_venv.sh first." >&2
-    exit 1
-fi
+for v in "$VENV_ORCH" "$VENV_MINI"; do
+    if [ ! -x "$v/bin/python3" ]; then
+        echo "[run] venv missing at $v. Run bench/setup_wsl_venv.sh first." >&2
+        exit 1
+    fi
+done
 
 # shellcheck disable=SC1091
-source "$VENV/bin/activate"
-export CHATDBG_MINI_PY="$VENV/bin/python3"
+source "$VENV_ORCH/bin/activate"
+export CHATDBG_MINI_PY="$VENV_MINI/bin/python3"
 export PYTHONUNBUFFERED=1
 
 cd "$REPO"

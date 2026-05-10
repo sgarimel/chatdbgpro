@@ -174,6 +174,35 @@ status.
   `import minisweagent` ok inside the mini venv. Final sizes:
   orch ~540 MB, mini ~370 MB.
 
+### §4.1.1 Wrapper bug found mid-sweep
+
+After the smoke test (§4.2) passed, I launched the full T1 shard with
+`bench/run_synthetic_with_venv.sh`. The first 32 cells reported
+`rc=0` and a healthy 18–66 s wall in `parallel_run`'s `[done]` line,
+but every `result.json` came back `status=no_collect`,
+`elapsed_s ≈ 0.5–0.8 s`. Stderr in each cell contained:
+
+```
+File ".../bench/drivers/tier1_runner.py", line 543, in main
+    from minisweagent.agents.default import DefaultAgent
+ModuleNotFoundError: No module named 'minisweagent'
+```
+
+Root cause: the wrapper exported `CHATDBG_MINI_PY=$VENV/bin/python3`
+where `$VENV` was the **orchestrator** venv (chatdbg-bench), not the
+mini venv (chatdbg-mini). Tier-1 driver dutifully launched
+`tier1_runner.py` with the orch python, which has no `minisweagent`
+because of the litellm pin conflict (the whole reason for the split).
+
+The smoke test passed because it ran the orchestrator directly, with
+`CHATDBG_MINI_PY` set manually to the mini venv on the command line.
+The wrapper was never exercised.
+
+Fix: wrapper now resolves both venvs, activates orch, and exports
+`CHATDBG_MINI_PY=$VENV_MINI/bin/python3`. The 32 broken cells will
+re-run on the next sweep — `--skip-existing` only skips `status=ok`,
+so `no_collect` triggers re-run automatically.
+
 ### §4.2 Smoke test — one synthetic T1 cell
 
 ```bash
