@@ -77,29 +77,54 @@ def run_one(
     timeout: int,
     trials: int,
     dry: bool,
+    no_docker: bool = False,
 ) -> str:
-    """Worker: run a single (bug, tier, model) via bench.orchestrator."""
+    """Worker: run a single (bug, tier, model) via bench.orchestrator.
+
+    When ``no_docker`` is True the cell is dispatched through the on-disk
+    case-discovery path (``--cases`` against ``bench/cases``), which is
+    required for the synthetic panel because those case ids do not exist
+    in ``corpus.db``.
+    """
     cmd = [
         sys.executable, "-m", "bench.orchestrator",
         "--models", model,
         "--tool-configs", str(TIER_CONFIG[tier]),
         "--tiers", str(tier),
-        "--docker",
-        "--bug-ids", bug_id,
         "--trials", str(trials),
         "--timeout", str(timeout),
         "--name", name,
-        "--runtime", runtime,
         "--skip-existing",
     ]
+    if no_docker:
+        cmd += ["--cases", bug_id]
+    else:
+        cmd += ["--docker", "--bug-ids", bug_id, "--runtime", runtime]
     label = f"{bug_id}/T{tier}/{model.split('/')[-1]}"
     if dry:
         return f"[DRY] {label}: {' '.join(cmd)}"
+    # Belt-and-suspenders timeout: the inner Tier1/Tier3 driver enforces
+    # `timeout` seconds via proc.communicate, but we've observed that
+    # mini-swe-agent's litellm cleanup can leave the runner subprocess
+    # hung past the inner deadline (one cell ran 3733s with timeout=600).
+    # Cap the orchestrator subprocess at `timeout + 120s` and force-kill
+    # if it overruns, so a single stuck cell can't block its worker for
+    # an hour.
+    outer_timeout = timeout + 120
     t0 = time.time()
-    r = subprocess.run(cmd, capture_output=True, text=True, cwd=str(REPO_ROOT))
-    dt = time.time() - t0
-    tail = (r.stdout + r.stderr).splitlines()[-1] if (r.stdout or r.stderr) else ""
-    return f"[done] {label} rc={r.returncode} {dt:.0f}s :: {tail[:120]}"
+    try:
+        r = subprocess.run(
+            cmd, capture_output=True, text=True, cwd=str(REPO_ROOT),
+            timeout=outer_timeout,
+        )
+        dt = time.time() - t0
+        tail = (r.stdout + r.stderr).splitlines()[-1] if (r.stdout or r.stderr) else ""
+        return f"[done] {label} rc={r.returncode} {dt:.0f}s :: {tail[:120]}"
+    except subprocess.TimeoutExpired as e:
+        dt = time.time() - t0
+        # subprocess.run already killed the child by this point.
+        return (f"[done] {label} rc=-9 {dt:.0f}s :: "
+                f"outer-timeout-kill (inner {timeout}s + 120s buffer exceeded)")
 
 
 def main() -> None:
@@ -119,6 +144,10 @@ def main() -> None:
     p.add_argument("--trials", type=int, default=1)
     p.add_argument("--workers", type=int, default=8,
                    help="Max concurrent orchestrator processes")
+    p.add_argument("--no-docker", action="store_true",
+                   help="Dispatch through orchestrator's on-disk --cases "
+                        "path. Required for the synthetic panel because those "
+                        "case ids are not in corpus.db.")
     p.add_argument("--dry-run", action="store_true")
     args = p.parse_args()
 
@@ -141,6 +170,7 @@ def main() -> None:
             pool.submit(
                 run_one, b, t, m, args.name,
                 args.runtime, args.timeout, args.trials, args.dry_run,
+                args.no_docker,
             ): (b, t, m)
             for b, t, m in specs
         }

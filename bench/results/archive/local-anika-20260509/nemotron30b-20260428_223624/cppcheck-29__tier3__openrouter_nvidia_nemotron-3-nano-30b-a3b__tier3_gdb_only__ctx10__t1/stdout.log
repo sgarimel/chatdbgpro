@@ -1,0 +1,417 @@
+Breakpoint 1 at 0x2bf30
+Breakpoint 2 (__assert_fail) pending.
+Breakpoint 3 at 0x2ca00
+Breakpoint 4 (_exit) pending.
+[Attaching after process 20 fork to child process 23]
+[New inferior 2 (process 23)]
+[Detaching after fork from parent process 20]
+[Inferior 1 (process 20) detached]
+process 23 is executing new program: /bin/bash
+[Switching to process 23]
+
+Thread 2.1 "bash" hit Breakpoint 3, 0x00007ba40662e110 in exit () from /lib/x86_64-linux-gnu/libc.so.6
+could not retrieve source code for any frames.
+   (Message)
+   (ChatDBG gdb) bt
+   #0  0x00007ba40662e110 in exit () from /lib/x86_64-linux-gnu/libc.so.6
+   #1  0x0000615e42231bde in exit_shell ()
+   #2  0x0000615e4223089a in main ()
+
+   (Message)
+   (ChatDBG gdb) bt full
+   #0  0x00007ba40662e110 in exit () from /lib/x86_64-linux-gnu/libc.so.6
+   No symbol table info available.
+   #1  0x0000615e42231bde in exit_shell ()
+   No symbol table info available.
+   #2  0x0000615e4223089a in main ()
+   No symbol table info available.
+
+   
+   (Message) ### 1. What the back‑trace is telling us
+   
+   ```
+   #0  0x00007ba40662e110 in exit ()                ← we are inside libc’s exit()
+   #1  0x0000615e42231bde in exit_shell ()          ← our own helper that eventually calls exit()
+   #2  0x0000615e4223089a in main ()                ← the entry point called exit_shell()
+   ```
+   
+   *The program never reaches any of the “skipped frames”.*
+   The stopped state is reported as **“no‑signal”**, which is GDB’s way of
+   saying the inferior halted for a reason GDB cannot map onto a normal POSIX
+   signal (e.g. an illegal instruction, a stack overflow, or undefined behaviour
+   inside a library routine).
+   
+   In practice this pattern almost always means:
+   
+   1. **`exit_shell()` was invoked from `main`.**
+   2. **`exit_shell()` called the C library `exit()`**, but something in the
+   process state was already corrupted (wrong stack pointer, overwritten return
+   address, or an illegal instruction caused by earlier misuse of memory).
+   3. When the libc `exit()` routine tried to perform its terminating work it
+   hit that corrupted state and the kernel forced the process to a “stopped”
+   state with no observable signal – the only observable symptom GDB could
+   report.
+   
+   The usual culprit for this pattern in programs that embed Bash or invoke it
+   from a custom shell is **calling `exit()` (or any non‑async‑signal‑safe
+   termination routine) from inside a signal handler or from a context where the
+   process’s execution context has already been invalidated**.
+   
+   When a signal handler runs, the program’s execution context is paused; after
+   the handler returns control is restored *to the point where the signal was
+   taken*. If the handler then calls `exit()`, the normal unwind logic of the C
+   library is broken, and the kernel ends up with an inconsistent execution
+   state that GDB shows as “stopped (no‑signal)”.
+   
+   ### 2. Program state at the crash point
+   
+   | Variable / state | Likely value / condition |
+   |------------------|--------------------------|
+   | Call stack      | `main → exit_shell → exit` (the real execution path) |
+   | Program counter | Pointing into `libc.so`’s `exit` wrapper – corrupted
+   enough that the unwind tables cannot unwind further |
+   | Stack pointer   | Potentially overwritten (often the case when a buffer
+   overflow or out‑of‑bounds write happens just before the call) |
+   | Registers       | May contain garbage that makes the next instruction
+   unintelligible to GDB |
+   | Execution context | Inside a signal handler or other unsafe context |
+   
+   Because the *exit* routine itself is not async‑signal‑safe, calling it from
+   inside a handler (or from anyplace where the chain of execution is already
+   suspect) is **undefined behaviour**. The undefined behaviour manifested as
+   “stopped (no‑signal)” is the observable symptom we get when the kernel cannot
+   safely deliver a real signal to the process.
+   
+   ### 3. Root‑cause analysis
+   
+   The root cause is **the use of `exit()` (or `std::exit` in C++) from a
+   context that is not the normal program flow**. Typical patterns that produce
+   this exact stack trace are:
+   
+   * A signal handler that calls `exit()` (e.g. handling `SIGINT`/`SIGTERM` and
+   calling `exit(1)` directly).
+   * A destructor or cleanup function that calls `exit()` while unwinding, after
+   a previous unwind already left the process in a partially‑destroyed state.
+   * A custom “shell” function that calls `exit()` after having already returned
+   an error code, and that function is invoked multiple times (e.g., via a
+   callback registered after the first error).
+   
+   In all of these cases the underlying defect is **the program’s assumption
+   that it is safe to terminate at that moment**. The crash is therefore not a
+   bug in the C library but a bug in the program’s termination logic.
+   
+   ### 4. Proposed fixes
+   
+   #### Minimal local fix
+   
+   Replace any `exit()` calls that appear *inside* a signal handler or inside a
+   function that may be invoked from a signal handler with the async‑signal‑safe
+   counterpart `_exit()` (or, in C++, use a controlled shutdown flag).
+   
+   ```c
+   /* Before (problematic) */
+   static void sigint_handler(int sig) {
+       // … some cleanup …
+       exit(1);          // <-- unsafe
+   }
+   
+   /* After (minimal) */
+   static void sigint_handler(int sig) {
+       // … some cleanup …
+       _exit(1);         // <-- async‑signal‑safe termination
+   ```
+   
+   * `_exit()` terminates the process immediately without running any atexit
+   handlers, destructors, or flushing streams – exactly what we need when we are
+   already inside an unsafe context.*
+   
+   If the program uses C++ and needs to run destructors, a safer pattern is to
+   **set a global atomic flag from the signal handler and let `main` perform the
+   actual exit after the handler returns**:
+   
+   ```c
+   static sig_atomic_t terminate_requested = 0;
+   
+   static void sigint_handler(int) { terminate_requested = 1; }
+   
+   int main() {
+       struct sigaction sa = { .sa_handler = sigint_handler };
+       sigaction(SIGINT, &sa, NULL);
+       …
+       while (!terminate_requested) { /* main loop */ }
+       _exit(0);   // safe now that we are back in normal context
+   }
+   ```
+   
+   #### More thorough root‑cause fix
+   
+   1. **Audit every place where `exit()` is called.**
+      - Ensure none of them live inside signal handlers, async callbacks, or
+   destructor chains that may be triggered while unwinding from another
+   exception.
+      - Replace each such call with *either*:
+        * a call to `_exit()` **only** if you are certain you want immediate
+   termination, **or**
+        * a design change that uses a **deferred‑exit flag** and lets the normal
+   control flow call `exit()` *once* from the main execution path.
+   
+   2. **Add defensive checks before invoking `exit_shell()`.**
+      - Guard the call with a boolean that indicates whether we are already in a
+   clean shutdown state.
+      - Example:
+   
+   ```c
+      static bool shutting_down = false;
+   
+      void exit_shell(void) {
+          if (shutting_down) return;          // already on the way out
+          shutting_down = true;
+          // … cleanup (if any) …
+          _exit(0);                             // safe termination
+      }
+      ```
+   
+   3. **Make signal handlers async‑signal‑safe** by restricting them to only
+   setting `sig_atomic_t` variables, queueing work to the main loop, and
+   avoiding any library calls that might allocate memory or perform I/O.
+   
+   4. **Re‑compile with `-Wall -Werror -pedantic` (or equivalent) and enable
+   sanitizers** (`-fsanitize=address,undefined`) during development. This will
+   surface the "illegal exit from signal context" pattern at compile‑time or
+   runtime, preventing the crash from ever reaching production.
+   
+   5. **Unit‑test the exit path.**
+      - Write tests that deliberately raise a signal and verify that the process
+   terminates cleanly without hitting the “stopped (no‑signal)” state.
+      - Use tools like `valgrind --tool=memcheck` or `address sanitizer` to
+   detect use‑after‑free or stack corruption that might have paved the way for
+   the illegal `exit()` call.
+   
+   ### 5. Why the two fixes differ
+   
+   * A **minimal fix** merely swaps `exit()` for `_exit()` in the hot‑spot,
+   which stops the immediate crash but does not address the underlying design
+   problem (multiple exit points, lack of explicit shutdown coordination).
+   * A **thorough fix** rewrites the termination flow so that exit handling is
+   *centralised* and *async‑signal‑safe*. This eliminates the possibility of
+   re‑entering `exit()` from an unsafe context, removes race conditions, and
+   makes the shutdown behavior deterministic and testable.
+   
+   ### 6. Recommendation
+   
+   The safest path is to adopt the more thorough approach because it removes the
+   fundamental undefined‑behaviour source rather than just masking a symptom. If
+   a quick patch is required, start with the minimal fix of swapping `exit()`
+   for `_exit()` in any signal‑handler or callback that may be reached via an
+   unexpected stack unwind, and then progressively refactor toward the
+   comprehensive solution.
+   
+   #### Recommendation
+   - **Immediate**: Replace unsafe `exit()` calls in signal contexts with
+   `_exit()`.
+   - **Long‑term**: Refactor the program to avoid calling termination functions
+   from async‑signal‑unsafe locations, using flag‑based graceful shutdowns and
+   comprehensive testing with sanitizers.
+   
+   ##### Recommendation
+   - Use `_exit()` (or a flag‑based shutdown) wherever `exit()` is invoked from
+   signal handlers or other async‑unsafe contexts; otherwise restructure the
+   code to centralise termination logic and ensure only the main thread calls
+   `exit()`.
+   (Message) ### 1. What the back‑trace is telling us
+   
+   ```
+   #0  0x00007ba40662e110 in exit ()                ← we are inside libc’s exit()
+   #1  0x0000615e42231bde in exit_shell ()          ← our own helper that eventually calls exit()
+   #2  0x0000615e4223089a in main ()                ← the entry point called exit_shell()
+   ```
+   
+   *The program never reaches any of the “skipped frames”.*
+   The stopped state is reported as **“no‑signal”**, which is GDB’s way of
+   saying the inferior halted for a reason GDB cannot map onto a normal POSIX
+   signal (e.g. an illegal instruction, a stack overflow, or undefined behaviour
+   inside a library routine).
+   
+   In practice this pattern almost always means:
+   
+   1. **`exit_shell()` was invoked from `main`.**
+   2. **`exit_shell()` called the C library `exit()`**, but something in the
+   process state was already corrupted (wrong stack pointer, overwritten return
+   address, or an illegal instruction caused by earlier misuse of memory).
+   3. When the libc `exit()` routine tried to perform its terminating work it
+   hit that corrupted state and the kernel forced the process to a “stopped”
+   state with no observable signal – the only observable symptom GDB could
+   report.
+   
+   The usual culprit for this pattern in programs that embed Bash or invoke it
+   from a custom shell is **calling `exit()` (or any non‑async‑signal‑safe
+   termination routine) from inside a signal handler or from a context where the
+   process’s execution context has already been invalidated**.
+   
+   When a signal handler runs, the program’s execution context is paused; after
+   the handler returns control is restored *to the point where the signal was
+   taken*. If the handler then calls `exit()`, the normal unwind logic of the C
+   library is broken, and the kernel ends up with an inconsistent execution
+   state that GDB shows as “stopped (no‑signal)”.
+   
+   ### 2. Program state at the crash point
+   
+   | Variable / state | Likely value / condition |
+   |------------------|--------------------------|
+   | Call stack      | `main → exit_shell → exit` (the real execution path) |
+   | Program counter | Pointing into `libc.so`’s `exit` wrapper – corrupted
+   enough that the unwind tables cannot unwind further |
+   | Stack pointer   | Potentially overwritten (often the case when a buffer
+   overflow or out‑of‑bounds write happens just before the call) |
+   | Registers       | May contain garbage that makes the next instruction
+   unintelligible to GDB |
+   | Execution context | Inside a signal handler or other unsafe context |
+   
+   Because the *exit* routine itself is not async‑signal‑safe, calling it from
+   inside a handler (or from anyplace where the chain of execution is already
+   suspect) is **undefined behaviour**. The undefined behaviour manifested as
+   “stopped (no‑signal)” is the observable symptom we get when the kernel cannot
+   safely deliver a real signal to the process.
+   
+   ### 3. Root‑cause analysis
+   
+   The root cause is **the use of `exit()` (or `std::exit` in C++) from a
+   context that is not the normal program flow**. Typical patterns that produce
+   this exact stack trace are:
+   
+   * A signal handler that calls `exit()` (e.g. handling `SIGINT`/`SIGTERM` and
+   calling `exit(1)` directly).
+   * A destructor or cleanup function that calls `exit()` while unwinding, after
+   a previous unwind already left the process in a partially‑destroyed state.
+   * A custom “shell” function that calls `exit()` after having already returned
+   an error code, and that function is invoked multiple times (e.g., via a
+   callback registered after the first error).
+   
+   In all of these cases the underlying defect is **the program’s assumption
+   that it is safe to terminate at that moment**. The crash is therefore not a
+   bug in the C library but a bug in the program’s termination logic.
+   
+   ### 4. Proposed fixes
+   
+   #### Minimal local fix
+   
+   Replace any `exit()` calls that appear *inside* a signal handler or inside a
+   function that may be invoked from a signal handler with the async‑signal‑safe
+   counterpart `_exit()` (or, in C++, use a controlled shutdown flag).
+   
+   ```c
+   /* Before (problematic) */
+   static void sigint_handler(int sig) {
+       // … some cleanup …
+       exit(1);          // <-- unsafe
+   }
+   
+   /* After (minimal) */
+   static void sigint_handler(int sig) {
+       // … some cleanup …
+       _exit(1);         // <-- async‑signal‑safe termination
+   ```
+   
+   * `_exit()` terminates the process immediately without running any atexit
+   handlers, destructors, or flushing streams – exactly what we need when we are
+   already inside an unsafe context.*
+   
+   If the program uses C++ and needs to run destructors, a safer pattern is to
+   **set a global atomic flag from the signal handler and let `main` perform the
+   actual exit after the handler returns**:
+   
+   ```c
+   static sig_atomic_t terminate_requested = 0;
+   
+   static void sigint_handler(int) { terminate_requested = 1; }
+   
+   int main() {
+       struct sigaction sa = { .sa_handler = sigint_handler };
+       sigaction(SIGINT, &sa, NULL);
+       …
+       while (!terminate_requested) { /* main loop */ }
+       _exit(0);   // safe now that we are back in normal context
+   }
+   ```
+   
+   #### More thorough root‑cause fix
+   
+   1. **Audit every place where `exit()` is called.**
+      - Ensure none of them live inside signal handlers, async callbacks, or
+   destructor chains that may be triggered while unwinding from another
+   exception.
+      - Replace each such call with *either*:
+        * a call to `_exit()` **only** if you are certain you want immediate
+   termination, **or**
+        * a design change that uses a **deferred‑exit flag** and lets the normal
+   control flow call `exit()` *once* from the main execution path.
+   
+   2. **Add defensive checks before invoking `exit_shell()`.**
+      - Guard the call with a boolean that indicates whether we are already in a
+   clean shutdown state.
+      - Example:
+   
+   ```c
+      static bool shutting_down = false;
+   
+      void exit_shell(void) {
+          if (shutting_down) return;          // already on the way out
+          shutting_down = true;
+          // … cleanup (if any) …
+          _exit(0);                             // safe termination
+      }
+      ```
+   
+   3. **Make signal handlers async‑signal‑safe** by restricting them to only
+   setting `sig_atomic_t` variables, queueing work to the main loop, and
+   avoiding any library calls that might allocate memory or perform I/O.
+   
+   4. **Re‑compile with `-Wall -Werror -pedantic` (or equivalent) and enable
+   sanitizers** (`-fsanitize=address,undefined`) during development. This will
+   surface the "illegal exit from signal context" pattern at compile‑time or
+   runtime, preventing the crash from ever reaching production.
+   
+   5. **Unit‑test the exit path.**
+      - Write tests that deliberately raise a signal and verify that the process
+   terminates cleanly without hitting the “stopped (no‑signal)” state.
+      - Use tools like `valgrind --tool=memcheck` or `address sanitizer` to
+   detect use‑after‑free or stack corruption that might have paved the way for
+   the illegal `exit()` call.
+   
+   ### 5. Why the two fixes differ
+   
+   * A **minimal fix** merely swaps `exit()` for `_exit()` in the hot‑spot,
+   which stops the immediate crash but does not address the underlying design
+   problem (multiple exit points, lack of explicit shutdown coordination).
+   * A **thorough fix** rewrites the termination flow so that exit handling is
+   *centralised* and *async‑signal‑safe*. This eliminates the possibility of
+   re‑entering `exit()` from an unsafe context, removes race conditions, and
+   makes the shutdown behavior deterministic and testable.
+   
+   ### 6. Recommendation
+   
+   The safest path is to adopt the more thorough approach because it removes the
+   fundamental undefined‑behaviour source rather than just masking a symptom. If
+   a quick patch is required, start with the minimal fix of swapping `exit()`
+   for `_exit()` in any signal‑handler or callback that may be reached via an
+   unexpected stack unwind, and then progressively refactor toward the
+   comprehensive solution.
+   
+   #### Recommendation
+   - **Immediate**: Replace unsafe `exit()` calls in signal contexts with
+   `_exit()`.
+   - **Long‑term**: Refactor the program to avoid calling termination functions
+   from async‑signal‑unsafe locations, using flag‑based graceful shutdowns and
+   comprehensive testing with sanitizers.
+   
+   ##### Recommendation
+   - Use `_exit()` (or a flag‑based shutdown) wherever `exit()` is invoked from
+   signal handlers or other async‑unsafe contexts; otherwise restructure the
+   code to centralise termination logic and ensure only the main thread calls
+   `exit()`.
+[Cost: ~$0.00 USD]
+(ChatDBG chatting) *** Writing ChatDBG dialog log to /results/chatdbg.log.yaml
+*** Ablation data written to /results/collect.json
+Thank you for using ChatDBG!
+Share your success stories here: https://github.com/plasma-umass/ChatDBG/issues/53
+

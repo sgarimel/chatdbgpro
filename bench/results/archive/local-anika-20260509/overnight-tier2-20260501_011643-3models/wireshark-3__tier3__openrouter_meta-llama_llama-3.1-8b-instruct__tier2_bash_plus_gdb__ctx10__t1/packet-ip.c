@@ -1,0 +1,101 @@
+    { &hf_geoip_src_latitude,
+      { "Source GeoIP Latitude", "ip.geoip.src_lat",
+        FT_DOUBLE, BASE_NONE, NULL, 0x0, NULL, HFILL }},
+    { &hf_geoip_src_longitude,
+      { "Source GeoIP Longitude", "ip.geoip.src_lon",
+        FT_DOUBLE, BASE_NONE, NULL, 0x0, NULL, HFILL }},
+    { &hf_geoip_dst_summary,
+      { "Destination GeoIP", "ip.geoip.dst_summary",
+        FT_STRING, STR_UNICODE, NULL, 0x0, NULL, HFILL }},
+    { &hf_geoip_dst_country,
+      { "Destination GeoIP Country", "ip.geoip.dst_country",
+        FT_STRING, STR_UNICODE, NULL, 0x0, NULL, HFILL }},
+    { &hf_geoip_dst_country_iso,
+      { "Destination GeoIP ISO Two Letter Country Code", "ip.geoip.dst_country_iso",
+        FT_STRING, STR_UNICODE, NULL, 0x0, NULL, HFILL }},
+    { &hf_geoip_dst_city,
+      { "Destination GeoIP City", "ip.geoip.dst_city",
+        FT_STRING, STR_UNICODE, NULL, 0x0, NULL, HFILL }},
+    { &hf_geoip_dst_as_number,
+      { "Destination GeoIP AS Number", "ip.geoip.dst_asnum",
+        FT_UINT32, BASE_DEC, NULL, 0x0, NULL, HFILL }},
+    { &hf_geoip_dst_as_org,
+      { "Destination GeoIP AS Organization", "ip.geoip.dst_org",
+        FT_STRING, STR_UNICODE, NULL, 0x0, NULL, HFILL }},
+    { &hf_geoip_dst_latitude,
+      { "Destination GeoIP Latitude", "ip.geoip.dst_lat",
+        FT_DOUBLE, BASE_NONE, NULL, 0x0, NULL, HFILL }},
+    { &hf_geoip_dst_longitude,
+      { "Destination GeoIP Longitude", "ip.geoip.dst_lon",
+        FT_DOUBLE, BASE_NONE, NULL, 0x0, NULL, HFILL }},
+
+    { &hf_ip_flags,
+      { "Flags", "ip.flags", FT_UINT16, BASE_HEX,
+        NULL, 0x0, FLAGS_OFFSET_WIDTH_MSG(IP_FLAGS_WIDTH), HFILL }},
+
+    { &hf_ip_flags_sf,
+      { "Security flag", "ip.flags.sf", FT_BOOLEAN, 16,
+        TFS(&flags_sf_set_evil), 0x8000, "Security flag (RFC 3514)", HFILL }},
+
+    { &hf_ip_flags_rf,
+      { "Reserved bit", "ip.flags.rb", FT_BOOLEAN, 16,
+        TFS(&tfs_set_notset), 0x8000, NULL, HFILL }},
+
+    { &hf_ip_flags_df,
+      { "Don't fragment", "ip.flags.df", FT_BOOLEAN, 16,
+        TFS(&tfs_set_notset), 0x4000, NULL, HFILL }},
+
+    { &hf_ip_flags_mf,
+      { "More fragments", "ip.flags.mf", FT_BOOLEAN, 16,
+        TFS(&tfs_set_notset), 0x2000, NULL, HFILL }},
+
+    { &hf_ip_frag_offset,
+      { "Fragment offset", "ip.frag_offset", FT_UINT16, BASE_DEC,
+        NULL, 0x1fff, FRAG_OFFSET_WIDTH_MSG(IP_OFFSET_WIDTH), HFILL }},
+
+    { &hf_ip_ttl,
+      { "Time to live", "ip.ttl", FT_UINT8, BASE_DEC,
+        NULL, 0x0, NULL, HFILL }},
+
+    { &hf_ip_proto,
+      { "Protocol", "ip.proto", FT_UINT8, BASE_DEC | BASE_EXT_STRING,
+        &ipproto_val_ext, 0x0, NULL, HFILL }},
+
+    { &hf_ip_checksum,
+      { "Header checksum", "ip.checksum", FT_UINT16, BASE_HEX,
+        NULL, 0x0, NULL, HFILL }},
+
+    { &hf_ip_checksum_calculated,
+    { "Calculated Checksum", "ip.checksum_calculated", FT_UINT16, BASE_HEX, NULL, 0x0,
+        "The expected IP checksum field as calculated from the IP datagram", HFILL }},
+
+    { &hf_ip_checksum_status,
+      { "Header checksum status", "ip.checksum.status", FT_UINT8, BASE_NONE, VALS(proto_checksum_vals), 0x0,
+        NULL, HFILL }},
+
+    /* IP options related fields */
+    { &hf_ip_opt_type,
+      { "Type", "ip.opt.type", FT_UINT8, BASE_DEC,
+        NULL, 0x0, NULL, HFILL }},
+
+    { &hf_ip_opt_type_copy,
+      { "Copy on fragmentation", "ip.opt.type.copy", FT_BOOLEAN, 8,
+        TFS(&tfs_yes_no), IPOPT_COPY_MASK, NULL, HFILL }},
+
+    { &hf_ip_opt_type_class,
+      { "Class", "ip.opt.type.class", FT_UINT8, BASE_DEC,
+        VALS(ipopt_type_class_vals), IPOPT_CLASS_MASK, NULL, HFILL }},
+
+    { &hf_ip_opt_type_number,
+      { "Number", "ip.opt.type.number", FT_UINT8, BASE_DEC,
+        VALS(ipopt_type_number_vals), IPOPT_NUMBER_MASK, NULL, HFILL }},
+
+    { &hf_ip_opt_len,
+      { "Length", "ip.opt.len", FT_UINT8, BASE_DEC,
+        NULL, 0x0, NULL, HFILL }},
+
+    { &hf_ip_opt_ptr,
+      { "Pointer", "ip.opt.ptr", FT_UINT8, BASE_DEC,
+        NULL, 0x0, NULL, HFILL }},
+
+    { &hf_ip_opt_sid,

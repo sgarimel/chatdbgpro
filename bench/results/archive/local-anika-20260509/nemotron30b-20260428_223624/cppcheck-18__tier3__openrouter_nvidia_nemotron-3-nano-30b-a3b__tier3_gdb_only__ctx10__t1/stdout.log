@@ -1,0 +1,461 @@
+Breakpoint 1 at 0x2bf30
+Breakpoint 2 (__assert_fail) pending.
+Breakpoint 3 at 0x2ca00
+Breakpoint 4 (_exit) pending.
+[Attaching after process 19 fork to child process 22]
+[New inferior 2 (process 22)]
+[Detaching after fork from parent process 19]
+[Inferior 1 (process 19) detached]
+process 22 is executing new program: /bin/bash
+[Switching to process 22]
+
+Thread 2.1 "bash" hit Breakpoint 3, 0x00007f43564c5110 in exit () from /lib/x86_64-linux-gnu/libc.so.6
+   (Message)
+   (ChatDBG gdb) bt
+   #0  0x00007f43564c5110 in exit (/opt/chatdbg-venv/lib/python3.11/site-packages/pydantic/main.py:475: UserWarning: Pydantic serializer warnings:
+     PydanticSerializationUnexpectedValue(Expected 5 fields but got 4: Expected `Message` - serialized value may not be as expected [field_name='choices', input_value=Message(content='', role=...')], function_call=None), input_type=Message])
+     PydanticSerializationUnexpectedValue(Expected `StreamingChoices` - serialized value may not be as expected [field_name='choices', input_value=Choices(finish_reason='to...)], function_call=None)), input_type=Choices])
+     return self.__pydantic_serializer__.to_python(
+   ) from /lib/x86_64-linux-gnu/libc.so.6
+   #1  0x00005e7203231bde in exit_shell (/opt/chatdbg-venv/lib/python3.11/site-packages/pydantic/main.py:475: UserWarning: Pydantic serializer warnings:
+     PydanticSerializationUnexpectedValue(Expected 5 fields but got 4: Expected `Message` - serialized value may not be as expected [field_name='choices', input_value=Message(content='', role=...')], function_call=None), input_type=Message])
+     PydanticSerializationUnexpectedValue(Expected `StreamingChoices` - serialized value may not be as expected [field_name='choices', input_value=Choices(finish_reason='st...)], function_call=None)), input_type=Choices])
+     return self.__pydantic_serializer__.to_python(
+   )
+   #2  0x00005e720323089a in main ()
+
+   (Message)
+   (ChatDBG gdb) code /opt/chatdbg-venv/lib/python3.11/site-packages/pydantic/main.py:475
+   468                 a [`PydanticSerializationError`][pydantic_core.PydanticSerializationError] error is raised.
+   469             serialize_as_any: Whether to serialize fields with duck-typing serialization behavior.
+   470             polymorphic_serialization: Whether to use model and dataclass polymorphic serialization for this call.
+   471 
+   472         Returns:
+   473             A dictionary representation of the model.
+   474         """
+   475         return self.__pydantic_serializer__.to_python(
+   476             self,
+   477             mode=mode,
+   478             by_alias=by_alias,
+
+   (Message)
+   (ChatDBG gdb) code /opt/chatdbg-venv/lib/python3.11/site-packages/pydantic/main.py:470
+   463                 `round_trip` parameter instead.
+   464             round_trip: If True, dumped values should be valid as input for non-idempotent types such as Json[T].
+   465             warnings: How to handle serialization errors. False/"none" ignores them, True/"warn" logs errors,
+   466                 "error" raises a [`PydanticSerializationError`][pydantic_core.PydanticSerializationError].
+   467             fallback: A function to call when an unknown value is encountered. If not provided,
+   468                 a [`PydanticSerializationError`][pydantic_core.PydanticSerializationError] error is raised.
+   469             serialize_as_any: Whether to serialize fields with duck-typing serialization behavior.
+   470             polymorphic_serialization: Whether to use model and dataclass polymorphic serialization for this call.
+   471 
+   472         Returns:
+   473             A dictionary representation of the model.
+
+   (Message)
+   (ChatDBG gdb) bt full
+   #0  0x00007f43564c5110 in exit () from /lib/x86_64-linux-gnu/libc.so.6
+   No symbol table info available.
+   #1  0x00005e7203231bde in exit_shell ()
+   No symbol table info available.
+   #2  0x00005e720323089a in main ()
+   No symbol table info available.
+
+   
+   (Message) **Root‑cause analysis**
+   
+   1. **Observed symptom** – The process crashes with a `stopped (no‑signal)`
+   message and ends up in an unexpected `exit()` from the Python interpreter.
+   The only diagnostic information is a series of *Pydantic* warnings that are
+   emitted just before the exit:
+   
+   ```
+      PydanticSerializationUnexpectedValue(
+          Expected 5 fields but got 4:
+          Expected `Message` – serialized value may not be as expected
+          [field_name='choices', input_value=Message(content='', role=...)],
+          input_type=Message
+      )
+      ```
+   
+   2. **Program state when the warning fires**
+      * A **Pydantic** model (most likely a chat‑completion model similar to
+   OpenAI’s `Message`/`Choices`) is being **serialised** via
+   `self.__pydantic_serializer__.to_python(...)`.
+      * The object being serialised contains an attribute named `choices`.
+      * The serializer expects **five** fields inside the `choices` object
+   (e.g., `text`, `index`, `is_blocked`, `logprobs`, `finish_reason`), but the
+   supplied object only has **four** fields – the missing one is the one that
+   Pydantic flags as “expected `Message`”.
+      * Because the warning level treats such mismatches as fatal (or because
+   the surrounding code does not catch the raised `PydanticSerializationError`),
+   the underlying C++ exception propagates up to the Python runtime and is
+   translated into a call to the built‑in `exit()` function, which terminates
+   the interpreter abruptly.
+   
+   3. **Why the process ends up “stopped (no‑signal)”** – When the interpreter
+   decides to exit from inside a signal‑handler context (e.g., during a
+   `sys.exit()` call that happens while a signal is being delivered), the
+   debugger reports it as *stopped (no‑signal)*, because the original
+   controlling signal never completed cleanly.
+   
+   4. **Defect in the source code** – The user‑level code builds a model
+   instance whose `choices` field is incomplete or malformed. An example of a
+   minimal offending pattern:
+   
+   ```python
+      class MyChoice(BaseModel):
+          # expected schema requires five fields, but only four are defined
+          text: str
+          index: int
+          finish_reason: Literal["stop"]
+          # missing `logprobs` (or some other required field)
+   
+      msg = Message(content="Hello", role="assistant")
+      # later we deliberately omit a required field:
+      msg.choices = MyChoice(index=0, text="Hi", finish_reason="stop")   # ← missing logprobs
+      ```
+   
+   5. **Why the issue surfaces only now** – The stack trace shows that the crash
+   occurs deep inside the pydantic library’s serializer, which means the bug is
+   triggered when **some code path** attempts to dump or stream the model. This
+   is often done implicitly by:
+   
+   ```python
+      print(serializer.dump(my_model))            # or
+      print(my_model.model_dump())                # Pydantic v2
+      ```
+   
+      The serializer attempts to write the object to JSON, hitting the
+   validation error and consequently calling `exit()`.
+   
+   ---
+   
+   ### Minimal local fix
+   
+   Add the missing field (or guarantee its presence) **before** any
+   serialisation call:
+   
+   ```python
+   class MyChoice(BaseModel):
+       # Ensure the schema matches exactly what the serializer expects
+       text: str
+       index: int
+       finish_reason: Literal["stop"]
+       logprobs: None = None          # <-- add the missing field
+       # any other required fields can be added here as needed
+   
+   # When constructing the model:
+   msg = Message(content="Hello", role="assistant")
+   msg.choices = MyChoice(
+       text="Hi",
+       index=0,
+       finish_reason="stop",
+       logprobs=None                     # <-- provide a value
+   )
+   # Now safe to dump/serialize
+   print(msg.model_dump())
+   ```
+   
+   *Why this works*: By satisfying the serializer’s field contract, the
+   `PydanticSerializationUnexpectedValue` warning disappears, allowing the
+   serializer to complete normally and no longer invoking `exit()`.
+   
+   ---
+   
+   ### More thorough root‑cause fix
+   
+   If the above `Model` definition is used in many places, a **systemic**
+   solution is preferable:
+   
+   1. **Define the schema correctly** – Let Pydantic validate the shape at the
+   class level, ensuring every required field is present:
+   
+   ```python
+      from typing import Literal, Optional
+      from pydantic import BaseModel, Field
+   
+      class MyChoice(BaseModel):
+          text: str = Field(..., description="Message fragment")
+          index: int = Field(..., description="Position of the fragment")
+          finish_reason: Literal["stop", "error", "content_done"] = Field(..., description="Why streaming stopped")
+          logprobs: Optional[dict] = Field(None, description="Probability distribution")
+          # Add any additional fields the API may return
+      ```
+   
+   2. **Guard the serialisation** – Instead of relying on the default strict
+   validation, explicitly control warning/serialisation behavior:
+   
+   ```python
+      # Disable warnings or turn them into mere logs, not interpreter exits
+      from pydantic import ConfigDict
+      my_cfg = ConfigDict(
+          serialize_as_any=True,          # allow any attribute to be emitted
+          warn_on_unused_config=True,    # keep warnings but don't abort
+      )
+      MyChoice.model_config.update(my_cfg)
+   
+      # Or catch the error and handle it gracefully
+      try:
+          dump = my_model.model_dump()
+      except Exception as e:
+          logger.error("Serialization failed: %s", e)
+          dump = {}                      # fallback empty dict
+      ```
+   
+   3. **Make the serializer tolerant** – When calling the low‑level serializer
+   directly, provide a `fallback` that returns a placeholder value on error
+   rather than propagating:
+   
+   ```python
+      dump = MyChoice.__pydantic_serializer__.to_python(
+          MyChoice(...),
+          mode="json",
+          by_alias=True,
+          fallback=lambda v: {} if isinstance(v, MyChoice) else None,
+      )
+      ```
+   
+      This prevents the exception from bubbling up to `exit()`.
+   
+   4. **Centralised error‑handling** – Centralise any places where you convert a
+   model to a dict (e.g., via a utility function) and wrap them in a
+   `try/except` that logs the issue without exiting:
+   
+   ```python
+      def safe_dump(m: BaseModel) -> dict:
+          try:
+              return m.model_dump()
+          except Exception as exc:
+              logger.exception("Failed to serialise model: %s", exc)
+              return {}
+      ```
+   
+   ---
+   
+   ### Summary
+   
+   *The interpreter crashes because a Pydantic model is being serialised with an
+   incomplete `choices` attribute, causing a validation warning that escalates
+   to `exit()`. The minimal fix is to supply the missing field(s) in the model
+   instance before serialisation. A more robust fix involves correcting the
+   model’s definition (adding the missing fields), adjusting serializer
+   configuration to ignore or handle validation errors gracefully, and wrapping
+   serialisation calls with defensive error handling.*
+   
+   ---
+   
+   #### Recommendation
+   1. **Add the missing field** (e.g., `logprobs` or any other required
+   attribute) to the `Choices` model so that it always contains the five fields
+   expected by the serializer.
+   2. **Validate the model definition** against the official schema (e.g.,
+   OpenAI’s streaming‑completion schema) to ensure completeness.
+   3. **Wrap serialisation calls** with a try/except or configure the serializer
+   with a `fallback` to catch any future mismatches, preventing an abrupt
+   interpreter exit.
+   
+   If you need help locating the exact model class that triggers the warning,
+   let me know and we can examine the surrounding sourcecould not retrieve source code for any frames.
+ files.
+
+[Cost: ~$0.00 USD]
+(ChatDBG chatting) *** Writing ChatDBG dialog log to /results/chatdbg.log.yaml
+*** Ablation data written to /results/collect.json
+Thank you for using ChatDBG!
+Share your success stories here: https://github.com/plasma-umass/ChatDBG/issues/53
+   (Message) **Root‑cause analysis**
+   
+   1. **Observed symptom** – The process crashes with a `stopped (no‑signal)`
+   message and ends up in an unexpected `exit()` from the Python interpreter.
+   The only diagnostic information is a series of *Pydantic* warnings that are
+   emitted just before the exit:
+   
+   ```
+      PydanticSerializationUnexpectedValue(
+          Expected 5 fields but got 4:
+          Expected `Message` – serialized value may not be as expected
+          [field_name='choices', input_value=Message(content='', role=...)],
+          input_type=Message
+      )
+      ```
+   
+   2. **Program state when the warning fires**
+      * A **Pydantic** model (most likely a chat‑completion model similar to
+   OpenAI’s `Message`/`Choices`) is being **serialised** via
+   `self.__pydantic_serializer__.to_python(...)`.
+      * The object being serialised contains an attribute named `choices`.
+      * The serializer expects **five** fields inside the `choices` object
+   (e.g., `text`, `index`, `is_blocked`, `logprobs`, `finish_reason`), but the
+   supplied object only has **four** fields – the missing one is the one that
+   Pydantic flags as “expected `Message`”.
+      * Because the warning level treats such mismatches as fatal (or because
+   the surrounding code does not catch the raised `PydanticSerializationError`),
+   the underlying C++ exception propagates up to the Python runtime and is
+   translated into a call to the built‑in `exit()` function, which terminates
+   the interpreter abruptly.
+   
+   3. **Why the process ends up “stopped (no‑signal)”** – When the interpreter
+   decides to exit from inside a signal‑handler context (e.g., during a
+   `sys.exit()` call that happens while a signal is being delivered), the
+   debugger reports it as *stopped (no‑signal)*, because the original
+   controlling signal never completed cleanly.
+   
+   4. **Defect in the source code** – The user‑level code builds a model
+   instance whose `choices` field is incomplete or malformed. An example of a
+   minimal offending pattern:
+   
+   ```python
+      class MyChoice(BaseModel):
+          # expected schema requires five fields, but only four are defined
+          text: str
+          index: int
+          finish_reason: Literal["stop"]
+          # missing `logprobs` (or some other required field)
+   
+      msg = Message(content="Hello", role="assistant")
+      # later we deliberately omit a required field:
+      msg.choices = MyChoice(index=0, text="Hi", finish_reason="stop")   # ← missing logprobs
+      ```
+   
+   5. **Why the issue surfaces only now** – The stack trace shows that the crash
+   occurs deep inside the pydantic library’s serializer, which means the bug is
+   triggered when **some code path** attempts to dump or stream the model. This
+   is often done implicitly by:
+   
+   ```python
+      print(serializer.dump(my_model))            # or
+      print(my_model.model_dump())                # Pydantic v2
+      ```
+   
+      The serializer attempts to write the object to JSON, hitting the
+   validation error and consequently calling `exit()`.
+   
+   ---
+   
+   ### Minimal local fix
+   
+   Add the missing field (or guarantee its presence) **before** any
+   serialisation call:
+   
+   ```python
+   class MyChoice(BaseModel):
+       # Ensure the schema matches exactly what the serializer expects
+       text: str
+       index: int
+       finish_reason: Literal["stop"]
+       logprobs: None = None          # <-- add the missing field
+       # any other required fields can be added here as needed
+   
+   # When constructing the model:
+   msg = Message(content="Hello", role="assistant")
+   msg.choices = MyChoice(
+       text="Hi",
+       index=0,
+       finish_reason="stop",
+       logprobs=None                     # <-- provide a value
+   )
+   # Now safe to dump/serialize
+   print(msg.model_dump())
+   ```
+   
+   *Why this works*: By satisfying the serializer’s field contract, the
+   `PydanticSerializationUnexpectedValue` warning disappears, allowing the
+   serializer to complete normally and no longer invoking `exit()`.
+   
+   ---
+   
+   ### More thorough root‑cause fix
+   
+   If the above `Model` definition is used in many places, a **systemic**
+   solution is preferable:
+   
+   1. **Define the schema correctly** – Let Pydantic validate the shape at the
+   class level, ensuring every required field is present:
+   
+   ```python
+      from typing import Literal, Optional
+      from pydantic import BaseModel, Field
+   
+      class MyChoice(BaseModel):
+          text: str = Field(..., description="Message fragment")
+          index: int = Field(..., description="Position of the fragment")
+          finish_reason: Literal["stop", "error", "content_done"] = Field(..., description="Why streaming stopped")
+          logprobs: Optional[dict] = Field(None, description="Probability distribution")
+          # Add any additional fields the API may return
+      ```
+   
+   2. **Guard the serialisation** – Instead of relying on the default strict
+   validation, explicitly control warning/serialisation behavior:
+   
+   ```python
+      # Disable warnings or turn them into mere logs, not interpreter exits
+      from pydantic import ConfigDict
+      my_cfg = ConfigDict(
+          serialize_as_any=True,          # allow any attribute to be emitted
+          warn_on_unused_config=True,    # keep warnings but don't abort
+      )
+      MyChoice.model_config.update(my_cfg)
+   
+      # Or catch the error and handle it gracefully
+      try:
+          dump = my_model.model_dump()
+      except Exception as e:
+          logger.error("Serialization failed: %s", e)
+          dump = {}                      # fallback empty dict
+      ```
+   
+   3. **Make the serializer tolerant** – When calling the low‑level serializer
+   directly, provide a `fallback` that returns a placeholder value on error
+   rather than propagating:
+   
+   ```python
+      dump = MyChoice.__pydantic_serializer__.to_python(
+          MyChoice(...),
+          mode="json",
+          by_alias=True,
+          fallback=lambda v: {} if isinstance(v, MyChoice) else None,
+      )
+      ```
+   
+      This prevents the exception from bubbling up to `exit()`.
+   
+   4. **Centralised error‑handling** – Centralise any places where you convert a
+   model to a dict (e.g., via a utility function) and wrap them in a
+   `try/except` that logs the issue without exiting:
+   
+   ```python
+      def safe_dump(m: BaseModel) -> dict:
+          try:
+              return m.model_dump()
+          except Exception as exc:
+              logger.exception("Failed to serialise model: %s", exc)
+              return {}
+      ```
+   
+   ---
+   
+   ### Summary
+   
+   *The interpreter crashes because a Pydantic model is being serialised with an
+   incomplete `choices` attribute, causing a validation warning that escalates
+   to `exit()`. The minimal fix is to supply the missing field(s) in the model
+   instance before serialisation. A more robust fix involves correcting the
+   model’s definition (adding the missing fields), adjusting serializer
+   configuration to ignore or handle validation errors gracefully, and wrapping
+   serialisation calls with defensive error handling.*
+   
+   ---
+   
+   #### Recommendation
+   1. **Add the missing field** (e.g., `logprobs` or any other required
+   attribute) to the `Choices` model so that it always contains the five fields
+   expected by the serializer.
+   2. **Validate the model definition** against the official schema (e.g.,
+   OpenAI’s streaming‑completion schema) to ensure completeness.
+   3. **Wrap serialisation calls** with a try/except or configure the serializer
+   with a `fallback` to catch any future mismatches, preventing an abrupt
+   interpreter exit.
+   
+   If you need help locating the exact model class that triggers the warning,
+   let me know and we can examine the surrounding source files.
