@@ -103,11 +103,28 @@ def run_one(
     label = f"{bug_id}/T{tier}/{model.split('/')[-1]}"
     if dry:
         return f"[DRY] {label}: {' '.join(cmd)}"
+    # Belt-and-suspenders timeout: the inner Tier1/Tier3 driver enforces
+    # `timeout` seconds via proc.communicate, but we've observed that
+    # mini-swe-agent's litellm cleanup can leave the runner subprocess
+    # hung past the inner deadline (one cell ran 3733s with timeout=600).
+    # Cap the orchestrator subprocess at `timeout + 120s` and force-kill
+    # if it overruns, so a single stuck cell can't block its worker for
+    # an hour.
+    outer_timeout = timeout + 120
     t0 = time.time()
-    r = subprocess.run(cmd, capture_output=True, text=True, cwd=str(REPO_ROOT))
-    dt = time.time() - t0
-    tail = (r.stdout + r.stderr).splitlines()[-1] if (r.stdout or r.stderr) else ""
-    return f"[done] {label} rc={r.returncode} {dt:.0f}s :: {tail[:120]}"
+    try:
+        r = subprocess.run(
+            cmd, capture_output=True, text=True, cwd=str(REPO_ROOT),
+            timeout=outer_timeout,
+        )
+        dt = time.time() - t0
+        tail = (r.stdout + r.stderr).splitlines()[-1] if (r.stdout or r.stderr) else ""
+        return f"[done] {label} rc={r.returncode} {dt:.0f}s :: {tail[:120]}"
+    except subprocess.TimeoutExpired as e:
+        dt = time.time() - t0
+        # subprocess.run already killed the child by this point.
+        return (f"[done] {label} rc=-9 {dt:.0f}s :: "
+                f"outer-timeout-kill (inner {timeout}s + 120s buffer exceeded)")
 
 
 def main() -> None:
