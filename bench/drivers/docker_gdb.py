@@ -353,6 +353,15 @@ class DockerDriver:
             # runtime deps (litellm, openai, llm_utils, ...). The venv path
             # is fixed by the Dockerfile.
             "PYTHONPATH": "/chatdbg-src:/opt/chatdbg-venv/lib/python3.11/site-packages",
+            # Container defaults to POSIX/C locale → gdb's Python wrapper
+            # uses ASCII codec and crashes on the unicode em-dashes /
+            # curly quotes in the FINAL OUTPUT FORMAT directive:
+            #   UnicodeDecodeError: 'ascii' codec can't decode byte 0xe2
+            # Force UTF-8 locale (always available in the gdb-base image,
+            # which inherits Ubuntu's locale data).
+            "LANG": "C.UTF-8",
+            "LC_ALL": "C.UTF-8",
+            "PYTHONIOENCODING": "utf-8",
         }
         # Case-metadata env vars consumed by src/chatdbg/util/prompts.py.
         if case.patch_first_file:

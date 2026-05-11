@@ -82,7 +82,16 @@ def process_cell(cell_dir: Path) -> tuple[str, str]:
     if q.get("response_pre_recovery") is not None:
         return "already_set", ""
     resp = q.get("response") or ""
-    if len(resp) >= EMPTY_THRESHOLD:
+    # Recover when (a) response is effectively empty, OR
+    # (b) response has investigation prose but is missing any of the
+    #     three labels (the sonnet realworld pattern: model writes prose
+    #     in content, then echoes the labelled diagnosis via a bash tool
+    #     call, then submits with empty submission — leaving content
+    #     prose in `response` but the labelled paragraphs live in the
+    #     bash tool output, not in content).
+    has_all_labels = all(label in resp for label in REQUIRED_LABELS)
+    is_empty = len(resp) < EMPTY_THRESHOLD
+    if not is_empty and has_all_labels:
         return "no_change", ""
 
     if not tj_path.exists():
@@ -98,17 +107,33 @@ def process_cell(cell_dir: Path) -> tuple[str, str]:
 
     # Patch in place: keep the original, prepend a marker so anyone
     # reading later can tell this came from tool output rather than the
-    # assistant's content.
+    # assistant's content. When the original response had some prose
+    # (non-empty), preserve it after the recovered labelled block so a
+    # reader can still see the investigation narrative.
     q["response_pre_recovery"] = resp
-    q["response_source"] = "recovered_from_tool_output"
-    q["response"] = (
-        "[recovered from tool output by bench.recover_responses; "
-        "model echo'd diagnosis instead of using mini-swe-agent submission]\n\n"
-        + diag.strip()
+    q["response_source"] = (
+        "recovered_from_tool_output" if is_empty
+        else "recovered_from_tool_output_partial_prose"
     )
+    header = (
+        "[recovered from tool output by bench.recover_responses; "
+        "model echo'd diagnosis instead of using mini-swe-agent submission]"
+    )
+    if is_empty:
+        new_resp = f"{header}\n\n{diag.strip()}"
+    else:
+        new_resp = (
+            f"{header}\n\n{diag.strip()}\n\n"
+            "--- original assistant prose (no RC/LF/GF labels) below ---\n\n"
+            + resp.strip()
+        )
+    q["response"] = new_resp
     cj["queries"][0] = q
     cj_path.write_text(json.dumps(cj, indent=2), encoding="utf-8")
-    return "recovered", f"{len(diag)} chars from tool output"
+    note = f"{len(diag)} chars from tool output"
+    if not is_empty:
+        note += f"; preserved {len(resp)}-char prose"
+    return "recovered", note
 
 
 def main() -> int:

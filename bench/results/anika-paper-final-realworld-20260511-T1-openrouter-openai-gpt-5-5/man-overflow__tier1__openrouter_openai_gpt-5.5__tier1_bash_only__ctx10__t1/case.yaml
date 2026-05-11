@@ -1,0 +1,60 @@
+id: man-overflow
+language: c
+kind: bugbench
+description: >
+  man-1.5h1 global buffer overflow in get_section_list(). The static
+  array tmp_section_list has space for 100 char* pointers (800 bytes),
+  but the loop exit condition on line 979 uses sizeof(tmp_section_list)
+  (800) instead of sizeof(tmp_section_list)/sizeof(char*) (100).
+  This allows the loop to write 4x past the array boundary when many
+  colon-separated sections are provided via -S.
+
+source:
+  dir: bugbench-src/man-1.5h1
+  build_commands:
+    - "cd src && make clean"
+    - "cd src && make CC=clang CFLAGS='-g -O0 -std=gnu89 -w -fsanitize=address -Wno-error=int-conversion -fpermissive' MOPTS='-fsanitize=address'"
+  binary: src/man
+  key_files:
+    - src/man.c
+
+run:
+  # 200 colon-separated empty sections overflows the 100-element array
+  crash_args_script: "python3 -c \"print('-S ' + ':'.join(['']*200) + ' ls')\""
+  expected_crash: true
+
+debug:
+  args_script: "python3 -c \"import sys; sys.stdout.write('-S\\n' + ':'.join(['']*200) + '\\nls\\n')\""
+  args_multiline: true
+
+bug:
+  category: buffer_overflow
+  error_type: global_buffer_overflow
+  root_cause_file: src/man.c
+  root_cause_lines: [979]
+  root_cause_function: get_section_list
+  fix_description: >
+    Change the loop exit condition from sizeof(tmp_section_list) to
+    sizeof(tmp_section_list)/sizeof(char*).
+
+criteria:
+  root_cause: >
+    The response must identify the incorrect loop bound in
+    get_section_list() at man.c line 979. The condition
+    "i+1 == sizeof(tmp_section_list)" compares an index against the
+    byte size (800) instead of the element count (100). This allows
+    writing up to 4x past the array when many sections are provided.
+
+  local_fix: >
+    Change the condition to:
+      if (end == NULL || i+1 == sizeof(tmp_section_list)/sizeof(char*))
+    This limits the loop to 100 iterations matching the array capacity.
+
+  global_fix: >
+    A structural fix should prevent sizeof-on-array mistakes:
+      (a) Use a named constant (NUM_SECTIONS = 100) for both the array
+          declaration and loop bound, eliminating the sizeof calculation.
+      (b) Dynamically allocate the section list (realloc as needed),
+          removing the fixed upper bound entirely.
+      (c) Use a macro like ARRAY_SIZE(x) = sizeof(x)/sizeof(x[0]) as
+          a project-wide idiom to prevent raw sizeof on arrays.
