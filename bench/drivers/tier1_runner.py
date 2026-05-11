@@ -563,6 +563,11 @@ def main() -> int:
                    help="(--docker-container only) Runtime for the exec "
                         "wrapper. 'docker' uses `docker exec ...`; "
                         "'apptainer' uses `apptainer exec instance://...`.")
+    p.add_argument("--wallclock-deadline", type=float, default=0.0,
+                   help="Soft deadline in seconds from runner start. When "
+                        "reached, save whatever the agent has and exit "
+                        "gracefully. 0 = no deadline. Passed by orchestrator "
+                        "= (--timeout) - 30s to leave room for graceful save.")
     args = p.parse_args()
 
     run_dir = args.run_dir.resolve()
@@ -685,13 +690,101 @@ def main() -> int:
     t0 = time.time()
     exit_status = "unknown"
     submission = ""
+
+    # SIGTERM + soft-deadline plumbing: save whatever the agent has even
+    # if the orchestrator kills us. Before this, a 600s timeout produced
+    # zero usable data (no collect.json, status=timeout).
+    import signal as _sig
+
+    def _save_partial(reason):
+        try:
+            messages = agent.messages
+            response = _extract_response(messages)
+            tool_calls = _extract_actions(messages)
+            p_tok, c_tok = _tally_tokens(messages)
+            freq = {}
+            for tc in tool_calls:
+                freq[tc.get("verb", "bash")] = freq.get(tc.get("verb", "bash"), 0) + 1
+            model_class_used = type(model).__module__ + "." + type(model).__name__
+            partial = {
+                "meta": {
+                    "uid": run_dir.name,
+                    "time": datetime.now().isoformat(timespec="seconds"),
+                    "model": args.model,
+                    "tool_config": "tier1_bash_only.json",
+                    "enabled_tools": ["bash"],
+                    "agent": "mini-swe-agent",
+                    "agent_version": _mini_version(),
+                    "mini_model_class": model_class_used,
+                    "mini_model_kwargs": model_config["model_kwargs"],
+                    "prompt_mode": "textbased" if is_textbased else "toolcalling",
+                    "interrupted": reason,
+                },
+                "instructions": system_template,
+                "queries": [{
+                    "user_text": task, "prompt": task, "thinking": None,
+                    "response": response, "code_blocks": [], "total_code_length": 0,
+                    "num_tool_calls": len(tool_calls), "tool_calls": tool_calls,
+                    "tool_frequency": freq,
+                    "stats": {
+                        "completed": False, "model": args.model,
+                        "cost": float(getattr(agent, "cost", 0.0) or 0.0),
+                        "time": time.time() - t0,
+                        "tokens": p_tok + c_tok,
+                        "prompt_tokens": p_tok, "completion_tokens": c_tok,
+                        "exit_status": f"interrupted:{reason}",
+                        "submission": "",
+                    },
+                }],
+            }
+            (run_dir / "collect.json").write_text(json.dumps(partial, indent=2))
+            sys.stderr.write(f"[tier1-runner] saved partial collect.json on {reason} "
+                              f"(messages={len(messages)} tools={len(tool_calls)} "
+                              f"resp_len={len(response)})\n")
+        except Exception as _e:
+            sys.stderr.write(f"[tier1-runner] _save_partial failed: {_e}\n")
+
+    def _sigterm_handler(signum, frame):
+        _save_partial("sigterm")
+        os._exit(143)
+
+    WRAPUP_PROMPT = (
+        "TIME IS UP. Stop running tools immediately. Output your "
+        "final diagnosis using EXACTLY these three labelled "
+        "paragraphs and nothing else:\n\n"
+        "ROOT CAUSE: <file:line and what is wrong>\n"
+        "LOCAL FIX: <minimal code change>\n"
+        "GLOBAL FIX: <structural change preventing this CLASS of bug>\n\n"
+        "If you don't know exactly, give your best guess from what "
+        "you have seen -- partial credit beats no answer."
+    )
+
+    def _sigalrm_handler(signum, frame):
+        try:
+            agent.messages.append({"role": "user", "content": WRAPUP_PROMPT})
+            sys.stderr.write("[tier1-runner] soft deadline hit; injected wrap-up message\n")
+        except Exception as _e:
+            sys.stderr.write(f"[tier1-runner] wrap-up inject failed: {_e}\n")
+        # Hard cutoff in 25s if model still doesn't respond
+        _sig.signal(_sig.SIGALRM, lambda s, f: (_save_partial("soft_deadline"), os._exit(124)))
+        _sig.alarm(25)
+
+    _sig.signal(_sig.SIGTERM, _sigterm_handler)
+    if getattr(args, "wallclock_deadline", 0) and args.wallclock_deadline > 0:
+        _sig.signal(_sig.SIGALRM, _sigalrm_handler)
+        _sig.alarm(int(args.wallclock_deadline))
+
     try:
         result = agent.run(task=task)
         exit_status = result.get("exit_status", "unknown") if result else "unknown"
         submission = result.get("submission", "") if result else ""
+    except SystemExit:
+        raise
     except Exception as e:
         exit_status = type(e).__name__
         sys.stderr.write(f"[tier1-runner] agent.run raised {exit_status}: {e}\n")
+    finally:
+        _sig.alarm(0)
     elapsed = time.time() - t0
 
     messages = agent.messages

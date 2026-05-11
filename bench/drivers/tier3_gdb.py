@@ -162,7 +162,31 @@ def _repo_venv_site_packages() -> str | None:
     the venv's first compiled .so and only return the path if it
     matches the running interpreter.
     """
-    import sysconfig
+    import sysconfig, subprocess, re as _re
+    # CRITICAL: the orchestrator runs in a Py3.11 venv, but the debugger
+    # (system gdb on adroit) embeds a different Python (3.9). Match against
+    # the DEBUGGER's Python version, not the orchestrator's, otherwise we
+    # add a Py3.11 site-packages dir that gdb's Py3.9 will try (and fail) to
+    # load (the classic "circular import in tiktoken" symptom).
+    target_py_tag = None
+    try:
+        # Ask the system gdb what Python version it embeds.
+        proc = subprocess.run(
+            ["gdb", "--batch", "-ex",
+             "python import sys; print(sys.version_info.major, sys.version_info.minor)"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if proc.returncode == 0:
+            for line in proc.stdout.splitlines():
+                m = _re.match(r"(\d)\s+(\d+)", line.strip())
+                if m:
+                    target_py_tag = m.group(1) + m.group(2)
+                    break
+    except Exception:
+        pass
+    # Fallback: orchestrator's Python.
+    if not target_py_tag:
+        target_py_tag = f"{sysconfig.get_python_version().replace('.', '')}"
     host_ext_suffix = sysconfig.get_config_var("EXT_SUFFIX") or ""
     candidates: list[Path] = []
     chatdbg_venv = os.environ.get("CHATDBG_VENV")
@@ -177,6 +201,13 @@ def _repo_venv_site_packages() -> str | None:
         if not matches:
             continue
         site_packages = matches[0]
+        # HARD GATE: only accept venvs whose Python version matches the
+        # debugger's embedded Python.
+        sp_match = _re.search(r"python(\d)\.?(\d+)", str(site_packages))
+        if sp_match:
+            sp_tag = sp_match.group(1) + sp_match.group(2)
+            if sp_tag != target_py_tag:
+                continue
         # Walk a small set of .so files to confirm platform compatibility.
         sample_so = next(site_packages.rglob("*.so"), None)
         if sample_so is None:
@@ -253,6 +284,19 @@ def _run_debugger(
                 except OSError:
                     pass
         else:
+            # Two-stage: SIGTERM first (so handlers can save partial data),
+            # wait briefly, then SIGKILL the whole group. This is needed by
+            # tier1_runner.py's SIGTERM-driven partial-collect save.
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                pass
+            else:
+                import time as _t
+                for _ in range(30):  # up to 3s
+                    _t.sleep(0.1)
+                    if proc.poll() is not None:
+                        break
             try:
                 os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
             except (ProcessLookupError, PermissionError):
@@ -386,6 +430,14 @@ class Tier3Driver:
         if existing:
             parts.append(existing)
         env["PYTHONPATH"] = os.pathsep.join(parts)
+
+        # Adroit: forward BENCH_PY39_USERBASE -> PYTHONUSERBASE so gdb's
+        # embedded Py3.9 picks up chatdbg + deps installed in a separate
+        # Py3.9 user-site (the project venv is Py3.11 and rejected by
+        # _repo_venv_site_packages on version mismatch).
+        py39_userbase = os.environ.get("BENCH_PY39_USERBASE")
+        if py39_userbase:
+            env["PYTHONUSERBASE"] = py39_userbase
 
         # Check-my-work: pass case.yaml path so the CMW tool loads criteria.
         if spec.check_my_work:
@@ -940,6 +992,16 @@ class Tier3Driver:
         if existing:
             parts.append(existing)
         env["PYTHONPATH"] = os.pathsep.join(parts)
+
+        # On hosts where the project venv's Python version (e.g. 3.11)
+        # does not match the system gdb's embedded Python (e.g. 3.9 on
+        # adroit), the project venv is rejected by _repo_venv_site_packages.
+        # Allow the caller to point at a separately-installed user-site
+        # for the matching Python version via BENCH_PY39_USERBASE; this is
+        # forwarded as PYTHONUSERBASE so gdb's Python auto-adds it.
+        py39_userbase = os.environ.get("BENCH_PY39_USERBASE")
+        if py39_userbase:
+            env["PYTHONUSERBASE"] = py39_userbase
 
         # Check-my-work: pass the case.yaml path so the CMW tool can
         # load criteria at runtime. The case.yaml is already copied to
