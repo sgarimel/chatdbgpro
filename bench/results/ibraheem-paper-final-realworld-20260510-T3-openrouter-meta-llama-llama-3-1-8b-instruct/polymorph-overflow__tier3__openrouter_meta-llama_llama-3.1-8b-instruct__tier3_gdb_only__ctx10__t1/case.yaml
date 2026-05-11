@@ -1,0 +1,60 @@
+id: polymorph-overflow
+language: c
+kind: bugbench
+description: >
+  polymorph-0.4.0 stack buffer overflow in convert_fileName(). A for-loop
+  copies characters from the 'original' argument into a stack buffer
+  newname[MAX] (MAX=2048) one by one without bounds checking. When the
+  input filename exceeds 2048 characters, the loop overwrites the stack
+  return address, causing a crash.
+
+source:
+  dir: bugbench-src/polymorph-0.4.0/src
+  build_commands:
+    - "make clean"
+    - "make CC=gcc CFLAGS='-g -O0 -std=gnu89 -w -fsanitize=address' MOPTS='-fsanitize=address'"
+  binary: polymorph
+  key_files:
+    - polymorph.c
+    - polymorph_types.h
+
+run:
+  # -f with > 2048 char argument triggers convert_fileName overflow
+  crash_args_script: "python3 -c \"print('-f ' + 'A'*2100)\""
+  expected_crash: true
+
+debug:
+  args_script: "python3 -c \"import sys; sys.stdout.write('-f\\n' + 'A'*2100 + '\\n')\""
+  args_multiline: true
+
+bug:
+  category: buffer_overflow
+  error_type: stack_buffer_overflow
+  root_cause_file: polymorph.c
+  root_cause_lines: [193, 194, 195, 196, 197, 198, 199]
+  root_cause_function: convert_fileName
+  fix_description: >
+    Add a bounds check to the for-loop that copies into newname.
+
+criteria:
+  root_cause: >
+    The response must identify that the for-loop in convert_fileName()
+    (polymorph.c lines 193-199) copies from 'original' into newname[MAX]
+    without checking bounds. When original is longer than MAX (2048),
+    the stack buffer newname overflows. Identifying either the loop or
+    the strcpy in grok_commandLine (line 120) is acceptable since both
+    are overflow bugs triggered by long filenames.
+
+  local_fix: >
+    Add a length check before the loop:
+      if (strlen(original) >= MAX) { fprintf(stderr, "name too long\n"); return; }
+    Or bound the loop iteration count to MAX-1.
+
+  global_fix: >
+    A structural fix should prevent this class of bug:
+      (a) Replace all fixed-size char buffers with dynamically allocated
+          strings sized to the actual input length.
+      (b) Use PATH_MAX from <limits.h> consistently and validate all
+          inputs against it at the entry points.
+      (c) Introduce a safe string copy helper used project-wide that
+          takes a destination size parameter and truncates or errors.
