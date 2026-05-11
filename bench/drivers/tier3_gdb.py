@@ -274,6 +274,19 @@ def _run_debugger(
                 except OSError:
                     pass
         else:
+            # Two-stage: SIGTERM first (so handlers can save partial data),
+            # wait briefly, then SIGKILL the whole group. This is needed by
+            # tier1_runner.py's SIGTERM-driven partial-collect save.
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                pass
+            else:
+                import time as _t
+                for _ in range(30):  # up to 3s
+                    _t.sleep(0.1)
+                    if proc.poll() is not None:
+                        break
             try:
                 os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
             except (ProcessLookupError, PermissionError):
