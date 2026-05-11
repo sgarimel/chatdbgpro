@@ -50,6 +50,9 @@ cd "$SLURM_SUBMIT_DIR"
 # Load Python (Adroit module names per ADROIT.md).
 module load anaconda3 || true
 module load singularity || true
+module load intel-llvm/2024.2 || true
+export PATH=$HOME/.conda/envs/clang-bench/bin:$PATH
+export LIBRARY_PATH=$HOME/.conda/envs/clang-bench/lib:${LIBRARY_PATH:-}
 
 # Activate the project venv. Two paths supported: .venv (ADROIT.md style) and
 # .venv-bench (Mac/dev style).
