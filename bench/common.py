@@ -74,9 +74,42 @@ def _resolve_workspace_path(raw: str, bug_id: str, project: str,
     return canonical
 
 DEFAULT_QUESTION = (
-    "What is the root cause of this crash? Walk through the program "
-    "state, identify the defect, and propose a fix in code. Cover both "
-    "a minimal local fix and a more thorough root-cause fix if they differ."
+    # NOTE: feeds gdb's `why <prompt>` — must be a SINGLE LINE. Newlines
+    # break gdb's command parser (lines 2+ become new gdb commands).
+    #
+    # Iter 2 (2026-05-11): the previous iter merely *appended* a label
+    # spec to the open-ended "walk through state" question. Many models
+    # treated investigation as the primary task, decided they were done
+    # after 3-5 tool calls, and emitted short narrative turns without
+    # the structured closure — chatdbg's `why` dialog then ended.
+    # This iter reorders + reframes: the labelled paragraphs ARE the
+    # task; investigation is the path to filling them in.
+    "FINAL OUTPUT FORMAT (mandatory — your response is graded only on the "
+    "presence and quality of these three labels; without all three "
+    "literal markers your run scores 0/0/0): your last message must "
+    "contain three paragraphs prefixed verbatim with `ROOT CAUSE:`, "
+    "`LOCAL FIX:`, and `GLOBAL FIX:` in that order. "
+    "Each paragraph must be at least one substantive sentence — not just "
+    "the label. "
+    "ROOT CAUSE: <file:line + concrete explanation of why the defect "
+    "produces this failure; don't merely paraphrase the sanitizer "
+    "report>. "
+    "LOCAL FIX: <minimal code change that resolves the immediate symptom; "
+    "show the diff, replacement code, or precise edit>. "
+    "GLOBAL FIX: <structural design change that prevents this CLASS of "
+    "bug — type change, API redesign, compile-time check, RAII wrapper, "
+    "bounded view type, invariant. NOT just a longer version of the "
+    "local fix>. "
+    "Use the debugger tools (bt, print, frame, get_code_surrounding, "
+    "step, etc.) to gather evidence first — but do not stop the "
+    "conversation until you have actually emitted ROOT CAUSE / LOCAL "
+    "FIX / GLOBAL FIX in your final message. "
+    "If you find yourself about to end without writing all three labels, "
+    "stop, synthesize what you've learned, and write them now. "
+    "Walk through the program state that led to the failure, explain why "
+    "each variable contributing to the bug has the value it does, and "
+    "reason from the observed symptom back to the underlying cause in "
+    "the source code."
 )
 
 
@@ -815,13 +848,22 @@ def build_oracle_strings(case: DockerCase) -> dict[str, str]:
     # characters — and shlex.quote inserts `"` when the value contains
     # `'` (yara's trigger does). Plain join keeps it pure single-quotes.
     if case.trigger_argv:
-        # Also strip bare `"` chars in the trigger: triggers like
-        # berry's that embed double-quoted shell substitutions
-        # (`bash -c "./berry $(find ... -name \"*.be\")"`) carry
-        # raw `"` into the joined string and trip apptainer's CSV
-        # parser exactly like shlex.quote did. Replace with `'` — the
-        # EXTRA value is informational, not a shell command.
-        extras.append("trigger=" + " ".join(case.trigger_argv).replace('"', "'"))
+        # Apptainer --env K=V cobra parser AND any downstream shell that
+        # might eval this value both choke on unmatched quotes. The
+        # earlier replace('"','\'') from PR #22 left nested single
+        # quotes for triggers containing  awk 'NR==2'  which broke
+        # apptainer instance startup. CHATDBG_PROMPT_EXTRA is purely
+        # informational (the LLM reads it); strip ALL shell-quote chars
+        # so the value is safe at every layer.
+        trigger_text = " ".join(case.trigger_argv)
+        # Strip ALL shell-special quoting characters: quotes (single,
+        # double, backtick) and backslashes. The escape-backslashes
+        # remain when the original trigger had `\"` and we removed the
+        # `"` — yielding `\ ` which bash interprets as line continuation
+        # and trips apptainer's runtime env-injector script.
+        for _ch in ('"', "'", "`", "\\"):
+            trigger_text = trigger_text.replace(_ch, "")
+        extras.append("trigger=" + trigger_text)
     if extras:
         # Separator is "; " not ", ": apptainer's `--env K=V` flag parses
         # value as CSV (cobra StringToString), so every comma splits the

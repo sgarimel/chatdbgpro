@@ -25,11 +25,33 @@ import numpy as np
 
 AXES = ("root_cause", "local_fix", "global_fix")
 TIER_LABELS = {
-    1: "T1",
-    2: "T2",
-    3: "T3",
-    4: "T4",
+    1: "T1",   # bash only
+    3: "T2",   # gdb only — paper-scheme rename of codebase tier 3
+    2: "T3",   # bash + gdb — kept defined for future T3 figures
+    4: "T4",   # Claude Code — kept for future T4 figures
 }
+
+# Fixed display order for every figure (heatmaps + bar charts). Strongest
+# closed-source first, then open-source, then small. See
+# feedback_figure_conventions in memory.
+MODEL_ORDER = (
+    "gpt-5.5",
+    "gpt-4o",
+    "claude-sonnet",
+    "grok",
+    "gemini",
+    "qwen",
+    "nemotron",
+    "llama",
+)
+
+
+def _order_models(labels) -> list[str]:
+    """Return labels sorted by MODEL_ORDER; unknown labels appended A-Z at end."""
+    present = set(labels)
+    head = [m for m in MODEL_ORDER if m in present]
+    tail = sorted(present - set(head))
+    return head + tail
 
 
 def load_json(path: Path) -> Any:
@@ -59,6 +81,8 @@ def short_model(model: str | None) -> str:
         return "gemini"
     if "grok" in lowered:
         return "grok"
+    if "llama" in lowered:
+        return "llama"
     return model.split("/")[-1]
 
 
@@ -165,8 +189,8 @@ def write_summary_csv(rows: list[dict], out_dir: Path) -> None:
 
 
 def plot_score_heatmap(rows: list[dict], out_dir: Path) -> None:
-    model_labels = sorted({r["model_label"] for r in rows})
-    tiers = [t for t in (1, 2, 3, 4) if any(r["tier"] == t for r in rows)]
+    model_labels = _order_models({r["model_label"] for r in rows})
+    tiers = [t for t in (1, 3, 2, 4) if any(r["tier"] == t for r in rows)]
     columns = [(tier, axis) for tier in tiers for axis in AXES]
     data = np.full((len(model_labels), len(columns)), np.nan)
     groups = _group(rows, ("model_label", "tier"))
@@ -210,41 +234,151 @@ def plot_score_heatmap(rows: list[dict], out_dir: Path) -> None:
     plt.close(fig)
 
 
-def plot_average_score(rows: list[dict], out_dir: Path) -> None:
-    groups = _group(rows, ("model_label",))
-    labels = sorted(groups)
-    scores = [
-        _mean([r["root_cause"] + r["local_fix"] + r["global_fix"] for r in groups[label]]) / 3.0
-        for label in labels
-    ]
-    fig, ax = plt.subplots(figsize=(max(8, len(labels) * 0.8), 4.5))
-    bars = ax.bar([label[0] for label in labels], scores, color="#2a9d8f")
-    ax.set_ylim(0, 1)
-    ax.set_ylabel("mean total score / 3")
-    ax.set_title("Average Debugging Score By Model")
-    ax.tick_params(axis="x", rotation=25)
-    for bar, score in zip(bars, scores):
-        ax.text(bar.get_x() + bar.get_width() / 2, score + 0.02,
-                f"{score:.2f}", ha="center", va="bottom", fontsize=9)
+_TIER_COLORS = {1: "#2a9d8f", 3: "#e76f51", 2: "#264653", 4: "#f4a261"}
+_TIER_TOKEN_COLORS = {1: "#457b9d", 3: "#e63946", 2: "#1d3557", 4: "#a8dadc"}
+
+
+def _grouped_tier_bar(
+    rows: list[dict],
+    value_fn,
+    *,
+    title: str,
+    ylabel: str,
+    out_path: Path,
+    color_map: dict[int, str],
+    annotate_fmt: str,
+    ymax: float | None = None,
+    label_offset: float | None = None,
+) -> None:
+    """Grouped bar chart: one cluster per model, one bar per tier inside."""
+    by_mt = _group(rows, ("model_label", "tier"))
+    models = _order_models({m for (m, _) in by_mt})
+    tiers = [t for t in (1, 3, 2, 4) if any(t2 == t for (_, t2) in by_mt)]
+    n_tiers = max(len(tiers), 1)
+    bar_w = 0.8 / n_tiers
+    x = np.arange(len(models))
+
+    fig, ax = plt.subplots(figsize=(max(9, len(models) * 1.05), 4.8))
+    for i, tier in enumerate(tiers):
+        vals = []
+        for m in models:
+            grp = by_mt.get((m, tier), [])
+            vals.append(value_fn(grp) if grp else float("nan"))
+        offset = (i - (n_tiers - 1) / 2) * bar_w
+        bars = ax.bar(
+            x + offset, vals, bar_w,
+            label=TIER_LABELS.get(tier, f"T{tier}"),
+            color=color_map.get(tier, "#888888"),
+            edgecolor="black", linewidth=0.4,
+        )
+        for bar, v in zip(bars, vals):
+            if v is None or (isinstance(v, float) and math.isnan(v)):
+                continue
+            off = label_offset if label_offset is not None else (
+                (ymax * 0.012) if ymax else (v * 0.012)
+            )
+            ax.text(bar.get_x() + bar.get_width() / 2, v + off,
+                    annotate_fmt.format(v), ha="center", va="bottom", fontsize=8)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(models, rotation=25, ha="right")
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    if ymax is not None:
+        ax.set_ylim(0, ymax)
+    ax.legend(title="Tier", frameon=True, loc="upper right")
+    ax.grid(axis="y", linestyle=":", alpha=0.4)
     fig.tight_layout()
-    fig.savefig(out_dir / "average_debugging_score_by_model.png", dpi=180)
+    fig.savefig(out_path, dpi=180)
     plt.close(fig)
 
 
+def plot_average_score(rows: list[dict], out_dir: Path) -> None:
+    def value(grp):
+        return _mean([r["root_cause"] + r["local_fix"] + r["global_fix"] for r in grp])
+    _grouped_tier_bar(
+        rows, value,
+        title="Average Debugging Score By Model And Tier (out of 3)",
+        ylabel="mean (root_cause + local_fix + global_fix)",
+        out_path=out_dir / "average_debugging_score_by_model.png",
+        color_map=_TIER_COLORS,
+        annotate_fmt="{:.2f}",
+        ymax=3.15,
+        label_offset=0.04,
+    )
+
+
 def plot_average_tokens(rows: list[dict], out_dir: Path) -> None:
-    groups = _group(rows, ("model_label",))
-    labels = sorted(groups)
-    tokens = [_mean([r["total_tokens"] for r in groups[label]]) for label in labels]
-    fig, ax = plt.subplots(figsize=(max(8, len(labels) * 0.8), 4.5))
-    bars = ax.bar([label[0] for label in labels], tokens, color="#457b9d")
-    ax.set_ylabel("mean input + output tokens")
-    ax.set_title("Average Tokens By Model")
-    ax.tick_params(axis="x", rotation=25)
-    for bar, value in zip(bars, tokens):
-        ax.text(bar.get_x() + bar.get_width() / 2, value,
-                f"{value:,.0f}", ha="center", va="bottom", fontsize=9)
-    fig.tight_layout()
-    fig.savefig(out_dir / "average_tokens_by_model.png", dpi=180)
+    def value(grp):
+        return _mean([r["total_tokens"] for r in grp])
+    _grouped_tier_bar(
+        rows, value,
+        title="Average Tokens By Model And Tier",
+        ylabel="mean input + output tokens",
+        out_path=out_dir / "average_tokens_by_model.png",
+        color_map=_TIER_TOKEN_COLORS,
+        annotate_fmt="{:,.0f}",
+    )
+
+
+def plot_case_model_heatmap(rows: list[dict], out_dir: Path) -> None:
+    """One subplot per tier; rows = cases, cols = models (MODEL_ORDER).
+    Value = (rc + lf + gf) / 3 averaged over trials for the (case, model, tier).
+    """
+    models = _order_models({r["model_label"] for r in rows})
+    tiers = [t for t in (1, 3, 2, 4) if any(r["tier"] == t for r in rows)]
+    cases = sorted({r["case_id"] for r in rows if r.get("case_id")})
+    if not cases or not models or not tiers:
+        return
+
+    by_ctm = _group(rows, ("case_id", "tier", "model_label"))
+    grids = {}
+    for tier in tiers:
+        g = np.full((len(cases), len(models)), np.nan)
+        for i, case in enumerate(cases):
+            for j, model in enumerate(models):
+                grp = by_ctm.get((case, tier, model), [])
+                if grp:
+                    g[i, j] = _mean(
+                        [r["root_cause"] + r["local_fix"] + r["global_fix"]
+                         for r in grp]
+                    )
+        grids[tier] = g
+
+    cell_w = 0.55
+    width = max(8, len(models) * cell_w * len(tiers) + 2)
+    height = max(6, len(cases) * 0.32 + 1.2)
+    fig, axes = plt.subplots(1, len(tiers), figsize=(width, height),
+                             sharey=True, squeeze=False)
+    im = None
+    for k, tier in enumerate(tiers):
+        ax = axes[0, k]
+        data = grids[tier]
+        im = ax.imshow(data, vmin=0, vmax=3, cmap="RdYlGn", aspect="auto")
+        ax.set_xticks(range(len(models)))
+        ax.set_xticklabels(models, rotation=35, ha="right")
+        ax.set_title(TIER_LABELS.get(tier, f"T{tier}"), fontweight="bold")
+        if k == 0:
+            ax.set_yticks(range(len(cases)))
+            ax.set_yticklabels(cases)
+        for i in range(data.shape[0]):
+            for j in range(data.shape[1]):
+                v = data[i, j]
+                if np.isnan(v):
+                    txt = "-"
+                elif float(v).is_integer():
+                    txt = f"{int(v)}"
+                else:
+                    txt = f"{v:.2f}"
+                color = "white" if not np.isnan(v) and (v < 0.75 or v > 2.25) else "black"
+                ax.text(j, i, txt, ha="center", va="center", color=color, fontsize=7)
+    fig.suptitle("Per-Case Rubric Score (out of 3) — Case × Model × Tier",
+                 fontsize=12, fontweight="bold")
+    if im is not None:
+        fig.colorbar(im, ax=axes.ravel().tolist(), fraction=0.018, pad=0.02,
+                     label="root_cause + local_fix + global_fix (0..3)")
+    fig.savefig(out_dir / "score_heatmap_by_case_model_tier.png", dpi=180,
+                bbox_inches="tight")
     plt.close(fig)
 
 
@@ -271,6 +405,7 @@ def main() -> int:
     plot_score_heatmap(rows, out_dir)
     plot_average_score(rows, out_dir)
     plot_average_tokens(rows, out_dir)
+    plot_case_model_heatmap(rows, out_dir)
     print(f"[charts] wrote {out_dir}")
     return 0
 

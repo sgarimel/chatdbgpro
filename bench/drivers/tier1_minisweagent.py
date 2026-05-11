@@ -301,6 +301,7 @@ class Tier1Driver:
         # session.cmds analog: log the runner invocation so a human can
         # rerun the exact same agent session by hand.
         argv = self._runner_argv(spec, run_dir, agent_cwd=run_dir)
+        argv += ["--wallclock-deadline", str(max(30, int(timeout) - 60))]
         (run_dir / "session.cmds").write_text(
             "# Tier-1 runner invocation (mini-swe-agent v2)\n"
             + " ".join(repr(a) if " " in a else a for a in argv)
@@ -336,6 +337,7 @@ class Tier1Driver:
         task = _build_injected_task(spec.case, workdir, prep.binary)
         (run_dir / "task.md").write_text(task, encoding="utf-8")
         argv = self._runner_argv(spec, run_dir, agent_cwd=workdir)
+        argv += ["--wallclock-deadline", str(max(30, int(timeout) - 60))]
         (run_dir / "session.cmds").write_text(
             "# Tier-1 runner invocation (mini-swe-agent v2, injected)\n"
             + " ".join(repr(a) if " " in a else a for a in argv)
@@ -406,6 +408,7 @@ class Tier1Driver:
         )
         (run_dir / "task.md").write_text(task, encoding="utf-8")
         argv = self._runner_argv(spec, run_dir, agent_cwd=workdir)
+        argv += ["--wallclock-deadline", str(max(30, int(timeout) - 60))]
         (run_dir / "session.cmds").write_text(
             "# Tier-1 runner invocation (mini-swe-agent v2, bugbench)\n"
             + " ".join(repr(a) if " " in a else a for a in argv)
@@ -489,6 +492,7 @@ class Tier1Driver:
             "--container-cwd", "/work",
             "--container-runtime", runtime,
         ]
+        argv += ["--wallclock-deadline", str(max(30, int(timeout) - 60))]
         if self.mini_model_class:
             argv += ["--mini-model-class", self.mini_model_class]
         (run_dir / "session.cmds").write_text(

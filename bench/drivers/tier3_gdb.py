@@ -140,7 +140,12 @@ def _repo_venv_site_packages() -> str | None:
     """Return the bench venv's site-packages path, if a venv exists
     AND its compiled extensions match the current platform.
 
-    Three layouts are supported:
+    Layouts supported, in order:
+      `$CHATDBG_VENV`   — explicit override, used when the venv lives
+                         outside the repo (e.g. Anika's WSL setup with
+                         the venv at ~/.venvs/chatdbg-bench because the
+                         repo is on OneDrive/NTFS-via-WSL and unusable
+                         for thousands of small site-packages writes).
       `.venv`           — repo/runtime env used by WSL/Linux native runs.
                          Prefer this when present so Mini-SWE's separate
                          `.venv-bench` can keep its own dependency versions.
@@ -157,16 +162,52 @@ def _repo_venv_site_packages() -> str | None:
     the venv's first compiled .so and only return the path if it
     matches the running interpreter.
     """
-    import sysconfig
+    import sysconfig, subprocess, re as _re
+    # CRITICAL: the orchestrator runs in a Py3.11 venv, but the debugger
+    # (system gdb on adroit) embeds a different Python (3.9). Match against
+    # the DEBUGGER's Python version, not the orchestrator's, otherwise we
+    # add a Py3.11 site-packages dir that gdb's Py3.9 will try (and fail) to
+    # load (the classic "circular import in tiktoken" symptom).
+    target_py_tag = None
+    try:
+        # Ask the system gdb what Python version it embeds.
+        proc = subprocess.run(
+            ["gdb", "--batch", "-ex",
+             "python import sys; print(sys.version_info.major, sys.version_info.minor)"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if proc.returncode == 0:
+            for line in proc.stdout.splitlines():
+                m = _re.match(r"(\d)\s+(\d+)", line.strip())
+                if m:
+                    target_py_tag = m.group(1) + m.group(2)
+                    break
+    except Exception:
+        pass
+    # Fallback: orchestrator's Python.
+    if not target_py_tag:
+        target_py_tag = f"{sysconfig.get_python_version().replace('.', '')}"
     host_ext_suffix = sysconfig.get_config_var("EXT_SUFFIX") or ""
+    candidates: list[Path] = []
+    chatdbg_venv = os.environ.get("CHATDBG_VENV")
+    if chatdbg_venv:
+        candidates.append(Path(chatdbg_venv))
     for name in (".venv", ".venv-bench-39", ".venv-bench"):
-        venv = REPO_DIR / name
+        candidates.append(REPO_DIR / name)
+    for venv in candidates:
         if not venv.exists():
             continue
         matches = list((venv / "lib").glob("python*/site-packages"))
         if not matches:
             continue
         site_packages = matches[0]
+        # HARD GATE: only accept venvs whose Python version matches the
+        # debugger's embedded Python.
+        sp_match = _re.search(r"python(\d)\.?(\d+)", str(site_packages))
+        if sp_match:
+            sp_tag = sp_match.group(1) + sp_match.group(2)
+            if sp_tag != target_py_tag:
+                continue
         # Walk a small set of .so files to confirm platform compatibility.
         sample_so = next(site_packages.rglob("*.so"), None)
         if sample_so is None:
@@ -243,6 +284,19 @@ def _run_debugger(
                 except OSError:
                     pass
         else:
+            # Two-stage: SIGTERM first (so handlers can save partial data),
+            # wait briefly, then SIGKILL the whole group. This is needed by
+            # tier1_runner.py's SIGTERM-driven partial-collect save.
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                pass
+            else:
+                import time as _t
+                for _ in range(30):  # up to 3s
+                    _t.sleep(0.1)
+                    if proc.poll() is not None:
+                        break
             try:
                 os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
             except (ProcessLookupError, PermissionError):
@@ -376,6 +430,14 @@ class Tier3Driver:
         if existing:
             parts.append(existing)
         env["PYTHONPATH"] = os.pathsep.join(parts)
+
+        # Adroit: forward BENCH_PY39_USERBASE -> PYTHONUSERBASE so gdb's
+        # embedded Py3.9 picks up chatdbg + deps installed in a separate
+        # Py3.9 user-site (the project venv is Py3.11 and rejected by
+        # _repo_venv_site_packages on version mismatch).
+        py39_userbase = os.environ.get("BENCH_PY39_USERBASE")
+        if py39_userbase:
+            env["PYTHONUSERBASE"] = py39_userbase
 
         # Check-my-work: pass case.yaml path so the CMW tool loads criteria.
         if spec.check_my_work:
@@ -692,37 +754,60 @@ class Tier3Driver:
         collect_path = run_dir / "collect.json"
         env = self._chatdbg_env(spec, run_dir, collect_path)
 
-        if self.debugger != "lldb":
-            # gdb for injected cases is plausible (we'd need to call
-            # `file <binary>` from the cwd) but not wired in the pilot.
-            raise ValueError(
-                f"injected_repo only supports lldb for now, got {self.debugger}"
-            )
-
         debug_cfg = spec.case.meta.get("debug", {})
         args = debug_cfg.get("args", [])
         stdin_data = debug_cfg.get("stdin_data")
 
-        lines = ["command script import chatdbg.chatdbg_lldb"]
-        if args:
-            lines.append("settings set target.run-args "
-                         + " ".join(shlex.quote(str(a)) for a in args))
+        stdin_file: Path | None = None
         if stdin_data is not None:
             stdin_file = run_dir / "stdin.bin"
             stdin_file.write_bytes(stdin_data.encode() if isinstance(stdin_data, str)
                                    else stdin_data)
-            lines.append(f"settings set target.input-path {stdin_file}")
-        lines.append("run")
-        lines.append(f"why {spec.question}")
-        script = "\n".join(lines) + "\n"
-        (run_dir / "session.cmds").write_text(script)
 
-        argv = [
-            lldb_binary(),
-            "-o", "settings set use-color false",
-            "-s", str(run_dir / "session.cmds"),
-            "--", str(binary),
-        ]
+        if self.debugger == "lldb":
+            lines = ["command script import chatdbg.chatdbg_lldb"]
+            if args:
+                lines.append("settings set target.run-args "
+                             + " ".join(shlex.quote(str(a)) for a in args))
+            if stdin_file is not None:
+                lines.append(f"settings set target.input-path {stdin_file}")
+            lines.append("run")
+            lines.append(f"why {spec.question}")
+            script = "\n".join(lines) + "\n"
+            (run_dir / "session.cmds").write_text(script)
+            argv = [
+                lldb_binary(),
+                "-o", "settings set use-color false",
+                "-s", str(run_dir / "session.cmds"),
+                "--", str(binary),
+            ]
+        elif self.debugger == "gdb":
+            # gdb path for injected_repo: mirrors the synthetic gdb script
+            # (build_gdb_script) but pulls args/stdin from `case.meta["debug"]`
+            # instead of `case.meta["run"]`, and passes the binary as a
+            # positional arg so `file <binary>` isn't needed inside the script.
+            lines = [f"source {REPO_DIR / 'src' / 'chatdbg' / 'chatdbg_gdb.py'}"]
+            if args:
+                lines.append("set args "
+                             + " ".join(shlex.quote(str(a)) for a in args))
+            # For stdin redirection, gdb's `run < file` is parsed by gdb's
+            # own command line and forwarded to the inferior. Works in
+            # -batch-silent mode.
+            run_line = "run"
+            if stdin_file is not None:
+                run_line = f"run < {shlex.quote(str(stdin_file))}"
+            lines.append(run_line)
+            lines.append(f"why {spec.question}")
+            script = "\n".join(lines) + "\n"
+            (run_dir / "session.cmds").write_text(script)
+            argv = ["gdb", "-nx", "-batch-silent",
+                    "-x", str(run_dir / "session.cmds"),
+                    str(binary)]
+        else:
+            raise ValueError(
+                f"injected_repo: unsupported debugger {self.debugger!r}; "
+                "expected 'lldb' or 'gdb'."
+            )
 
         start = time.time()
         try:
@@ -856,6 +941,25 @@ class Tier3Driver:
         where Apple's lldb embeds Python 3.9 (see lldb_binary()); the
         rest is just ChatDBG's normal runtime config surfaced via env."""
         env = os.environ.copy()
+
+        # Under gdb (and lldb), ASan/UBSan default to calling _exit() on
+        # error which the debugger sees as a normal exit (gdb reports
+        # "exited with code 01") — chatdbg's stop_handler then records
+        # no signal and the prompt becomes "stopped (no-signal)", giving
+        # the model nothing concrete to investigate. abort_on_error=1
+        # makes the sanitizers raise SIGABRT instead, so the debugger
+        # catches the crash with a real stop_signal and a backtrace
+        # that lands inside the sanitizer's runtime (one frame up = the
+        # bug). Defaults preserve any caller override.
+        env.setdefault("ASAN_OPTIONS",
+                       "abort_on_error=1:halt_on_error=1:detect_leaks=0")
+        env.setdefault("UBSAN_OPTIONS",
+                       "abort_on_error=1:halt_on_error=1:"
+                       "print_stacktrace=1")
+        env.setdefault("MSAN_OPTIONS",
+                       "abort_on_error=1:halt_on_error=1")
+        env.setdefault("LSAN_OPTIONS",
+                       "abort_on_error=1")
         env["CHATDBG_MODEL"] = spec.model
         env["CHATDBG_TOOL_CONFIG"] = str(spec.tool_config_path)
         env["CHATDBG_COLLECT_DATA"] = str(collect_path)
@@ -888,6 +992,16 @@ class Tier3Driver:
         if existing:
             parts.append(existing)
         env["PYTHONPATH"] = os.pathsep.join(parts)
+
+        # On hosts where the project venv's Python version (e.g. 3.11)
+        # does not match the system gdb's embedded Python (e.g. 3.9 on
+        # adroit), the project venv is rejected by _repo_venv_site_packages.
+        # Allow the caller to point at a separately-installed user-site
+        # for the matching Python version via BENCH_PY39_USERBASE; this is
+        # forwarded as PYTHONUSERBASE so gdb's Python auto-adds it.
+        py39_userbase = os.environ.get("BENCH_PY39_USERBASE")
+        if py39_userbase:
+            env["PYTHONUSERBASE"] = py39_userbase
 
         # Check-my-work: pass the case.yaml path so the CMW tool can
         # load criteria at runtime. The case.yaml is already copied to

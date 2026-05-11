@@ -32,7 +32,14 @@ done
 
 # shellcheck disable=SC1091
 source "$VENV_ORCH/bin/activate"
+# Export both venv hooks for the orchestrator subprocesses:
+#   CHATDBG_MINI_PY — tier1 driver's mini-swe-agent venv lookup
+#   CHATDBG_VENV    — tier3 driver's PYTHONPATH lookup for the embedded
+#                     gdb/lldb Python (resolves the orch venv's
+#                     site-packages so chatdbg + llm_utils + litellm
+#                     are importable from inside gdb)
 export CHATDBG_MINI_PY="$VENV_MINI/bin/python3"
+export CHATDBG_VENV="$VENV_ORCH"
 export PYTHONUNBUFFERED=1
 
 cd "$REPO"

@@ -1,5 +1,12 @@
 # Ibraheem — realworld panel runner handoff (Adroit / Princeton HPC)
 
+> **2026-05-10 — read `bench/RUNNER_HANDOFF_ibraheem_addendum.md` first.**
+> While running her synthetic panel, Anika's session discovered and fixed
+> five infrastructure issues that affect your realworld runs too — the
+> ASan-signal-propagation fix in particular is load-bearing for any T3
+> cell to see a real crash. The addendum has a TL;DR plus the small
+> Adroit-specific deltas. The rest of this file (below) is still correct.
+
 This file is the entry point for any Claude Code session running on Ibraheem's
 Adroit account. Read this end-to-end first, then start at "Step-by-step run".
 

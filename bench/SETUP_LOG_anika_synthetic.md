@@ -255,7 +255,122 @@ bash bench/run_synthetic_with_venv.sh \
     --workers 8 --timeout 600
 ```
 
-## §6. State at end of setup
+## §6. Post-sweep learnings — empty gpt-4o cells and the prompt iteration
+
+After the T1 sweep finished, ~24 cells came back with empty `response` even
+though the model `status` was `ok`. Initial scan suggested these could be
+"recovered" from tool output (the gemini-flash-lite pattern of echo-ing the
+diagnosis); careful re-scan showed only **5/24 recoverable**, the other
+**19 genuinely empty**. Diving into one of the 19 — gpt-4o on
+`null-deref-env` — revealed the underlying mechanism.
+
+### What the harness does to "text-only" responses
+
+Mini-swe-agent v2's `parse_toolcall_actions` raises `FormatError` whenever
+the model returns an assistant message with `tool_calls=[]`. The agent
+catches the FormatError, appends a "Tool call error" user message to the
+conversation, and **never appends the rejected assistant message itself**.
+That means the model's actual prose — the ROOT CAUSE / LOCAL FIX /
+GLOBAL FIX diagnosis it wrote — never lands in `trajectory.json`,
+`stdout.log`, or anywhere else. The information is just gone.
+
+For null-deref-env / gpt-4o:
+- `info.model_stats.api_calls = 100`
+- `info.exit_status = "LimitsExceeded"`
+- only **3** assistant messages persisted to trajectory.json (the 3
+  investigation tool calls); the other 97 model responses were
+  text-only, all rejected, all discarded
+- stdout.log is **4 lines** total; stderr is empty
+- 410s of wall time burned on a rejection loop
+
+### The CHATDBG_LOG_REJECTED hook
+
+To make this visible, I added an env-var-gated wrapper around
+`model._query` in `bench/drivers/tier1_runner.py`. When
+`CHATDBG_LOG_REJECTED=1` is set, every raw model response (accepted or
+not) gets one line in `<run_dir>/rejected_responses.jsonl` with
+`attempt`, `finish_reason`, `n_tool_calls`, `content_len`, and the full
+`content`. This is the only way to see what models like gpt-4o tried to
+say before mini's gate dropped them.
+
+Rerunning gpt-4o on null-deref-env with the hook surfaced 4 well-formed
+ROOT CAUSE / LOCAL FIX / GLOBAL FIX diagnoses (1,200–1,500 chars each),
+all correctly identifying program.c:13's null-pointer deref, all
+correctly proposing a null-check + a structural config-management
+global fix. **The model is solving the problem.** The harness is
+throwing the answer away.
+
+### Why gpt-4o emits text-only responses on its final turn
+
+gpt-4o (and qwen30, and ~half of gemini-flash-lite) treats
+`message.content` and `message.tool_calls` as **mutually exclusive**
+output modes. When investigating, it emits `tool_calls` with
+`content=null`. When wrapping up, it switches to `content`-only and
+expresses the submit command as a markdown ```bash ... ``` fenced
+block. Sonnet-4.5 and gpt-5.5 don't have this split — they can populate
+both fields in the same response. This is most plausibly a
+post-training-data thing: models trained heavily on "tool use chat"
+data learn `content` vs `tool_calls` as alternating turns rather than
+co-occurring fields.
+
+### Prompt iteration log (gpt-4o + null-deref-env)
+
+Five iterations of the system/instance prompt's
+`<critical_submission_protocol>` block; results scored as "does the
+final accepted assistant message carry the diagnosis":
+
+| iter | strategy | accepted-msg has diagnosis? |
+|---|---|---|
+| 1 | "every response must include a tool call; content+tool_calls coexist" (3 sentences) | NO — 100 API calls, LimitsExceeded |
+| 2 | + spelled out the function-calling API mechanic vs markdown fenced block | NO — same shape (3 invest + 4 rejected text + 1 bare submit) |
+| 3 | + added a concrete JSON example of `content + tool_calls` together | NO — *worse*, 6 rejected text attempts |
+| 4 | + offered a `cat <<EOF` heredoc fallback alongside iter-3 example | NO — gpt-4o ignored the heredoc suggestion |
+| **5** | **reframed: `content` field has no audience; diagnosis MUST travel inside a `bash` tool call's `command` arg via heredoc** | **YES** — 1 rejected text attempt, then heredoc tool call carrying full RC/LF/GF, then submit |
+
+The breakthrough in iter 5 was **removing the choice**. Telling gpt-4o
+"both fields coexist" left it free to pick content-only and it did,
+every time. Telling it "content has no audience; bash is the only
+microphone" forced the diagnosis into the only channel mini-swe-agent
+actually reads from. Combined with `bench/recover_responses.py`, which
+already extracts RC/LF/GF from tool output, this gives a clean
+end-to-end pipeline for tool-callers that won't populate
+content+tool_calls together.
+
+### Implications for the paper
+
+The "small models score worse than big models" axis is partly a
+harness-protocol axis, not just a debugging-ability axis. The original
+empty-cell breakdown was:
+
+- gpt-4o:               0/9 recoverable from existing trajectories
+- qwen30:               0/3
+- grok-4:               0/1
+- gemini-flash-lite:    5/11
+
+After iter 5's prompt + the `recover_responses.py` post-processor,
+**all** of these should produce judgeable diagnoses. The question for
+the figure is whether to:
+1. Treat the new pipeline as the canonical run (rerun the 19 affected
+   cells, then judge uniformly), or
+2. Keep the original run and document the harness bias explicitly,
+   reporting both "as-emitted" and "as-recovered" scores.
+
+Either is defensible; (1) is closer to "what the model can do" and (2)
+is closer to "what the original ChatDBG paper's protocol would have
+measured." Pick at chart time.
+
+### Files changed in this iteration
+
+- `bench/drivers/tier1_runner.py` — adds `<critical_submission_protocol>`
+  block to `DEBUG_INSTANCE_TEMPLATE` (iter 5 version);
+  CHATDBG_LOG_REJECTED hook around `model._query`.
+- `bench/recover_responses.py` — pre-existing; unchanged.
+
+Memory updated: `project_tier1_response_extraction_blind_spot.md` now
+reflects the honest 5/19 recoverable split, not the original incorrect
+"24/24 recoverable" claim.
+
+## §7. State at end of setup
 
 Files added/modified in this session, all tracked under
 `push/local-runs-anika`:

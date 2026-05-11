@@ -42,7 +42,7 @@ mkdir -p logs
 : "${MODEL:?MODEL env var required (e.g. openrouter/openai/gpt-5.5)}"
 OWNER="${OWNER:-${USER}}"
 RUNSET="${RUNSET:-bench/results/final_paper_bench/_runset_locked.tsv}"
-WORKERS="${WORKERS:-8}"
+WORKERS="${WORKERS:-2}"
 TIMEOUT="${TIMEOUT:-600}"
 
 cd "$SLURM_SUBMIT_DIR"
@@ -50,6 +50,11 @@ cd "$SLURM_SUBMIT_DIR"
 # Load Python (Adroit module names per ADROIT.md).
 module load anaconda3 || true
 module load singularity || true
+module load intel-llvm/2024.2 || true
+module load proxy/default || true
+export PATH=$HOME/.conda/envs/clang-bench/bin:$PATH
+export BENCH_APPTAINER_SIF_DIR=$HOME/.apptainer/cache
+export LIBRARY_PATH=$HOME/.conda/envs/clang-bench/lib:${LIBRARY_PATH:-}
 
 # Activate the project venv. Two paths supported: .venv (ADROIT.md style) and
 # .venv-bench (Mac/dev style).
