@@ -74,27 +74,42 @@ def _resolve_workspace_path(raw: str, bug_id: str, project: str,
     return canonical
 
 DEFAULT_QUESTION = (
-    "What is the root cause of this crash? Walk through the program state, "
-    "identify the defect, and propose a fix in code. Cover both a minimal "
-    "local fix and a more thorough root-cause fix if they differ. "
-    # NOTE: this prompt feeds gdb's `why <prompt>` command — keep it on a
-    # SINGLE LINE (no embedded newlines), or gdb's command parser will
-    # treat lines 2+ as separate gdb commands and break the script.
-    "Your final response MUST end with three labelled paragraphs in this "
-    "exact format (used verbatim — do not omit the labels or alter the "
-    "wording): "
-    "[ROOT CAUSE:] file:line and what is wrong, in your own words — "
-    "don't just paraphrase the sanitizer report, explain why the defect "
-    "produces this failure. "
-    "[LOCAL FIX:] minimal code change that resolves the immediate symptom; "
-    "show the diff or replacement code. "
-    "[GLOBAL FIX:] structural design change that prevents this CLASS of "
-    "bug (type change, API redesign, compile-time check, RAII wrapper, "
-    "bounded view type, invariant). Not just a bigger version of the "
-    "local fix. "
-    "The grader scores by matching these three sections against the case "
-    "criteria; responses missing the literal labels ROOT CAUSE / LOCAL "
-    "FIX / GLOBAL FIX score 0."
+    # NOTE: feeds gdb's `why <prompt>` — must be a SINGLE LINE. Newlines
+    # break gdb's command parser (lines 2+ become new gdb commands).
+    #
+    # Iter 2 (2026-05-11): the previous iter merely *appended* a label
+    # spec to the open-ended "walk through state" question. Many models
+    # treated investigation as the primary task, decided they were done
+    # after 3-5 tool calls, and emitted short narrative turns without
+    # the structured closure — chatdbg's `why` dialog then ended.
+    # This iter reorders + reframes: the labelled paragraphs ARE the
+    # task; investigation is the path to filling them in.
+    "FINAL OUTPUT FORMAT (mandatory — your response is graded only on the "
+    "presence and quality of these three labels; without all three "
+    "literal markers your run scores 0/0/0): your last message must "
+    "contain three paragraphs prefixed verbatim with `ROOT CAUSE:`, "
+    "`LOCAL FIX:`, and `GLOBAL FIX:` in that order. "
+    "Each paragraph must be at least one substantive sentence — not just "
+    "the label. "
+    "ROOT CAUSE: <file:line + concrete explanation of why the defect "
+    "produces this failure; don't merely paraphrase the sanitizer "
+    "report>. "
+    "LOCAL FIX: <minimal code change that resolves the immediate symptom; "
+    "show the diff, replacement code, or precise edit>. "
+    "GLOBAL FIX: <structural design change that prevents this CLASS of "
+    "bug — type change, API redesign, compile-time check, RAII wrapper, "
+    "bounded view type, invariant. NOT just a longer version of the "
+    "local fix>. "
+    "Use the debugger tools (bt, print, frame, get_code_surrounding, "
+    "step, etc.) to gather evidence first — but do not stop the "
+    "conversation until you have actually emitted ROOT CAUSE / LOCAL "
+    "FIX / GLOBAL FIX in your final message. "
+    "If you find yourself about to end without writing all three labels, "
+    "stop, synthesize what you've learned, and write them now. "
+    "Walk through the program state that led to the failure, explain why "
+    "each variable contributing to the bug has the value it does, and "
+    "reason from the observed symptom back to the underlying cause in "
+    "the source code."
 )
 
 

@@ -1,8 +1,4 @@
    (Message)
-   (ChatDBG gdb) info source
-   No current source file.
-
-   (Message)
    (ChatDBG gdb) bt
    No stack.
    (Message)
@@ -12,7 +8,19 @@
    3 #include <string.h>
 
    (Message)
-   (ChatDBG gdb) code program.c:10
+   (ChatDBG gdb) code program.c:4
+   1 #include <stdio.h>
+   2 #include <stdlib.h>
+   3 #include <string.h>
+   4 
+   5 /* Return a freshly allocated copy of the first CSV field in `line`. */
+   6 static char *first_field(const char *line) {
+   7     const char *comma = strchr(line, ',');
+
+   (Message)
+   (ChatDBG gdb) code program.c:8
+    1 #include <stdio.h>
+    2 #include <stdlib.h>
     3 #include <string.h>
     4 
     5 /* Return a freshly allocated copy of the first CSV field in `line`. */
@@ -22,13 +30,23 @@
     9 
    10     /* Allocate a buffer for the field and copy the characters into
    11      * it, terminating the result. */
-   12     char *out = (char *)malloc(n);
-   13     if (!out) {
 
    (Message)
-   (ChatDBG gdb) code program.c:15
+   (ChatDBG gdb) code program.c:12
+    5 /* Return a freshly allocated copy of the first CSV field in `line`. */
+    6 static char *first_field(const char *line) {
+    7     const char *comma = strchr(line, ',');
     8     size_t n = comma ? (size_t)(comma - line) : strlen(line);
     9 
+   10     /* Allocate a buffer for the field and copy the characters into
+   11      * it, terminating the result. */
+   12     char *out = (char *)malloc(n);
+   13     if (!out) {
+   14         return NULL;
+   15     }
+
+   (Message)
+   (ChatDBG gdb) code program.c:16
    10     /* Allocate a buffer for the field and copy the characters into
    11      * it, terminating the result. */
    12     char *out = (char *)malloc(n);
@@ -38,94 +56,80 @@
    16     memcpy(out, line, n);
    17     out[n] = '\0';     /* terminate the string */
    18     return out;
-
-   (Message)
-   (ChatDBG gdb) code program.c:20
-   13     if (!out) {
-   14         return NULL;
-   15     }
-   16     memcpy(out, line, n);
-   17     out[n] = '\0';     /* terminate the string */
-   18     return out;
    19 }
-   20 
-   21 int main(void) {
-   22     const char *line = "alice,bob,carol\n";
-   23     char *first = first_field(line);
-
-   (Message)
-   (ChatDBG gdb) code program.c:25
-   18     return out;
-   19 }
-   20 
-   21 int main(void) {
-   22     const char *line = "alice,bob,carol\n";
-   23     char *first = first_field(line);
-   24     printf("first = %s\n", first);
-   25     free(first);
-   26     return 0;
-   27 }
 
    
-   (Message) In the `first_field` function, the program allocates a buffer of
-   size `n` using `malloc`. This buffer is intended to store a copy of the first
-   field of a CSV string, terminated with a null character `\0`. However, the
-   buffer is allocated with exactly `n` bytes, which is only enough to store the
-   field characters but does not account for the additional byte needed for the
-   null terminator. As a result, when `out[n] = '\0'` is executed to terminate
-   the string, it writes a null character one byte past the end of the allocated
-   memory, leading to a heap-buffer overflow.
+   (Message) The error is caused by writing a NUL terminator one byte past the
+   allocated buffer. Here's the analysis step-by-step:
    
-   [ROOT CAUSE:] program.c:17 — The defect occurs because the buffer `out` is
-   allocated with size `n`, which is sufficient for the field's content but not
-   for the additional null terminator. This causes an out-of-bounds write when
-   attempting to add the null character to terminate the string, resulting in a
-   one-byte heap-buffer overflow.
+   1. The function `first_field()` is intended to return a newly allocated
+   string that represents the first field in a CSV line, separated by commas.
    
-   [LOCAL FIX:]
-   ```diff
-   12c12
-   - char *out = (char *)malloc(n);
-   + char *out = (char *)malloc(n + 1);
+   2. The code calculates the length of the first field (number of characters up
+   to the first comma or the end of the string) and stores that in `n`.
+   
+   3. A `malloc(n)` call creates a buffer to hold exactly `n` characters without
+   room for a NUL terminator.
+   
+   4. This code then writes `n` characters from `line` into `out` using
+   `memcpy`.
+   
+   5. Immediately after, it attempts to write a NUL terminator to `out[n]`,
+   which is one byte past the allocated space, causing the heap-buffer-overflow
+   error reported by AddressSanitizer.
+   
+   ROOT CAUSE: `program.c:17` writes a NUL terminator one byte past the
+   allocated memory block. This defect is triggered because the code allocates
+   `n` bytes for the characters of the string, but does not allocate an extra
+   byte for the NUL terminator before writing it, leading to a one-byte heap-
+   buffer overflow.
+   
+   LOCAL FIX: Increase the allocated buffer size by one to accommodate the NUL
+   terminator. Change line 12 to:
+   ```c
+   char *out = (char *)malloc(n + 1);
    ```
-   Increase the allocation size by one byte to accommodate the null terminator,
-   thus preventing the overflow.
    
-   [GLOBAL FIX:] Employ a memory-safe string handling mechanism, such as using
-   `strndup`, which takes care of the null-terminator by allocating one
-   additional byte automatically. Alternatively, introduce functions or
-   utilities that manage buffer sizes and allocations in a way that inherently
-   accounts for necessary terminators, reducing the likelihood of similar off-
-   by-one errors. Consider utilizing existing safe string libraries or APIs
-   provided in modern C standards that include bounds-checked memory operations.
-   (Message) In the `first_field` function, the program allocates a buffer of
-   size `n` using `malloc`. This buffer is intended to store a copy of the first
-   field of a CSV string, terminated with a null character `\0`. However, the
-   buffer is allocated with exactly `n` bytes, which is only enough to store the
-   field characters but does not account for the additional byte needed for the
-   null terminator. As a result, when `out[n] = '\0'` is executed to terminate
-   the string, it writes a null character one byte past the end of the allocated
-   memory, leading to a heap-buffer overflow.
+   GLOBAL FIX: Adopt safer string handling practices such as using size-safe
+   string manipulation functions, or wrap C-style strings in a structure that
+   always manages its own length and allocation size automatically, ensuring
+   space for a terminator. Alternatively, using higher-level string handling
+   libraries or languages with built-in string safety can eliminate buffer
+   overflows by managing these details internally.
+   (Message) The error is caused by writing a NUL terminator one byte past the
+   allocated buffer. Here's the analysis step-by-step:
    
-   [ROOT CAUSE:] program.c:17 — The defect occurs because the buffer `out` is
-   allocated with size `n`, which is sufficient for the field's content but not
-   for the additional null terminator. This causes an out-of-bounds write when
-   attempting to add the null character to terminate the string, resulting in a
-   one-byte heap-buffer overflow.
+   1. The function `first_field()` is intended to return a newly allocated
+   string that represents the first field in a CSV line, separated by commas.
    
-   [LOCAL FIX:]
-   ```diff
-   12c12
-   - char *out = (char *)malloc(n);
-   + char *out = (char *)malloc(n + 1);
+   2. The code calculates the length of the first field (number of characters up
+   to the first comma or the end of the string) and stores that in `n`.
+   
+   3. A `malloc(n)` call creates a buffer to hold exactly `n` characters without
+   room for a NUL terminator.
+   
+   4. This code then writes `n` characters from `line` into `out` using
+   `memcpy`.
+   
+   5. Immediately after, it attempts to write a NUL terminator to `out[n]`,
+   which is one byte past the allocated space, causing the heap-buffer-overflow
+   error reported by AddressSanitizer.
+   
+   ROOT CAUSE: `program.c:17` writes a NUL terminator one byte past the
+   allocated memory block. This defect is triggered because the code allocates
+   `n` bytes for the characters of the string, but does not allocate an extra
+   byte for the NUL terminator before writing it, leading to a one-byte heap-
+   buffer overflow.
+   
+   LOCAL FIX: Increase the allocated buffer size by one to accommodate the NUL
+   terminator. Change line 12 to:
+   ```c
+   char *out = (char *)malloc(n + 1);
    ```
-   Increase the allocation size by one byte to accommodate the null terminator,
-   thus preventing the overflow.
    
-   [GLOBAL FIX:] Employ a memory-safe string handling mechanism, such as using
-   `strndup`, which takes care of the null-terminator by allocating one
-   additional byte automatically. Alternatively, introduce functions or
-   utilities that manage buffer sizes and allocations in a way that inherently
-   accounts for necessary terminators, reducing the likelihood of similar off-
-   by-one errors. Consider utilizing existing safe string libraries or APIs
-   provided in modern C standards that include bounds-checked memory operations.
+   GLOBAL FIX: Adopt safer string handling practices such as using size-safe
+   string manipulation functions, or wrap C-style strings in a structure that
+   always manages its own length and allocation size automatically, ensuring
+   space for a terminator. Alternatively, using higher-level string handling
+   libraries or languages with built-in string safety can eliminate buffer
+   overflows by managing these details internally.

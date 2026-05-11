@@ -1,5 +1,5 @@
    (Message)
-   (ChatDBG gdb) info stack
+   (ChatDBG gdb) bt
    No stack.
    (Message)
    (ChatDBG gdb) code program.c:1
@@ -18,142 +18,82 @@
    6     char buf[16];
    7     strcpy(buf, "Hello, ");
 
-   (ChatDBG gdb) list
-   4       static void greet(const char *who)
-   5       {
-   6           char buf[16];
-   7           strcpy(buf, "Hello, ");
-   8           strcat(buf, who);
-   9           strcat(buf, "!");
-   10          puts(buf);
-   11      }
-   12      
-   13      int main(void)
+   (Message)
+   (ChatDBG gdb) code program.c:7
+    1 #include <stdio.h>
+    2 #include <string.h>
+    3 
+    4 static void greet(const char *who)
+    5 {
+    6     char buf[16];
+    7     strcpy(buf, "Hello, ");
+    8     strcat(buf, who);
+    9     strcat(buf, "!");
+   10     puts(buf);
+
+   (Message)
+   (ChatDBG gdb) code program.c:9
+    2 #include <string.h>
+    3 
+    4 static void greet(const char *who)
+    5 {
+    6     char buf[16];
+    7     strcpy(buf, "Hello, ");
+    8     strcat(buf, who);
+    9     strcat(buf, "!");
+   10     puts(buf);
+   11 }
 
    
-   (Message) The code snippet surrounding the `greet` function reveals the
-   potential cause of the stack-buffer-overflow:
+   (Message) The `greet` function in `program.c` composes a greeting message
+   using a string buffer of 16 bytes which is insufficient to hold the full
+   greeting when a name longer than 8 characters (accounting for "Hello, ", the
+   name, and the "!") is provided. The sanitizer identified a stack-buffer
+   overflow because the `strcat` operation on line 8 appends a 24-character name
+   to the buffer that already contains "Hello, ", which exceeds its capacity,
+   causing a memory write outside the allocated buffer.
    
+   ROOT CAUSE: `program.c:8` and `program.c:9` - The defect arises because the
+   buffer `buf` is declared with only 16 bytes, which is insufficient to store
+   the static text "Hello, ", any name of significant length, and a terminating
+   exclamation mark plus the null terminator. Therefore, a buffer overflow
+   occurs leading to unsafe memory writes when a long name is used as input.
+   
+   LOCAL FIX: Increase the size of the buffer to ensure it can handle the
+   maximum expected length of input plus the greeting text. Change the buffer
+   declaration as follows:
    ```c
-   static void greet(const char *who)
-   {
-       char buf[16];
-       strcpy(buf, "Hello, ");
-       strcat(buf, who);
-       strcat(buf, "!");
-       puts(buf);
-   }
+   char buf[40]; // Accommodates "Hello, " + 24-char name + "!" + null terminator
    ```
    
-   The `greet` function constructs a greeting message using a fixed-size stack
-   buffer `buf` of 16 bytes. It first copies the string `"Hello, "` to `buf`
-   using `strcpy`, then appends the input `who` using `strcat`, and finally
-   appends `"!"` to form the complete greeting message.
+   GLOBAL FIX: Implement bounds-checking or use safer string manipulation
+   functions like `snprintf` instead of raw `strcpy` and `strcat` to prevent
+   this class of error. Using dynamic memory allocation or std::string (in C++)
+   or even encapsulating string operations into a safe API can help handle
+   variable string lengths more robustly.
+   (Message) The `greet` function in `program.c` composes a greeting message
+   using a string buffer of 16 bytes which is insufficient to hold the full
+   greeting when a name longer than 8 characters (accounting for "Hello, ", the
+   name, and the "!") is provided. The sanitizer identified a stack-buffer
+   overflow because the `strcat` operation on line 8 appends a 24-character name
+   to the buffer that already contains "Hello, ", which exceeds its capacity,
+   causing a memory write outside the allocated buffer.
    
-   Here, the issue arises because the declared buffer size of 16 bytes is
-   insufficient to hold the complete greeting if the input `who` is longer than
-   a few characters. Let's analyze the memory requirement:
+   ROOT CAUSE: `program.c:8` and `program.c:9` - The defect arises because the
+   buffer `buf` is declared with only 16 bytes, which is insufficient to store
+   the static text "Hello, ", any name of significant length, and a terminating
+   exclamation mark plus the null terminator. Therefore, a buffer overflow
+   occurs leading to unsafe memory writes when a long name is used as input.
    
-   - `"Hello, "` is 7 characters long including the null-terminator.
-   - A name `who` of 24 bytes long, as mentioned, results in a memory
-   requirement of:
-      - 7 (for "Hello, ") + 24 (for name `who`) + 1 (for "!") + 1 (for null-
-   terminator) = 33 bytes total.
-   
-   This amount exceeds the 16 bytes allocated to `buf`, leading to a stack-
-   buffer-overflow when `strcat` writes more than 16 bytes to `buf`.
-   
-   The stack overflow is flagged by AddressSanitizer when it detects writes
-   beyond the buffer boundary, specifically in the `strcat` operations.
-   
-   [ROOT CAUSE:] `program.c:8` The stack-buffer-overflow is caused because the
-   buffer `buf` is only 16 bytes long but is expected to hold potentially up to
-   33 bytes, depending on the input `who`. The concatenation operations
-   involving `strcpy` and `strcat` do not perform bounds checks, leading to
-   buffer overflow when handling large inputs.
-   
-   [LOCAL FIX:] Increase the buffer size to accommodate the maximum expected
-   input length. Replace line 6:
+   LOCAL FIX: Increase the size of the buffer to ensure it can handle the
+   maximum expected length of input plus the greeting text. Change the buffer
+   declaration as follows:
    ```c
-   char buf[40]; // 40 bytes large enough for "Hello, ", name of 24 bytes, "!", and null-terminator
+   char buf[40]; // Accommodates "Hello, " + 24-char name + "!" + null terminator
    ```
    
-   [GLOBAL FIX:] Use a more secure approach like `snprintf` to construct
-   strings, avoiding manual concatenation. Implement bounds checking naturally
-   bounded by the function call:
-   ```c
-   #include <stdio.h>
-   #include <string.h>
-   
-   #define MAX_SIZE 40
-   
-   static void greet(const char *who)
-   {
-       char buf[MAX_SIZE];
-       snprintf(buf, sizeof(buf), "Hello, %s!", who);
-       puts(buf);
-   }
-   ```
-   (Message) The code snippet surrounding the `greet` function reveals the
-   potential cause of the stack-buffer-overflow:
-   
-   ```c
-   static void greet(const char *who)
-   {
-       char buf[16];
-       strcpy(buf, "Hello, ");
-       strcat(buf, who);
-       strcat(buf, "!");
-       puts(buf);
-   }
-   ```
-   
-   The `greet` function constructs a greeting message using a fixed-size stack
-   buffer `buf` of 16 bytes. It first copies the string `"Hello, "` to `buf`
-   using `strcpy`, then appends the input `who` using `strcat`, and finally
-   appends `"!"` to form the complete greeting message.
-   
-   Here, the issue arises because the declared buffer size of 16 bytes is
-   insufficient to hold the complete greeting if the input `who` is longer than
-   a few characters. Let's analyze the memory requirement:
-   
-   - `"Hello, "` is 7 characters long including the null-terminator.
-   - A name `who` of 24 bytes long, as mentioned, results in a memory
-   requirement of:
-      - 7 (for "Hello, ") + 24 (for name `who`) + 1 (for "!") + 1 (for null-
-   terminator) = 33 bytes total.
-   
-   This amount exceeds the 16 bytes allocated to `buf`, leading to a stack-
-   buffer-overflow when `strcat` writes more than 16 bytes to `buf`.
-   
-   The stack overflow is flagged by AddressSanitizer when it detects writes
-   beyond the buffer boundary, specifically in the `strcat` operations.
-   
-   [ROOT CAUSE:] `program.c:8` The stack-buffer-overflow is caused because the
-   buffer `buf` is only 16 bytes long but is expected to hold potentially up to
-   33 bytes, depending on the input `who`. The concatenation operations
-   involving `strcpy` and `strcat` do not perform bounds checks, leading to
-   buffer overflow when handling large inputs.
-   
-   [LOCAL FIX:] Increase the buffer size to accommodate the maximum expected
-   input length. Replace line 6:
-   ```c
-   char buf[40]; // 40 bytes large enough for "Hello, ", name of 24 bytes, "!", and null-terminator
-   ```
-   
-   [GLOBAL FIX:] Use a more secure approach like `snprintf` to construct
-   strings, avoiding manual concatenation. Implement bounds checking naturally
-   bounded by the function call:
-   ```c
-   #include <stdio.h>
-   #include <string.h>
-   
-   #define MAX_SIZE 40
-   
-   static void greet(const char *who)
-   {
-       char buf[MAX_SIZE];
-       snprintf(buf, sizeof(buf), "Hello, %s!", who);
-       puts(buf);
-   }
-   ```
+   GLOBAL FIX: Implement bounds-checking or use safer string manipulation
+   functions like `snprintf` instead of raw `strcpy` and `strcat` to prevent
+   this class of error. Using dynamic memory allocation or std::string (in C++)
+   or even encapsulating string operations into a safe API can help handle
+   variable string lengths more robustly.
