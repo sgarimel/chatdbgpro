@@ -47,6 +47,25 @@ def _slugify(model: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", model.lower()).strip("-")
 
 
+
+def _is_corpus_case(case_id: str) -> bool:
+    """Return True if case_id is a BugsCPP corpus.db bug. Caches the
+    corpus.db case set on first call."""
+    global _CORPUS_CASES
+    try:
+        _CORPUS_CASES
+    except NameError:
+        import sqlite3
+        db = REPO_ROOT / "data" / "corpus.db"
+        if not db.exists():
+            _CORPUS_CASES = set()
+        else:
+            con = sqlite3.connect(str(db))
+            _CORPUS_CASES = {r[0] for r in con.execute(
+                "select bug_id from bugs where included_in_corpus=1")}
+            con.close()
+    return case_id in _CORPUS_CASES
+
 def _read_runset(path: Path):
     with path.open("r", encoding="utf-8", newline="") as f:
         for row in csv.DictReader(f, delimiter="\t"):
@@ -98,31 +117,33 @@ def main() -> int:
     for (tier, model), cases in sorted(by_tier_model.items()):
         sweep = f"{args.owner}-paper-final-{args.panel}-{date_tag}-T{tier}-{_slugify(model)}"
         cases_sorted = sorted(set(cases))
-        cmd = [
-            sys.executable, "-m", "bench.parallel_run",
-            "--bug-ids", *cases_sorted,
-            "--tiers", str(tier),
-            "--models", model,
-            "--name", sweep,
-            "--runtime", args.runtime,
-            "--timeout", str(args.timeout),
-            "--workers", str(args.workers),
-        ]
-        if args.panel == "synthetic":
-            # Synthetic case ids are case.yaml manifests under bench/cases/,
-            # not rows in corpus.db. Force the orchestrator's on-disk
-            # --cases path; --runtime is ignored downstream in this mode.
-            cmd.append("--no-docker")
-        if args.dry_run:
-            cmd.append("--dry-run")
-        print(f"[shard] >>> T{tier} {model}: {len(cases_sorted)} cases -> sweep={sweep}",
-              flush=True)
-        print(f"        {' '.join(cmd)}", flush=True)
-        r = subprocess.run(cmd, cwd=str(REPO_ROOT))
-        if r.returncode != 0:
-            rc_overall = r.returncode
-            print(f"[shard] !!! group T{tier} {model} returned rc={r.returncode}; "
-                  f"continuing with next group", file=sys.stderr)
+        corpus = sorted(c for c in cases_sorted if _is_corpus_case(c))
+        synth = sorted(c for c in cases_sorted if not _is_corpus_case(c))
+        for subgroup_kind, subgroup_cases in [("corpus", corpus), ("synth", synth)]:
+            if not subgroup_cases:
+                continue
+            cmd = [
+                sys.executable, "-m", "bench.parallel_run",
+                "--bug-ids", *subgroup_cases,
+                "--tiers", str(tier),
+                "--models", model,
+                "--name", sweep,
+                "--runtime", args.runtime,
+                "--timeout", str(args.timeout),
+                "--workers", str(args.workers),
+            ]
+            if subgroup_kind == "synth" or args.panel == "synthetic":
+                cmd.append("--no-docker")
+            if args.dry_run:
+                cmd.append("--dry-run")
+            print(f"[shard] >>> T{tier} {model} ({subgroup_kind}): "
+                  f"{len(subgroup_cases)} cases -> sweep={sweep}", flush=True)
+            print(f"        {' '.join(cmd)}", flush=True)
+            r = subprocess.run(cmd, cwd=str(REPO_ROOT))
+            if r.returncode != 0:
+                rc_overall = r.returncode
+                print(f"[shard] !!! group T{tier} {model} {subgroup_kind} "
+                      f"returned rc={r.returncode}; continuing", file=sys.stderr)
     return rc_overall
 
 
