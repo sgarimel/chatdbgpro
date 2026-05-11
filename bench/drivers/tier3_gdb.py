@@ -140,7 +140,12 @@ def _repo_venv_site_packages() -> str | None:
     """Return the bench venv's site-packages path, if a venv exists
     AND its compiled extensions match the current platform.
 
-    Three layouts are supported:
+    Layouts supported, in order:
+      `$CHATDBG_VENV`   — explicit override, used when the venv lives
+                         outside the repo (e.g. Anika's WSL setup with
+                         the venv at ~/.venvs/chatdbg-bench because the
+                         repo is on OneDrive/NTFS-via-WSL and unusable
+                         for thousands of small site-packages writes).
       `.venv`           — repo/runtime env used by WSL/Linux native runs.
                          Prefer this when present so Mini-SWE's separate
                          `.venv-bench` can keep its own dependency versions.
@@ -159,8 +164,13 @@ def _repo_venv_site_packages() -> str | None:
     """
     import sysconfig
     host_ext_suffix = sysconfig.get_config_var("EXT_SUFFIX") or ""
+    candidates: list[Path] = []
+    chatdbg_venv = os.environ.get("CHATDBG_VENV")
+    if chatdbg_venv:
+        candidates.append(Path(chatdbg_venv))
     for name in (".venv", ".venv-bench-39", ".venv-bench"):
-        venv = REPO_DIR / name
+        candidates.append(REPO_DIR / name)
+    for venv in candidates:
         if not venv.exists():
             continue
         matches = list((venv / "lib").glob("python*/site-packages"))
@@ -692,37 +702,60 @@ class Tier3Driver:
         collect_path = run_dir / "collect.json"
         env = self._chatdbg_env(spec, run_dir, collect_path)
 
-        if self.debugger != "lldb":
-            # gdb for injected cases is plausible (we'd need to call
-            # `file <binary>` from the cwd) but not wired in the pilot.
-            raise ValueError(
-                f"injected_repo only supports lldb for now, got {self.debugger}"
-            )
-
         debug_cfg = spec.case.meta.get("debug", {})
         args = debug_cfg.get("args", [])
         stdin_data = debug_cfg.get("stdin_data")
 
-        lines = ["command script import chatdbg.chatdbg_lldb"]
-        if args:
-            lines.append("settings set target.run-args "
-                         + " ".join(shlex.quote(str(a)) for a in args))
+        stdin_file: Path | None = None
         if stdin_data is not None:
             stdin_file = run_dir / "stdin.bin"
             stdin_file.write_bytes(stdin_data.encode() if isinstance(stdin_data, str)
                                    else stdin_data)
-            lines.append(f"settings set target.input-path {stdin_file}")
-        lines.append("run")
-        lines.append(f"why {spec.question}")
-        script = "\n".join(lines) + "\n"
-        (run_dir / "session.cmds").write_text(script)
 
-        argv = [
-            lldb_binary(),
-            "-o", "settings set use-color false",
-            "-s", str(run_dir / "session.cmds"),
-            "--", str(binary),
-        ]
+        if self.debugger == "lldb":
+            lines = ["command script import chatdbg.chatdbg_lldb"]
+            if args:
+                lines.append("settings set target.run-args "
+                             + " ".join(shlex.quote(str(a)) for a in args))
+            if stdin_file is not None:
+                lines.append(f"settings set target.input-path {stdin_file}")
+            lines.append("run")
+            lines.append(f"why {spec.question}")
+            script = "\n".join(lines) + "\n"
+            (run_dir / "session.cmds").write_text(script)
+            argv = [
+                lldb_binary(),
+                "-o", "settings set use-color false",
+                "-s", str(run_dir / "session.cmds"),
+                "--", str(binary),
+            ]
+        elif self.debugger == "gdb":
+            # gdb path for injected_repo: mirrors the synthetic gdb script
+            # (build_gdb_script) but pulls args/stdin from `case.meta["debug"]`
+            # instead of `case.meta["run"]`, and passes the binary as a
+            # positional arg so `file <binary>` isn't needed inside the script.
+            lines = [f"source {REPO_DIR / 'src' / 'chatdbg' / 'chatdbg_gdb.py'}"]
+            if args:
+                lines.append("set args "
+                             + " ".join(shlex.quote(str(a)) for a in args))
+            # For stdin redirection, gdb's `run < file` is parsed by gdb's
+            # own command line and forwarded to the inferior. Works in
+            # -batch-silent mode.
+            run_line = "run"
+            if stdin_file is not None:
+                run_line = f"run < {shlex.quote(str(stdin_file))}"
+            lines.append(run_line)
+            lines.append(f"why {spec.question}")
+            script = "\n".join(lines) + "\n"
+            (run_dir / "session.cmds").write_text(script)
+            argv = ["gdb", "-nx", "-batch-silent",
+                    "-x", str(run_dir / "session.cmds"),
+                    str(binary)]
+        else:
+            raise ValueError(
+                f"injected_repo: unsupported debugger {self.debugger!r}; "
+                "expected 'lldb' or 'gdb'."
+            )
 
         start = time.time()
         try:
