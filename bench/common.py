@@ -74,9 +74,27 @@ def _resolve_workspace_path(raw: str, bug_id: str, project: str,
     return canonical
 
 DEFAULT_QUESTION = (
-    "What is the root cause of this crash? Walk through the program "
-    "state, identify the defect, and propose a fix in code. Cover both "
-    "a minimal local fix and a more thorough root-cause fix if they differ."
+    "What is the root cause of this crash? Walk through the program state, "
+    "identify the defect, and propose a fix in code. Cover both a minimal "
+    "local fix and a more thorough root-cause fix if they differ. "
+    # NOTE: this prompt feeds gdb's `why <prompt>` command — keep it on a
+    # SINGLE LINE (no embedded newlines), or gdb's command parser will
+    # treat lines 2+ as separate gdb commands and break the script.
+    "Your final response MUST end with three labelled paragraphs in this "
+    "exact format (used verbatim — do not omit the labels or alter the "
+    "wording): "
+    "[ROOT CAUSE:] file:line and what is wrong, in your own words — "
+    "don't just paraphrase the sanitizer report, explain why the defect "
+    "produces this failure. "
+    "[LOCAL FIX:] minimal code change that resolves the immediate symptom; "
+    "show the diff or replacement code. "
+    "[GLOBAL FIX:] structural design change that prevents this CLASS of "
+    "bug (type change, API redesign, compile-time check, RAII wrapper, "
+    "bounded view type, invariant). Not just a bigger version of the "
+    "local fix. "
+    "The grader scores by matching these three sections against the case "
+    "criteria; responses missing the literal labels ROOT CAUSE / LOCAL "
+    "FIX / GLOBAL FIX score 0."
 )
 
 
