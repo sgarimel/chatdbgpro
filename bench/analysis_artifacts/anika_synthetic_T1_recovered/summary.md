@@ -8,8 +8,8 @@ Source: `bench/results/final_paper_bench/synthetic`. `full RC/LF/GF` counts cell
 | T1 | google gemini-3.1-flash-lite-preview | 16 | 16 | 0 | 0 | 10 | 5 | 0 | 6 |
 | T1 | meta-llama llama-3.1-8b-instruct | 20 | 18 | 2 | 0 | 16 | 0 | 2 | 2 |
 | T1 | nvidia nemotron-3-nano-30b-a3b | 16 | 1 | 15 | 0 | 2 | 0 | 0 | 14 |
-| T1 | openai gpt-4o | 20 | 16 | 4 | 0 | 7 | 0 | 0 | 13 |
+| T1 | openai gpt-4o | 20 | 20 | 0 | 0 | 17 | 6 | 3 | 0 |
 | T1 | openai gpt-5.5 | 12 | 12 | 0 | 0 | 12 | 0 | 0 | 0 |
 | T1 | qwen qwen3-30b-a3b-instruct-2507 | 12 | 11 | 1 | 0 | 8 | 0 | 0 | 4 |
 | T1 | x-ai grok-4 | 16 | 14 | 2 | 0 | 12 | 0 | 1 | 3 |
-| | **TOTAL** | **128** | **104** | **24** | **0** | **83** | **5** | **3** | **42** |
+| | **TOTAL** | **128** | **108** | **20** | **0** | **93** | **11** | **6** | **29** |

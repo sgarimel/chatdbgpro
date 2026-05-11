@@ -77,6 +77,36 @@ interact with a Unix shell to investigate bugs and produce diagnoses.
 DEBUG_INSTANCE_TEMPLATE = """\
 {{task}}
 
+<critical_submission_protocol>
+**Output channel — read carefully:** in this environment, your assistant
+`content` field is NOT a delivery channel. Anything you write there is
+discarded by the harness. The ONLY way to communicate with the judge —
+including your final ROOT CAUSE / LOCAL FIX / GLOBAL FIX diagnosis — is
+through bash tool calls. Treat the task as a pipeline:
+
+  1. Investigate via bash tool calls (run the binary, inspect source,
+     run gdb in batch mode, etc.).
+  2. **Emit your full diagnosis by calling the `bash` tool with a single
+     `cat <<'EOF'` heredoc whose body is the three labelled paragraphs.**
+     This is your "write the diagnosis" step. Example tool call argument:
+
+         {"command": "cat <<'CHATDBG_DIAG_EOF'\nROOT CAUSE: <your prose, file:line + explanation>\n\nLOCAL FIX: <your prose, minimal code change>\n\nGLOBAL FIX: <your prose, structural fix>\nCHATDBG_DIAG_EOF"}
+
+     The tool will echo the heredoc to stdout. That stdout IS your
+     submission — the harness reads the diagnosis from it.
+  3. After the diagnosis heredoc has been echoed, emit ONE more bash
+     tool call to terminate the session:
+     `{"command": "echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"}`.
+
+**Do NOT write the diagnosis as plain assistant text and then submit.**
+The text will be silently discarded — you will see this as the harness
+sending you "Tool call error" reminders until you hit a step limit. The
+diagnosis must travel inside a `bash` tool call's `command` argument.
+
+This is a tool-only protocol: think of `content` as having no audience,
+and `tool_calls` as the only microphone in the room.
+</critical_submission_protocol>
+
 <instructions>
 # Task Instructions
 
@@ -590,6 +620,36 @@ def main() -> int:
     # contains 'claude'/'sonnet'/'opus'. We delegate auto-selection
     # logic to mini rather than reimplementing it.
     model = get_model(args.model, model_config)
+
+    # Optional hook: when CHATDBG_LOG_REJECTED=1, capture every raw model
+    # response into <run_dir>/rejected_responses.jsonl BEFORE mini's
+    # `_parse_actions` decides whether to accept or reject it. Responses
+    # without tool_calls are silently dropped by mini's protocol — this
+    # log is the only way to see what models like gpt-4o tried to say
+    # in their (rejected) text-only attempts.
+    if os.environ.get("CHATDBG_LOG_REJECTED") == "1":
+        sidecar = run_dir / "rejected_responses.jsonl"
+        _orig_query = model._query
+        _attempt_counter = {"n": 0}
+        def _logged_query(messages, **kwargs):
+            response = _orig_query(messages, **kwargs)
+            _attempt_counter["n"] += 1
+            try:
+                msg = response.choices[0].message
+                tool_calls = getattr(msg, "tool_calls", None) or []
+                with sidecar.open("a", encoding="utf-8") as f:
+                    f.write(json.dumps({
+                        "attempt": _attempt_counter["n"],
+                        "finish_reason": response.choices[0].finish_reason,
+                        "n_tool_calls": len(tool_calls),
+                        "tool_call_names": [tc.function.name for tc in tool_calls],
+                        "content": msg.content,
+                        "content_len": len(msg.content or ""),
+                    }) + "\n")
+            except Exception:
+                pass
+            return response
+        model._query = _logged_query
 
     if args.docker_container:
         env = _build_docker_environment(
