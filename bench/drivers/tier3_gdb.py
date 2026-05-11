@@ -889,6 +889,25 @@ class Tier3Driver:
         where Apple's lldb embeds Python 3.9 (see lldb_binary()); the
         rest is just ChatDBG's normal runtime config surfaced via env."""
         env = os.environ.copy()
+
+        # Under gdb (and lldb), ASan/UBSan default to calling _exit() on
+        # error which the debugger sees as a normal exit (gdb reports
+        # "exited with code 01") — chatdbg's stop_handler then records
+        # no signal and the prompt becomes "stopped (no-signal)", giving
+        # the model nothing concrete to investigate. abort_on_error=1
+        # makes the sanitizers raise SIGABRT instead, so the debugger
+        # catches the crash with a real stop_signal and a backtrace
+        # that lands inside the sanitizer's runtime (one frame up = the
+        # bug). Defaults preserve any caller override.
+        env.setdefault("ASAN_OPTIONS",
+                       "abort_on_error=1:halt_on_error=1:detect_leaks=0")
+        env.setdefault("UBSAN_OPTIONS",
+                       "abort_on_error=1:halt_on_error=1:"
+                       "print_stacktrace=1")
+        env.setdefault("MSAN_OPTIONS",
+                       "abort_on_error=1:halt_on_error=1")
+        env.setdefault("LSAN_OPTIONS",
+                       "abort_on_error=1")
         env["CHATDBG_MODEL"] = spec.model
         env["CHATDBG_TOOL_CONFIG"] = str(spec.tool_config_path)
         env["CHATDBG_COLLECT_DATA"] = str(collect_path)
