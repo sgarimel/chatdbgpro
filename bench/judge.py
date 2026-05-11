@@ -97,6 +97,16 @@ def build_user_prompt(run_dir: Path) -> tuple[str, dict] | None:
                 except UnicodeDecodeError:
                     source = cached.read_text(errors="replace")
                 source_file = rc_file
+    if source is None and source_file:
+        # Synthetic cases: source lives at bench/cases/[paper/]<id>/<source_file>
+        # but isn't always copied into the run dir at run time.
+        case_id = case.get("id", "")
+        candidates = list((BENCH_DIR / "cases").rglob(f"{case_id}/{source_file}"))
+        if candidates:
+            try:
+                source = candidates[0].read_text()
+            except UnicodeDecodeError:
+                source = candidates[0].read_text(errors="replace")
     if source is None:
         return None
     if len(source) > MAX_SRC_CHARS:

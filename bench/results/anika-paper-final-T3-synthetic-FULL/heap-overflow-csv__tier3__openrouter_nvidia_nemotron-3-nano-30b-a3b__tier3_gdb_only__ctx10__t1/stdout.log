@@ -1,0 +1,138 @@
+   (Message)
+   (ChatDBG gdb) bt
+   No stack.
+   (Message)
+   (ChatDBG gdb) code program.c:50
+   
+
+   (Message)
+   (ChatDBG gdb) code program.c:50
+   
+
+   (Message)
+   (ChatDBG gdb) code program.c:1
+   1 #include <stdio.h>
+   2 #include <stdlib.h>
+   3 #include <string.h>
+
+   (Message)
+   (ChatDBG gdb) code program.c:100
+   
+
+   (Message)
+   (ChatDBG gdb) code program.c:40
+   
+
+   (Message)
+   (ChatDBG gdb) code program.c:20
+   13     if (!out) {
+   14         return NULL;
+   15     }
+   16     memcpy(out, line, n);
+   17     out[n] = '\0';     /* terminate the string */
+   18     return out;
+   19 }
+   20 
+   21 int main(void) {
+   22     const char *line = "alice,bob,carol\n";
+   23     char *first = first_field(line);
+
+   (Message)
+   (ChatDBG gdb) code program.c:15
+    8     size_t n = comma ? (size_t)(comma - line) : strlen(line);
+    9 
+   10     /* Allocate a buffer for the field and copy the characters into
+   11      * it, terminating the result. */
+   12     char *out = (char *)malloc(n);
+   13     if (!out) {
+   14         return NULL;
+   15     }
+   16     memcpy(out, line, n);
+   17     out[n] = '\0';     /* terminate the string */
+   18     return out;
+
+   
+   (Message) ROOT CAUSE: In `program.c` at line 17 the function `first_field`
+   allocates a buffer of exactly `n` bytes (`malloc(n)`) and then writes `out[n]
+   = '\0'` to terminate the string. Because only `n` bytes were reserved, the
+   write to `out[n]` accesses memory immediately after the heap allocation,
+   triggering a one‑byte heap‑buffer‑overflow that AddressSanitizer reports. The
+   variables `n` (the field length without the terminator) and `out` (the
+   pointer returned by `malloc`) are both derived from the input line, so the
+   off‑by‑one error is guaranteed whenever a comma is present.
+   
+   LOCAL FIX: The minimal edit is to reserve space for the terminator by
+   allocating one extra byte:
+   
+   ```diff
+   -    char *out = (char *)malloc(n);
+   +    char *out = malloc(n + 1);  /* allocate space for NUL terminator */
+   ```
+   
+   With this change the subsequent `memcpy(out, line, n);` copies exactly `n`
+   characters and `out[n] = '\0'` writes within the allocated region,
+   eliminating the overflow.
+   
+   GLOBAL FIX: Refactor the code to avoid manual NUL‑terminated buffer
+   management altogether. For example, have `first_field` compute the required
+   size including the terminator and allocate that amount, or better, expose the
+   length of the extracted field rather than a NUL‑terminated string:
+   
+   ```c
+   struct field {
+       const char *ptr;
+       size_t      len;
+   };
+   
+   struct field first_field(const char *line) {
+       const char *comma = strchr(line, ',');
+       size_t n = comma ? (size_t)(comma - line) : strlen(line);
+       return (struct field){ .ptr = line, .len = n };
+   }
+   ```
+   
+   Using a length‑aware view eliminates reliance on a trailing NUL byte, making
+   it impossible to overflow the heap buffer and prevents this entire class of
+   off‑by‑one heap overflow bugs.
+   (Message) ROOT CAUSE: In `program.c` at line 17 the function `first_field`
+   allocates a buffer of exactly `n` bytes (`malloc(n)`) and then writes `out[n]
+   = '\0'` to terminate the string. Because only `n` bytes were reserved, the
+   write to `out[n]` accesses memory immediately after the heap allocation,
+   triggering a one‑byte heap‑buffer‑overflow that AddressSanitizer reports. The
+   variables `n` (the field length without the terminator) and `out` (the
+   pointer returned by `malloc`) are both derived from the input line, so the
+   off‑by‑one error is guaranteed whenever a comma is present.
+   
+   LOCAL FIX: The minimal edit is to reserve space for the terminator by
+   allocating one extra byte:
+   
+   ```diff
+   -    char *out = (char *)malloc(n);
+   +    char *out = malloc(n + 1);  /* allocate space for NUL terminator */
+   ```
+   
+   With this change the subsequent `memcpy(out, line, n);` copies exactly `n`
+   characters and `out[n] = '\0'` writes within the allocated region,
+   eliminating the overflow.
+   
+   GLOBAL FIX: Refactor the code to avoid manual NUL‑terminated buffer
+   management altogether. For example, have `first_field` compute the required
+   size including the terminator and allocate that amount, or better, expose the
+   length of the extracted field rather than a NUL‑terminated string:
+   
+   ```c
+   struct field {
+       const char *ptr;
+       size_t      len;
+   };
+   
+   struct field first_field(const char *line) {
+       const char *comma = strchr(line, ',');
+       size_t n = comma ? (size_t)(comma - line) : strlen(line);
+       return (struct field){ .ptr = line, .len = n };
+   }
+   ```
+   
+   Using a length‑aware view eliminates reliance on a trailing NUL byte, making
+   it impossible to overflow the heap buffer and prevents this entire class of
+   off‑by‑one heap overflow bugs.

@@ -1,4 +1,4 @@
-# Anomalies in Anika realworld sweep
+# Anomalies in Anomalies realworld sweep
 
 Total flagged cells: **27** / 85
 

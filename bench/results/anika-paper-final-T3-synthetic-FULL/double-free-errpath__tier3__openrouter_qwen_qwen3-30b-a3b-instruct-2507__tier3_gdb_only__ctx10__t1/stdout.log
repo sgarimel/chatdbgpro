@@ -1,0 +1,116 @@
+   (Message)
+   (ChatDBG gdb) bt
+   No stack.
+   (Message)
+   (ChatDBG gdb) info registers
+   The program has no registers now.
+   (Message)
+   (ChatDBG gdb) print b->name
+   No symbol "b" in current context.
+   (Message)
+   (ChatDBG gdb) code program.c:25
+   18         free(b);
+   19         return NULL;
+   20     }
+   21     /* Simulated recoverable parse error. */
+   22     if (strlen(name) > 4) {
+   23         free(b->name);      /* release the name on the recoverable error path */
+   24         b->size = 0;
+   25         return b;           /* hand the partially-initialised blob back */
+   26     }
+   27     b->size = strlen(b->name);
+   28     return b;
+
+   (Message)
+   (ChatDBG gdb) code program.c:50
+   43     printf("done\n");
+   44     return 0;
+   45 }
+
+   (Message)
+   (ChatDBG gdb) code program.c:48
+   41     }
+   42     destroy_blob(b);
+   43     printf("done\n");
+   44     return 0;
+   45 }
+
+   (Message)
+   (ChatDBG gdb) code program.c:35
+   28     return b;
+   29 }
+   30 
+   31 static void destroy_blob(blob_t *b) {
+   32     if (!b) return;
+   33     free(b->name);          /* release the name buffer */
+   34     free(b);
+   35 }
+   36 
+   37 int main(void) {
+   38     blob_t *b = load_blob("abcdef");   /* triggers the recoverable error path */
+
+   
+   (Message) The program crashes due to a double-free detected by
+   AddressSanitizer. The root cause lies in the `load_blob` function: on the
+   recoverable error path (when `strlen(name) > 4`), it frees `b->name` but then
+   returns the `blob_t` pointer `b` without nulling out `b->name`. Later,
+   `destroy_blob` is called on this same pointer, and it attempts to free
+   `b->name` again — now pointing to already-freed memory — triggering a double-
+   free error. The pointer `b->name` is left dangling because the `load_blob`
+   function does not reset it to `NULL` after `free(b->name)`, violating the
+   invariant that only valid, non-null pointers should be freed.
+   
+   ROOT CAUSE: `program.c:23-25` – After freeing `b->name` on the recoverable
+   error path, `load_blob` returns the blob with `b->name` still pointing to
+   freed memory; `destroy_blob` later frees this dangling pointer again, causing
+   a double-free detected by AddressSanitizer.
+   
+   LOCAL FIX: Replace line 25 in `program.c` with `b->name = NULL; return b;` to
+   nullify the pointer after freeing, so that `destroy_blob` does not attempt a
+   second free.
+   ```c
+   b->name = NULL;
+   return b;
+   ```
+   
+   GLOBAL FIX: Redesign `blob_t` to use RAII semantics with a wrapper that
+   ensures pointer cleanup is safe. Define a `blob_t` that owns its data and
+   includes a destructor that checks for nullity. Use a wrapper type (e.g.,
+   `blob_t`) with a clear ownership rule: if `name` is non-null, it must be
+   freed exactly once. Enforce this at compile time via a `struct` containing
+   both the data and a boolean flag indicating whether the name is owned, or use
+   a bounded view with a free-or-die policy. Alternatively, adopt a well-defined
+   `owned_string` type that encapsulates string ownership and prevents
+   accidental reuse.
+   (Message) The program crashes due to a double-free detected by
+   AddressSanitizer. The root cause lies in the `load_blob` function: on the
+   recoverable error path (when `strlen(name) > 4`), it frees `b->name` but then
+   returns the `blob_t` pointer `b` without nulling out `b->name`. Later,
+   `destroy_blob` is called on this same pointer, and it attempts to free
+   `b->name` again — now pointing to already-freed memory — triggering a double-
+   free error. The pointer `b->name` is left dangling because the `load_blob`
+   function does not reset it to `NULL` after `free(b->name)`, violating the
+   invariant that only valid, non-null pointers should be freed.
+   
+   ROOT CAUSE: `program.c:23-25` – After freeing `b->name` on the recoverable
+   error path, `load_blob` returns the blob with `b->name` still pointing to
+   freed memory; `destroy_blob` later frees this dangling pointer again, causing
+   a double-free detected by AddressSanitizer.
+   
+   LOCAL FIX: Replace line 25 in `program.c` with `b->name = NULL; return b;` to
+   nullify the pointer after freeing, so that `destroy_blob` does not attempt a
+   second free.
+   ```c
+   b->name = NULL;
+   return b;
+   ```
+   
+   GLOBAL FIX: Redesign `blob_t` to use RAII semantics with a wrapper that
+   ensures pointer cleanup is safe. Define a `blob_t` that owns its data and
+   includes a destructor that checks for nullity. Use a wrapper type (e.g.,
+   `blob_t`) with a clear ownership rule: if `name` is non-null, it must be
+   freed exactly once. Enforce this at compile time via a `struct` containing
+   both the data and a boolean flag indicating whether the name is owned, or use
+   a bounded view with a free-or-die policy. Alternatively, adopt a well-defined
+   `owned_string` type that encapsulates string ownership and prevents
+   accidental reuse.

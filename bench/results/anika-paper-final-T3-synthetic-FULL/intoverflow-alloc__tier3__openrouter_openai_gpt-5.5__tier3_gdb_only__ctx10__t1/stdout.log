@@ -1,0 +1,164 @@
+   (Message)
+   (ChatDBG gdb) bt
+   #0  0x000055555565bbc7 in main () at /mnt/c/Users/Owner/OneDrive/Documents/Classes/COS/COS484/chatdbgpro/bench/cases/intoverflow-alloc/program.cpp:33
+
+   (Message)
+   (ChatDBG gdb) code /mnt/c/Users/Owner/OneDrive/Documents/Classes/COS/COS484/chatdbgpro/bench/cases/intoverflow-alloc/program.cpp:1
+   1 #include <cstdio>
+   2 #include <cstdlib>
+   3 #include <cstring>
+   4 #include <cstdint>
+
+   (Message)
+   (ChatDBG gdb) code /mnt/c/Users/Owner/OneDrive/Documents/Classes/COS/COS484/chatdbgpro/bench/cases/intoverflow-alloc/program.cpp:15
+    8     uint64_t score;
+    9     uint64_t payload[6];     /* 64 bytes total */
+   10 };
+   11 
+   12 /* Allocate an array of `count` records and zero it. */
+   13 static Record *make_records(uint32_t count) {
+   14     /* Compute the allocation size and reserve a zeroed buffer large
+   15      * enough to hold `count` Record values. Callers pre-size the
+   16      * batch so OOM is the only expected failure. */
+   17     uint32_t bytes = count * (uint32_t)sizeof(Record);
+   18     Record *r = (Record *)std::malloc(bytes);
+
+   (Message)
+   (ChatDBG gdb) code /mnt/c/Users/Owner/OneDrive/Documents/Classes/COS/COS484/chatdbgpro/bench/cases/intoverflow-alloc/program.cpp:18
+   12 /* Allocate an array of `count` records and zero it. */
+   13 static Record *make_records(uint32_t count) {
+   14     /* Compute the allocation size and reserve a zeroed buffer large
+   15      * enough to hold `count` Record values. Callers pre-size the
+   16      * batch so OOM is the only expected failure. */
+   17     uint32_t bytes = count * (uint32_t)sizeof(Record);
+   18     Record *r = (Record *)std::malloc(bytes);
+   19     if (!r) return nullptr;
+   20     std::memset(r, 0, bytes);
+   21     return r;
+
+   (Message)
+   (ChatDBG gdb) info locals
+   n = 70000000
+   rs = 0x7fffe9789800
+
+   (Message)
+   (ChatDBG gdb) p sizeof(Record)
+   $1 = 64
+
+   (Message)
+   (ChatDBG gdb) p/x (unsigned int)(70000000u * (unsigned int)sizeof(Record))
+   $2 = 0xb076000
+
+   (Message)
+   (ChatDBG gdb) p (unsigned int)(70000000u * (unsigned int)sizeof(Record))
+   $3 = 185032704
+
+   (Message)
+   (ChatDBG gdb) p (unsigned long long)70000000 * sizeof(Record)
+   $4 = 4480000000
+
+   (Message)
+   (ChatDBG gdb) p &rs[n-1]
+   $5 = (Record *) 0x8000f47ff7c0
+
+   (Message)
+   (ChatDBG gdb) p (char*)&rs[n-1] - (char*)rs
+   $6 = 4479999936
+
+   (Message)
+   (ChatDBG gdb) p (char*)&rs[n-1].id - (char*)rs
+   $7 = 4479999936
+
+   (Message)
+   (ChatDBG gdb) p (char*)rs + 185032704
+   $8 = 0x7ffff47ff800 ""
+
+   
+   (Message) ROOT CAUSE: `program.cpp:17` computes `uint32_t bytes = count *
+   (uint32_t)sizeof(Record);`, so the allocation size is calculated in 32-bit
+   arithmetic even though `malloc` takes a `size_t`. In the failing run, `main`
+   sets `n = 70,000,000`, and GDB shows `sizeof(Record) == 64`, so the required
+   allocation is `70,000,000 * 64 = 4,480,000,000` bytes. That exceeds
+   `UINT32_MAX`, so the 32-bit product wraps to `185,032,704` bytes.
+   `make_records` therefore returns a pointer to a buffer of only about 176 MiB,
+   while `main` assumes it contains 70,000,000 records. The failing write at
+   `program.cpp:33`, `rs[n - 1].id = 42`, targets offset `4,479,999,936` from
+   `rs`, far beyond the allocated `185,032,704` bytes, producing the
+   SIGSEGV/heap-buffer-overflow.
+   
+   LOCAL FIX: Compute the allocation size in `size_t` and check for
+   multiplication overflow before calling `malloc`/`memset`. A minimal fix is:
+   ```diff
+   +#include <limits>
+   +
+    static Record *make_records(uint32_t count) {
+        /* Compute the allocation size and reserve a zeroed buffer large
+         * enough to hold `count` Record values. Callers pre-size the
+         * batch so OOM is the only expected failure. */
+   -    uint32_t bytes = count * (uint32_t)sizeof(Record);
+   +    if ((size_t)count > std::numeric_limits<size_t>::max() / sizeof(Record))
+   +        return nullptr;
+   +    size_t bytes = (size_t)count * sizeof(Record);
+        Record *r = (Record *)std::malloc(bytes);
+        if (!r) return nullptr;
+        std::memset(r, 0, bytes);
+        return r;
+    }
+   ```
+   This makes the requested size `4,480,000,000` bytes on a 64-bit platform
+   instead of the wrapped `185,032,704` bytes, and it cleanly returns `nullptr`
+   if the multiplication cannot be represented.
+   
+   GLOBAL FIX: Replace raw “count plus manually computed byte size” allocation
+   patterns with a typed container or checked allocation API that preserves the
+   element count and performs overflow-safe sizing internally, for example
+   `std::vector<Record> records(count);` or a project-wide
+   `allocate_array<T>(count)` helper that uses `size_t`, checks `count <=
+   SIZE_MAX / sizeof(T)`, and returns an owning RAII object. That design
+   prevents callers from accidentally mixing 32-bit counts, byte counts, and
+   element counts, and it ensures every array allocation enforces the same
+   overflow invariant before memory is reserved or indexed.
+   (Message) ROOT CAUSE: `program.cpp:17` computes `uint32_t bytes = count *
+   (uint32_t)sizeof(Record);`, so the allocation size is calculated in 32-bit
+   arithmetic even though `malloc` takes a `size_t`. In the failing run, `main`
+   sets `n = 70,000,000`, and GDB shows `sizeof(Record) == 64`, so the required
+   allocation is `70,000,000 * 64 = 4,480,000,000` bytes. That exceeds
+   `UINT32_MAX`, so the 32-bit product wraps to `185,032,704` bytes.
+   `make_records` therefore returns a pointer to a buffer of only about 176 MiB,
+   while `main` assumes it contains 70,000,000 records. The failing write at
+   `program.cpp:33`, `rs[n - 1].id = 42`, targets offset `4,479,999,936` from
+   `rs`, far beyond the allocated `185,032,704` bytes, producing the
+   SIGSEGV/heap-buffer-overflow.
+   
+   LOCAL FIX: Compute the allocation size in `size_t` and check for
+   multiplication overflow before calling `malloc`/`memset`. A minimal fix is:
+   ```diff
+   +#include <limits>
+   +
+    static Record *make_records(uint32_t count) {
+        /* Compute the allocation size and reserve a zeroed buffer large
+         * enough to hold `count` Record values. Callers pre-size the
+         * batch so OOM is the only expected failure. */
+   -    uint32_t bytes = count * (uint32_t)sizeof(Record);
+   +    if ((size_t)count > std::numeric_limits<size_t>::max() / sizeof(Record))
+   +        return nullptr;
+   +    size_t bytes = (size_t)count * sizeof(Record);
+        Record *r = (Record *)std::malloc(bytes);
+        if (!r) return nullptr;
+        std::memset(r, 0, bytes);
+        return r;
+    }
+   ```
+   This makes the requested size `4,480,000,000` bytes on a 64-bit platform
+   instead of the wrapped `185,032,704` bytes, and it cleanly returns `nullptr`
+   if the multiplication cannot be represented.
+   
+   GLOBAL FIX: Replace raw “count plus manually computed byte size” allocation
+   patterns with a typed container or checked allocation API that preserves the
+   element count and performs overflow-safe sizing internally, for example
+   `std::vector<Record> records(count);` or a project-wide
+   `allocate_array<T>(count)` helper that uses `size_t`, checks `count <=
+   SIZE_MAX / sizeof(T)`, and returns an owning RAII object. That design
+   prevents callers from accidentally mixing 32-bit counts, byte counts, and
+   element counts, and it ensures every array allocation enforces the same
+   overflow invariant before memory is reserved or indexed.

@@ -1,6 +1,6 @@
 # Anika realworld sweep — verification summary
 
-Source: every `bench/results/anika-paper-final-realworld-20260511-T*-*` sweep dir scanned directly. Model order follows `feedback_figure_conventions.md`.
+Source: every `bench/results/anika-paper-final-realworld-*-T*-*` sweep dir scanned directly. Model order follows `feedback_figure_conventions.md`.
 
 | Tier | Model | N | ok | timeout | no_collect | build_failed | (missing collect.json) | full RC/LF/GF | (of which recovered) | partial prose | empty |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|

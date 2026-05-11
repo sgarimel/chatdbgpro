@@ -1,0 +1,126 @@
+   (Message)
+   (ChatDBG gdb) bt
+   No stack.
+   (Message)
+   (ChatDBG gdb) code program.c:1
+   1 #include <stdio.h>
+   2 #include <stdlib.h>
+   3 #include <string.h>
+
+   (Message)
+   (ChatDBG gdb) list
+   24              b->size = 0;
+   25              return b;           /* hand the partially-initialised blob back */
+   26          }
+   27          b->size = strlen(b->name);
+   28          return b;
+   29      }
+   30      
+   31      static void destroy_blob(blob_t *b) {
+   32          if (!b) return;
+   33          free(b->name);          /* release the name buffer */
+
+   (Message)
+   (ChatDBG gdb) list
+   34          free(b);
+   35      }
+   36      
+   37      int main(void) {
+   38          blob_t *b = load_blob("abcdef");   /* triggers the recoverable error path */
+   39          if (b && b->size == 0) {
+   40              fprintf(stderr, "load_blob: empty blob, cleaning up\n");
+   41          }
+   42          destroy_blob(b);
+   43          printf("done\n");
+
+   (Message)
+   (ChatDBG gdb) code program.c:20
+   13     blob_t *b = (blob_t *)malloc(sizeof(*b));
+   14     if (!b) return NULL;
+   15     b->name = strdup(name);
+   16     b->size = 0;
+   17     if (!b->name) {
+   18         free(b);
+   19         return NULL;
+   20     }
+   21     /* Simulated recoverable parse error. */
+   22     if (strlen(name) > 4) {
+   23         free(b->name);      /* release the name on the recoverable error path */
+
+   
+   (Message) ROOT CAUSE: `program.c:22` – In the recoverable‑error path of
+   `load_blob` the code executes `free(b->name);` and then returns the `blob_t`.
+   The pointer stored in `b->name` is thus freed, but the surrounding `blob_t`
+   structure is still handed to the caller and later passed to `destroy_blob`,
+   which again calls `free(b->name)`. Because the pointer is now dangling, the
+   second free triggers AddressSanitizer’s double‑free detector, causing the
+   observed crash. This happens because the function both allocates and
+   unconditionally frees the same owned buffer on an error path, violating the
+   single‑ownership invariant that the caller expects the destructor to clean up
+   all allocated resources.
+   
+   LOCAL FIX: Remove the premature free of `b->name` on the error path so that
+   the destructor remains the sole owner of the allocated memory. The change can
+   be expressed as a diff:
+   
+   ```
+   @@ -22,1 +22,1 @@
+   -        free(b->name);      /* release the name on the recoverable error path */
+   +        /* release the name on the recoverable error path */
+   +        /* intentionally skip freeing – ownership stays with destroy_blob */
+   ```
+   
+   After this edit the recovered blob is returned with its `name` pointer still
+   valid, and `destroy_blob` will free it exactly once, eliminating the
+   double‑free.
+   
+   GLOBAL FIX: Redesign the API so that resource ownership is unambiguous and
+   cannot be double‑released. A robust approach is to give `load_blob` a single
+   responsibility: allocate and partially initialise the blob but never free any
+   of its fields. All deallocation should be performed exclusively by
+   `destroy_blob`. To enforce this, the implementation could return error codes
+   instead of using a recoverable‑error‑path that frees memory, or employ a
+   “cleanup‑on‑exit” label that jumps to a common exit point where only
+   `destroy_blob` executes the frees. By centralising the free operation in one
+   function and ensuring that no other code interferes with the owned pointers,
+   the class of double‑free bugs caused by premature releases is prevented. This
+   structural change makes the ownership discipline explicit and guarantees that
+   each allocated resource is freed exactly once.
+   (Message) ROOT CAUSE: `program.c:22` – In the recoverable‑error path of
+   `load_blob` the code executes `free(b->name);` and then returns the `blob_t`.
+   The pointer stored in `b->name` is thus freed, but the surrounding `blob_t`
+   structure is still handed to the caller and later passed to `destroy_blob`,
+   which again calls `free(b->name)`. Because the pointer is now dangling, the
+   second free triggers AddressSanitizer’s double‑free detector, causing the
+   observed crash. This happens because the function both allocates and
+   unconditionally frees the same owned buffer on an error path, violating the
+   single‑ownership invariant that the caller expects the destructor to clean up
+   all allocated resources.
+   
+   LOCAL FIX: Remove the premature free of `b->name` on the error path so that
+   the destructor remains the sole owner of the allocated memory. The change can
+   be expressed as a diff:
+   
+   ```
+   @@ -22,1 +22,1 @@
+   -        free(b->name);      /* release the name on the recoverable error path */
+   +        /* release the name on the recoverable error path */
+   +        /* intentionally skip freeing – ownership stays with destroy_blob */
+   ```
+   
+   After this edit the recovered blob is returned with its `name` pointer still
+   valid, and `destroy_blob` will free it exactly once, eliminating the
+   double‑free.
+   
+   GLOBAL FIX: Redesign the API so that resource ownership is unambiguous and
+   cannot be double‑released. A robust approach is to give `load_blob` a single
+   responsibility: allocate and partially initialise the blob but never free any
+   of its fields. All deallocation should be performed exclusively by
+   `destroy_blob`. To enforce this, the implementation could return error codes
+   instead of using a recoverable‑error‑path that frees memory, or employ a
+   “cleanup‑on‑exit” label that jumps to a common exit point where only
+   `destroy_blob` executes the frees. By centralising the free operation in one
+   function and ensuring that no other code interferes with the owned pointers,
+   the class of double‑free bugs caused by premature releases is prevented. This
+   structural change makes the ownership discipline explicit and guarantees that
+   each allocated resource is freed exactly once.

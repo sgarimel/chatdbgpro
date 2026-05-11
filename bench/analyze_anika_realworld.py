@@ -1,8 +1,8 @@
-"""Verification figures for Anika's local realworld sweep.
+"""Verification figures for a per-owner realworld sweep.
 
-Scans every `bench/results/anika-paper-final-realworld-20260511-T*-*`
-sweep dir directly (no `final_paper_bench/realworld` promote step
-needed) and emits:
+Scans every `bench/results/<owner>-paper-final-realworld-*-T*-*` sweep
+dir directly (no `final_paper_bench/realworld` promote step needed)
+and emits:
 
   - summary.md: per-(tier, model) coverage + format compliance
   - coverage_by_model_tier.png: stacked bars (ok / timeout / no_collect / build_failed / other)
@@ -34,10 +34,20 @@ import numpy as np
 REPO = Path(__file__).resolve().parents[1]
 RESULTS = REPO / "bench" / "results"
 
-SWEEP_RE = re.compile(
-    r"^anika-paper-final-realworld-(?P<date>\d{8})-T(?P<tier>\d+)-"
-    r"openrouter-(?P<model>.+)$"
-)
+DEFAULT_OWNER = "anika"
+
+
+def make_sweep_re(owner: str, date: str | None = None):
+    """Build a regex for sweep dir names. Date is optional (None matches
+    any date)."""
+    date_pat = date if date else r"\d{8}"
+    return re.compile(
+        rf"^{owner}-paper-final-realworld-(?P<date>{date_pat})-"
+        rf"T(?P<tier>\d+)-openrouter-(?P<model>.+)$"
+    )
+
+
+SWEEP_RE = make_sweep_re(DEFAULT_OWNER)
 CELL_RE = re.compile(
     r"^(?P<case>.+)__tier(?P<tier>\d+)__openrouter_(?P<model>.+?)__"
     r"tier\d+_(?:bash_only|gdb_only|gdb_plus_bash|claude_code)__ctx\d+__t\d+$"
@@ -187,10 +197,10 @@ def sorted_keys(by):
     return sorted(by.keys(), key=sk)
 
 
-def write_summary(by, out_path):
+def write_summary(by, out_path, owner: str = DEFAULT_OWNER):
     lines = [
-        "# Anika realworld sweep — verification summary\n\n",
-        "Source: every `bench/results/anika-paper-final-realworld-20260511-T*-*` "
+        f"# {owner.title()} realworld sweep — verification summary\n\n",
+        f"Source: every `bench/results/{owner}-paper-final-realworld-*-T*-*` "
         "sweep dir scanned directly. Model order follows "
         "`feedback_figure_conventions.md`.\n\n",
         "| Tier | Model | N | ok | timeout | no_collect | build_failed | "
@@ -242,7 +252,7 @@ def plot_coverage(by, out_path):
     ax.set_xticks(x)
     ax.set_xticklabels(labels, rotation=55, ha="right", fontsize=8)
     ax.set_ylabel("cells")
-    ax.set_title("Anika realworld sweep  —  run completion (per tier × model)")
+    ax.set_title(f"{out_path.stem.split('_')[0].title()} realworld sweep  —  run completion (per tier × model)")
     ax.legend(fontsize=8)
     fig.tight_layout()
     fig.savefig(out_path, dpi=130)
@@ -269,7 +279,7 @@ def plot_format(by, out_path):
     ax.set_xticks(x)
     ax.set_xticklabels(labels, rotation=55, ha="right", fontsize=8)
     ax.set_ylabel("cells")
-    ax.set_title("Anika realworld sweep  —  final-response format compliance")
+    ax.set_title(f"{out_path.stem.split('_')[0].title()} realworld sweep  —  final-response format compliance")
     ax.legend(fontsize=8)
     fig.tight_layout()
     fig.savefig(out_path, dpi=130)
@@ -329,7 +339,7 @@ def plot_heatmap(rows, out_path):
             ax.text(j, i, text[i][j], ha="center", va="center",
                     color="black", fontsize=6)
     ax.set_title(
-        "Anika realworld sweep  —  case × (tier, model) heatmap\n"
+        f"{out_path.stem.split('_')[0].title()} realworld sweep  —  case × (tier, model) heatmap\n"
         "Y=ok+full · ~=ok+missing labels · E=ok+empty · "
         "T=timeout · N=no_collect · B=build_failed · ·=not in panel")
     fig.tight_layout()
@@ -362,7 +372,7 @@ def write_anomalies(rows, out_path):
             bad.append((r, reasons))
     bad.sort(key=lambda x: (x[0]["tier"], x[0]["model"], x[0]["case_id"]))
     lines = [
-        "# Anomalies in Anika realworld sweep\n\n",
+        f"# Anomalies in {out_path.stem.split('_')[0].title()} realworld sweep\n\n",
         f"Total flagged cells: **{len(bad)}** / {len(rows)}\n\n",
         "| Tier | Model | Case | Status | Elapsed | RespLen | Reasons |\n",
         "|---|---|---|---|---:|---:|---|\n",
@@ -378,20 +388,31 @@ def write_anomalies(rows, out_path):
 
 def main() -> int:
     p = argparse.ArgumentParser()
-    p.add_argument("--out", default="anika_realworld_T1_verify")
+    p.add_argument("--out", default=None,
+                   help="Output dir under bench/analysis_artifacts/. "
+                        "Default: <owner>_realworld_T1_verify.")
+    p.add_argument("--owner", default=DEFAULT_OWNER,
+                   help="Sweep dir prefix owner (anika, ibraheem).")
+    p.add_argument("--date", default=None,
+                   help="Restrict to a single sweep date YYYYMMDD.")
     args = p.parse_args()
+
+    global SWEEP_RE
+    SWEEP_RE = make_sweep_re(args.owner, args.date)
+    out_name = args.out or f"{args.owner}_realworld_T1_verify"
 
     rows = collect_rows()
     keys = {(r["tier"], r["model"]) for r in rows}
     cases = {r["case_id"] for r in rows}
-    print(f"[analyze] {len(rows)} cells across {len(keys)} "
+    print(f"[analyze] owner={args.owner} date={args.date or 'any'} "
+          f"-> {len(rows)} cells across {len(keys)} "
           f"(tier, model) groups, {len(cases)} unique cases")
 
-    out = REPO / "bench" / "analysis_artifacts" / args.out
+    out = REPO / "bench" / "analysis_artifacts" / out_name
     out.mkdir(parents=True, exist_ok=True)
 
     by = aggregate(rows)
-    write_summary(by, out / "summary.md")
+    write_summary(by, out / "summary.md", owner=args.owner)
     plot_coverage(by, out / "coverage_by_model_tier.png")
     plot_format(by, out / "format_by_model_tier.png")
     plot_heatmap(rows, out / "per_case_heatmap.png")
