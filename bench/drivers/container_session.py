@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import atexit
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -471,11 +472,17 @@ class ContainerSession:
             timeout=300.0,  # apptainer pull from registry can take minutes
         )
         if proc.returncode != 0:
+            # Redact API keys from argv before logging (apptainer --env
+            # values can contain OPENROUTER_API_KEY etc., which GitHub
+            # secret-scanning rightly blocks on commit).
+            def _redact(s):
+                return re.sub(r"sk-[A-Za-z0-9_-]{8,}", "sk-REDACTED", s)
+            safe_argv = [_redact(a) for a in argv]
             raise RuntimeError(
                 f"apptainer instance start failed (exit {proc.returncode}):\n"
-                f"  argv: {' '.join(shlex.quote(a) for a in argv)}\n"
-                f"  stderr: {proc.stderr.strip()}\n"
-                f"  stdout: {proc.stdout.strip()}"
+                f"  argv: {' '.join(shlex.quote(a) for a in safe_argv)}\n"
+                f"  stderr: {_redact(proc.stderr.strip())}\n"
+                f"  stdout: {_redact(proc.stdout.strip())}"
             )
         # Apptainer instances aren't identified by a hash like docker; the
         # name IS the canonical handle. Store it consistently.

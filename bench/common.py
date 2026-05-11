@@ -815,13 +815,22 @@ def build_oracle_strings(case: DockerCase) -> dict[str, str]:
     # characters — and shlex.quote inserts `"` when the value contains
     # `'` (yara's trigger does). Plain join keeps it pure single-quotes.
     if case.trigger_argv:
-        # Also strip bare `"` chars in the trigger: triggers like
-        # berry's that embed double-quoted shell substitutions
-        # (`bash -c "./berry $(find ... -name \"*.be\")"`) carry
-        # raw `"` into the joined string and trip apptainer's CSV
-        # parser exactly like shlex.quote did. Replace with `'` — the
-        # EXTRA value is informational, not a shell command.
-        extras.append("trigger=" + " ".join(case.trigger_argv).replace('"', "'"))
+        # Apptainer --env K=V cobra parser AND any downstream shell that
+        # might eval this value both choke on unmatched quotes. The
+        # earlier replace('"','\'') from PR #22 left nested single
+        # quotes for triggers containing  awk 'NR==2'  which broke
+        # apptainer instance startup. CHATDBG_PROMPT_EXTRA is purely
+        # informational (the LLM reads it); strip ALL shell-quote chars
+        # so the value is safe at every layer.
+        trigger_text = " ".join(case.trigger_argv)
+        # Strip ALL shell-special quoting characters: quotes (single,
+        # double, backtick) and backslashes. The escape-backslashes
+        # remain when the original trigger had `\"` and we removed the
+        # `"` — yielding `\ ` which bash interprets as line continuation
+        # and trips apptainer's runtime env-injector script.
+        for _ch in ('"', "'", "`", "\\"):
+            trigger_text = trigger_text.replace(_ch, "")
+        extras.append("trigger=" + trigger_text)
     if extras:
         # Separator is "; " not ", ": apptainer's `--env K=V` flag parses
         # value as CSV (cobra StringToString), so every comma splits the

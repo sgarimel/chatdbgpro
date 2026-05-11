@@ -51,6 +51,7 @@ cd "$SLURM_SUBMIT_DIR"
 module load anaconda3 || true
 module load singularity || true
 module load intel-llvm/2024.2 || true
+module load proxy/default || true
 export PATH=$HOME/.conda/envs/clang-bench/bin:$PATH
 export BENCH_APPTAINER_SIF_DIR=$HOME/.apptainer/cache
 export LIBRARY_PATH=$HOME/.conda/envs/clang-bench/lib:${LIBRARY_PATH:-}
