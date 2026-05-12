@@ -404,6 +404,10 @@ class Tier3Driver:
         # session is unrestricted). See T3_T4_PROMPT_TOOL_DIAGNOSIS.md.
         env["CHATDBG_UNSAFE"] = "true"
 
+        # Wall-clock wrap-up: tell chatdbg to inject the final
+        # diagnosis prompt 60s before the driver subprocess timeout.
+        env["CHATDBG_WALLCLOCK_DEADLINE"] = str(max(60, int(timeout) - 60))
+
         # Case metadata — align T3 prompt with T1/T2/T4 information.
         sf = spec.case.meta.get("source_file", "")
         if sf:
@@ -438,6 +442,32 @@ class Tier3Driver:
         py39_userbase = os.environ.get("BENCH_PY39_USERBASE")
         if py39_userbase:
             env["PYTHONUSERBASE"] = py39_userbase
+            # When lldb's embedded Python autodetects a venv from PATH
+            # (e.g. .venv-bench/bin/python3), it disables user-site, so
+            # PYTHONUSERBASE alone is ignored. Explicitly append every
+            # site-packages dir under the userbase to PYTHONPATH as a
+            # safety net.
+            import glob as _glob
+            def _pyver_key(path):
+                m = _re_pyver.search(path)
+                return (int(m.group(1)), int(m.group(2))) if m else (0, 0)
+            import re as _re_mod
+            _re_pyver = _re_mod.compile(r"python(\d+)\.(\d+)")
+            # gdb path: only include Py3.9 site-packages.
+            # Including Py3.14 site-packages here breaks Py3.9 imports
+            # (e.g. urllib3 from Py3.14 uses PEP 604 X|Y syntax).
+            _all = _glob.glob(os.path.join(py39_userbase, "lib", "python*", "site-packages"))
+            userbase_site_dirs = [d for d in _all if "python3.9" in d]
+            if userbase_site_dirs:
+                pp = env.get("PYTHONPATH", "")
+                pieces = userbase_site_dirs + ([pp] if pp else [])
+                env["PYTHONPATH"] = os.pathsep.join(pieces + [env.get("PYTHONPATH", "")]).strip(os.pathsep)
+                # Dedupe while preserving order
+                seen = set(); out = []
+                for piece in env["PYTHONPATH"].split(os.pathsep):
+                    if piece and piece not in seen:
+                        seen.add(piece); out.append(piece)
+                env["PYTHONPATH"] = os.pathsep.join(out)
 
         # Check-my-work: pass case.yaml path so the CMW tool loads criteria.
         if spec.check_my_work:
@@ -752,7 +782,7 @@ class Tier3Driver:
             )
 
         collect_path = run_dir / "collect.json"
-        env = self._chatdbg_env(spec, run_dir, collect_path)
+        env = self._chatdbg_env(spec, run_dir, collect_path, timeout=timeout)
 
         debug_cfg = spec.case.meta.get("debug", {})
         args = debug_cfg.get("args", [])
@@ -873,7 +903,7 @@ class Tier3Driver:
             )
 
         collect_path = run_dir / "collect.json"
-        env = self._chatdbg_env(spec, run_dir, collect_path)
+        env = self._chatdbg_env(spec, run_dir, collect_path, timeout=timeout)
 
         # Read crash args generated at build time
         import json as _json
@@ -934,7 +964,7 @@ class Tier3Driver:
             status=status, exit_code=exit_code, elapsed_s=elapsed,
         )
 
-    def _chatdbg_env(self, spec: RunSpec, run_dir: Path, collect_path: Path) -> dict:
+    def _chatdbg_env(self, spec: RunSpec, run_dir: Path, collect_path: Path, timeout: float = 600.0) -> dict:
         """Build the child env dict shared by synthetic + injected + bugbench runs.
 
         Only the PYTHONPATH-prepending is load-bearing on macOS arm64
@@ -970,6 +1000,10 @@ class Tier3Driver:
         # Unfence all debugger commands for benchmark runs.
         env["CHATDBG_UNSAFE"] = "true"
 
+        # Wall-clock wrap-up: tell chatdbg to inject the final
+        # diagnosis prompt 60s before the driver subprocess timeout.
+        env["CHATDBG_WALLCLOCK_DEADLINE"] = str(max(60, int(timeout) - 60))
+
         # Case metadata — align T3 prompt with T1/T2/T4 information.
         sf = spec.case.meta.get("source_file", "")
         if sf:
@@ -1002,6 +1036,31 @@ class Tier3Driver:
         py39_userbase = os.environ.get("BENCH_PY39_USERBASE")
         if py39_userbase:
             env["PYTHONUSERBASE"] = py39_userbase
+            # When lldb's embedded Python autodetects a venv from PATH
+            # (e.g. .venv-bench/bin/python3), it disables user-site, so
+            # PYTHONUSERBASE alone is ignored. Explicitly append every
+            # site-packages dir under the userbase to PYTHONPATH as a
+            # safety net.
+            import glob as _glob
+            def _pyver_key(path):
+                m = _re_pyver.search(path)
+                return (int(m.group(1)), int(m.group(2))) if m else (0, 0)
+            import re as _re_mod
+            _re_pyver = _re_mod.compile(r"python(\d+)\.(\d+)")
+            userbase_site_dirs = sorted(
+                _glob.glob(os.path.join(py39_userbase, "lib", "python*", "site-packages")),
+                key=_pyver_key, reverse=True,
+            )
+            if userbase_site_dirs:
+                pp = env.get("PYTHONPATH", "")
+                pieces = userbase_site_dirs + ([pp] if pp else [])
+                env["PYTHONPATH"] = os.pathsep.join(pieces + [env.get("PYTHONPATH", "")]).strip(os.pathsep)
+                # Dedupe while preserving order
+                seen = set(); out = []
+                for piece in env["PYTHONPATH"].split(os.pathsep):
+                    if piece and piece not in seen:
+                        seen.add(piece); out.append(piece)
+                env["PYTHONPATH"] = os.pathsep.join(out)
 
         # Check-my-work: pass the case.yaml path so the CMW tool can
         # load criteria at runtime. The case.yaml is already copied to

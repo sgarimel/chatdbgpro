@@ -54,6 +54,23 @@ class Assistant:
         self._max_call_response_tokens = max_call_response_tokens
 
         self._check_model()
+
+        # Wall-clock soft deadline: when CHATDBG_WALLCLOCK_DEADLINE
+        # (seconds) is set, the streamed-query loop injects a final
+        # WRAPUP user message at the top of the next iteration once
+        # the deadline passes. This converts a hard SIGKILL by the
+        # driver's subprocess timeout (no collect.json) into a final
+        # graceful query (full collect.json).
+        import os as _os, time as _time
+        self._wallclock_deadline_abs = None
+        self._wrapup_injected = False
+        _d = _os.environ.get("CHATDBG_WALLCLOCK_DEADLINE")
+        if _d:
+            try:
+                self._wallclock_deadline_abs = _time.time() + float(_d)
+            except (TypeError, ValueError):
+                pass
+
         self._broadcast("on_begin_dialog", instructions)
 
     def close(self):
@@ -174,6 +191,30 @@ class Assistant:
         self._conversation.append({"role": "user", "content": prompt})
 
         while True:
+            # Wall-clock wrap-up: if the deadline has passed and we
+            # haven't already injected the wrap-up, prepend it now so
+            # the next stream call sees it and the model produces its
+            # final answer instead of more tool calls.
+            if (self._wallclock_deadline_abs
+                    and not self._wrapup_injected
+                    and time.time() >= self._wallclock_deadline_abs):
+                self._conversation.append({
+                    "role": "user",
+                    "content": (
+                        "TIME IS UP. Stop running tools immediately. "
+                        "Output your final diagnosis using EXACTLY "
+                        "these three labelled paragraphs and nothing "
+                        "else:\n\n"
+                        "ROOT CAUSE: <file:line and what is wrong>\n"
+                        "LOCAL FIX: <minimal code change>\n"
+                        "GLOBAL FIX: <structural change preventing "
+                        "this CLASS of bug>\n\n"
+                        "If you don't know exactly, give your best "
+                        "guess from what you have seen -- partial "
+                        "credit beats no answer."
+                    ),
+                })
+                self._wrapup_injected = True
             stream = self._stream_completion()
 
             # litellm.stream_chunk_builder is broken for new GPT models
