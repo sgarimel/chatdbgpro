@@ -428,6 +428,31 @@ class Tier3Driver:
         py39_userbase = os.environ.get("BENCH_PY39_USERBASE")
         if py39_userbase:
             env["PYTHONUSERBASE"] = py39_userbase
+            # When lldb's embedded Python autodetects a venv from PATH
+            # (e.g. .venv-bench/bin/python3), it disables user-site, so
+            # PYTHONUSERBASE alone is ignored. Explicitly append every
+            # site-packages dir under the userbase to PYTHONPATH as a
+            # safety net.
+            import glob as _glob
+            def _pyver_key(path):
+                m = _re_pyver.search(path)
+                return (int(m.group(1)), int(m.group(2))) if m else (0, 0)
+            import re as _re_mod
+            _re_pyver = _re_mod.compile(r"python(\d+)\.(\d+)")
+            userbase_site_dirs = sorted(
+                _glob.glob(os.path.join(py39_userbase, "lib", "python*", "site-packages")),
+                key=_pyver_key, reverse=True,
+            )
+            if userbase_site_dirs:
+                pp = env.get("PYTHONPATH", "")
+                pieces = userbase_site_dirs + ([pp] if pp else [])
+                env["PYTHONPATH"] = os.pathsep.join(pieces + [env.get("PYTHONPATH", "")]).strip(os.pathsep)
+                # Dedupe while preserving order
+                seen = set(); out = []
+                for piece in env["PYTHONPATH"].split(os.pathsep):
+                    if piece and piece not in seen:
+                        seen.add(piece); out.append(piece)
+                env["PYTHONPATH"] = os.pathsep.join(out)
 
         # Check-my-work: pass case.yaml path so the CMW tool loads criteria.
         if spec.check_my_work:
@@ -950,6 +975,31 @@ class Tier3Driver:
         py39_userbase = os.environ.get("BENCH_PY39_USERBASE")
         if py39_userbase:
             env["PYTHONUSERBASE"] = py39_userbase
+            # When lldb's embedded Python autodetects a venv from PATH
+            # (e.g. .venv-bench/bin/python3), it disables user-site, so
+            # PYTHONUSERBASE alone is ignored. Explicitly append every
+            # site-packages dir under the userbase to PYTHONPATH as a
+            # safety net.
+            import glob as _glob
+            def _pyver_key(path):
+                m = _re_pyver.search(path)
+                return (int(m.group(1)), int(m.group(2))) if m else (0, 0)
+            import re as _re_mod
+            _re_pyver = _re_mod.compile(r"python(\d+)\.(\d+)")
+            userbase_site_dirs = sorted(
+                _glob.glob(os.path.join(py39_userbase, "lib", "python*", "site-packages")),
+                key=_pyver_key, reverse=True,
+            )
+            if userbase_site_dirs:
+                pp = env.get("PYTHONPATH", "")
+                pieces = userbase_site_dirs + ([pp] if pp else [])
+                env["PYTHONPATH"] = os.pathsep.join(pieces + [env.get("PYTHONPATH", "")]).strip(os.pathsep)
+                # Dedupe while preserving order
+                seen = set(); out = []
+                for piece in env["PYTHONPATH"].split(os.pathsep):
+                    if piece and piece not in seen:
+                        seen.add(piece); out.append(piece)
+                env["PYTHONPATH"] = os.pathsep.join(out)
 
         # Check-my-work: pass the case.yaml path so the CMW tool can
         # load criteria at runtime. The case.yaml is already copied to
