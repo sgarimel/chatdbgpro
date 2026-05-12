@@ -39,7 +39,8 @@ LOCAL_SWEEP_RE = re.compile(
 )
 CELL_RE = re.compile(
     r"^(?P<case>.+)__tier(?P<tier>\d+)__openrouter_(?P<model>.+?)__"
-    r"tier\d+_(?:bash_only|gdb_only|gdb_plus_bash|claude_code)__ctx\d+__t\d+$"
+    r"(?:tier\d+_(?:bash_only|gdb_only|gdb_plus_bash|claude_code)"
+    r"|t\d+_unfenced_cmw)__ctx\d+__t\d+$"
 )
 
 MODEL_ORDER = [
