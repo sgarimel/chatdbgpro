@@ -1,0 +1,74 @@
+id: bc-heap-overflow
+language: c
+kind: bugbench
+description: >
+  bc-1.06 heap buffer overflow in storage.c more_arrays(). The
+  initialization loop on line 176 uses 'v_count' (variable count) as
+  the upper bound instead of 'a_count' (array count). When v_count >
+  a_count, the loop writes past the allocated a_names/arrays heap
+  buffers, corrupting heap metadata and causing a crash in subsequent
+  lookups.
+
+source:
+  dir: bugbench-src/bc-1.06/src
+  build_commands:
+    # bc-1.06 ships config.h.in only; need ./configure to generate config.h
+    # before -DHAVE_CONFIG_H is meaningful.
+    - "./configure --quiet 2>&1 | tail -3"
+    - "clang -g -O0 -std=gnu89 -w -fsanitize=address -I. -Ibc -Ih -Ilib -DHAVE_CONFIG_H -c bc/bc.c bc/execute.c bc/global.c bc/load.c bc/main.c bc/scan.c bc/storage.c bc/util.c lib/number.c lib/getopt.c lib/getopt1.c"
+    - "clang -g -O0 -fsanitize=address -o bc_buggy bc.o execute.o global.o load.o main.o number.o scan.o storage.o util.o getopt.o getopt1.o -lm"
+  binary: bc_buggy
+  key_files:
+    - bc/storage.c
+    - bc/util.c
+    - bc/bc.c
+
+run:
+  # Feed bad.b via stdin to trigger the heap overflow
+  stdin_file: bugbench-src/bc-1.06/script/bad.b
+  expected_crash: true
+
+debug:
+  stdin_file: bugbench-src/bc-1.06/script/bad.b
+
+bug:
+  category: buffer_overflow
+  error_type: heap_buffer_overflow
+  root_cause_file: bc/storage.c
+  root_cause_lines: [176]
+  root_cause_function: more_arrays
+  related_files:
+    - bc/util.c
+  related_lines: [577, 580]
+  fix_description: >
+    In more_arrays(), change the loop bound from v_count to a_count.
+
+criteria:
+  root_cause: >
+    The response must identify that more_arrays() in storage.c uses
+    v_count instead of a_count as the loop bound on line 176, causing
+    the initialization loop to write past the end of the arrays[] and
+    a_names[] heap buffers. Identifying the related bug in util.c
+    lookup() (line 580, off-by-one on a_count check) is a bonus but
+    not required.
+
+  local_fix: >
+    Change line 176 from:
+      for (; indx < v_count; indx++)
+    to:
+      for (; indx < a_count; indx++)
+    And optionally fix util.c line 580 from:
+      if (id->a_name >= a_count)
+    to:
+      if (id->a_name >= (a_count - 1))
+
+  global_fix: >
+    A structural fix should prevent count-variable confusion:
+      (a) Encapsulate array and variable storage in separate structs
+          with their own count fields, eliminating the possibility of
+          using the wrong counter.
+      (b) Use a single resizable-array abstraction (like a C vector)
+          that manages its own size/capacity, replacing raw malloc +
+          manual index tracking.
+      (c) Add assertions (assert(indx < a_count)) at every array
+          access point to catch mismatched counters at development time.
