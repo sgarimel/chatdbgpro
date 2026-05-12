@@ -439,10 +439,11 @@ class Tier3Driver:
                 return (int(m.group(1)), int(m.group(2))) if m else (0, 0)
             import re as _re_mod
             _re_pyver = _re_mod.compile(r"python(\d+)\.(\d+)")
-            userbase_site_dirs = sorted(
-                _glob.glob(os.path.join(py39_userbase, "lib", "python*", "site-packages")),
-                key=_pyver_key, reverse=True,
-            )
+            # gdb path: only include Py3.9 site-packages.
+            # Including Py3.14 site-packages here breaks Py3.9 imports
+            # (e.g. urllib3 from Py3.14 uses PEP 604 X|Y syntax).
+            _all = _glob.glob(os.path.join(py39_userbase, "lib", "python*", "site-packages"))
+            userbase_site_dirs = [d for d in _all if "python3.9" in d]
             if userbase_site_dirs:
                 pp = env.get("PYTHONPATH", "")
                 pieces = userbase_site_dirs + ([pp] if pp else [])
