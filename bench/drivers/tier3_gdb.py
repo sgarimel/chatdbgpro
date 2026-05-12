@@ -394,6 +394,10 @@ class Tier3Driver:
         # session is unrestricted). See T3_T4_PROMPT_TOOL_DIAGNOSIS.md.
         env["CHATDBG_UNSAFE"] = "true"
 
+        # Wall-clock wrap-up: tell chatdbg to inject the final
+        # diagnosis prompt 60s before the driver subprocess timeout.
+        env["CHATDBG_WALLCLOCK_DEADLINE"] = str(max(60, int(timeout) - 60))
+
         # Case metadata — align T3 prompt with T1/T2/T4 information.
         sf = spec.case.meta.get("source_file", "")
         if sf:
@@ -768,7 +772,7 @@ class Tier3Driver:
             )
 
         collect_path = run_dir / "collect.json"
-        env = self._chatdbg_env(spec, run_dir, collect_path)
+        env = self._chatdbg_env(spec, run_dir, collect_path, timeout=timeout)
 
         if self.debugger != "lldb":
             # gdb for injected cases is plausible (we'd need to call
@@ -866,7 +870,7 @@ class Tier3Driver:
             )
 
         collect_path = run_dir / "collect.json"
-        env = self._chatdbg_env(spec, run_dir, collect_path)
+        env = self._chatdbg_env(spec, run_dir, collect_path, timeout=timeout)
 
         # Read crash args generated at build time
         import json as _json
@@ -927,7 +931,7 @@ class Tier3Driver:
             status=status, exit_code=exit_code, elapsed_s=elapsed,
         )
 
-    def _chatdbg_env(self, spec: RunSpec, run_dir: Path, collect_path: Path) -> dict:
+    def _chatdbg_env(self, spec: RunSpec, run_dir: Path, collect_path: Path, timeout: float = 600.0) -> dict:
         """Build the child env dict shared by synthetic + injected + bugbench runs.
 
         Only the PYTHONPATH-prepending is load-bearing on macOS arm64
@@ -943,6 +947,10 @@ class Tier3Driver:
 
         # Unfence all debugger commands for benchmark runs.
         env["CHATDBG_UNSAFE"] = "true"
+
+        # Wall-clock wrap-up: tell chatdbg to inject the final
+        # diagnosis prompt 60s before the driver subprocess timeout.
+        env["CHATDBG_WALLCLOCK_DEADLINE"] = str(max(60, int(timeout) - 60))
 
         # Case metadata — align T3 prompt with T1/T2/T4 information.
         sf = spec.case.meta.get("source_file", "")

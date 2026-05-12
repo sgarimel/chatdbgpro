@@ -348,6 +348,10 @@ class DockerDriver:
             # disassemble/x/set/catch/call and the model has no source-
             # file hint to point get_code_surrounding at.
             "CHATDBG_UNSAFE": "true",
+            # Wall-clock wrap-up: tell chatdbg to inject the final
+            # diagnosis prompt 60s before the subprocess timeout, so
+            # the model produces collect.json instead of being killed.
+            "CHATDBG_WALLCLOCK_DEADLINE": str(max(60, int(timeout) - 60)),
             # PYTHONPATH must include both the bind-mounted ChatDBG source
             # and the venv where gdb-base.Dockerfile installed ChatDBG's
             # runtime deps (litellm, openai, llm_utils, ...). The venv path
